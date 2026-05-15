@@ -327,6 +327,80 @@ class TestCDFCoverage:
         )
 
 
+class TestHVHDriftNonDegenerate:
+    """Verify HVH-Drift produces a non-degenerate token distribution.
+
+    Spec §6.5: with quantum-uniform u-values, the empirical token-rank
+    distribution must be distinguishable from both extremes:
+
+    * **Greedy** — argmax-only (delta spike at rank 0).
+    * **Uniform** — equal probability across all candidate ranks.
+
+    This guards against accidental regressions where the preset
+    collapses to one of the trivial baselines.
+    """
+
+    def test_hvh_drift_kolmogorov_smirnov_non_degenerate(self) -> None:
+        from qr_sampler.temperature.hvh_drift import HVHDriftStrategy
+
+        vocab_size = 50
+        n_tokens = 1000
+
+        # Logits with moderate spread so the distribution is non-trivial
+        # but still has structure (HVH-Drift cares about H/VH drift).
+        logits = np.linspace(2.0, -2.0, vocab_size, dtype=np.float64)
+
+        config = _make_config(
+            temperature_strategy="hvh_drift",
+            sample_count=2048,
+            top_k=0,
+            top_p=1.0,
+            min_p_base=0.0,
+        )
+        strategy = HVHDriftStrategy(vocab_size=vocab_size)
+        amplifier = AmplifierRegistry.build(config)
+        selector = TokenSelector()
+        source = MockUniformSource(mean=127.5, seed=2026)
+
+        ranks = np.empty(n_tokens, dtype=np.int64)
+        for i in range(n_tokens):
+            temp_result = strategy.compute_temperature(logits, config)
+            min_p = float(temp_result.diagnostics.get("min_p", 0.0))
+            raw = source.get_random_bytes(config.sample_count)
+            u = amplifier.amplify(raw).u
+            sel = selector.select(
+                logits,
+                temp_result.temperature,
+                config.top_k,
+                config.top_p,
+                u,
+                min_p=min_p,
+            )
+            ranks[i] = sel.token_rank
+
+        # --- Distinguishability from GREEDY (delta at rank 0) ---
+        # A greedy sampler would put every token at rank 0. HVH-Drift
+        # must spread some mass to higher ranks.
+        non_argmax_fraction = float(np.mean(ranks != 0))
+        assert non_argmax_fraction > 0.2, (
+            f"HVH-Drift selections collapsed toward greedy: "
+            f"only {non_argmax_fraction:.3f} of tokens left rank 0"
+        )
+        assert ranks.max() > 0, "HVH-Drift never selected anything beyond argmax"
+
+        # --- Distinguishability from UNIFORM over ranks ---
+        # Normalize discrete ranks to (0, 1) and run a one-sample KS test
+        # against the continuous uniform CDF. A truly uniform sampler
+        # would give p > 0.05; HVH-Drift must skew toward low ranks
+        # (higher-probability tokens), so this should reject decisively.
+        normalized = (ranks.astype(np.float64) + 0.5) / vocab_size
+        stat, p_value = scipy_stats.kstest(normalized, "uniform")
+        assert p_value < 0.01, (
+            f"HVH-Drift rank distribution is indistinguishable from uniform: "
+            f"KS statistic={stat:.4f}, p={p_value:.4f}"
+        )
+
+
 class TestOneHotCorrectness:
     """Verify that the processor produces valid one-hot output."""
 
