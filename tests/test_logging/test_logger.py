@@ -69,6 +69,49 @@ class TestTokenSamplingRecord:
         assert record.num_candidates == 50
         assert record.config_hash == "abcdef1234567890"
 
+    def test_record_back_compat_no_new_fields(self) -> None:
+        """Existing call sites with the original 16 args still work."""
+        record = TokenSamplingRecord(
+            timestamp_ns=1,
+            entropy_fetch_ms=0.1,
+            total_sampling_ms=0.2,
+            entropy_source_used="mock_uniform",
+            entropy_is_fallback=False,
+            sample_mean=127.5,
+            z_score=0.0,
+            u_value=0.5,
+            temperature_strategy="fixed",
+            shannon_entropy=1.0,
+            temperature_used=0.7,
+            token_id=0,
+            token_rank=0,
+            token_prob=1.0,
+            num_candidates=1,
+            config_hash="0" * 16,
+        )
+        assert record.varentropy is None
+        assert record.min_p_used is None
+        assert record.preset_active is None
+        assert record.h_ema is None
+        assert record.vh_ema is None
+
+    def test_token_sampling_record_accepts_new_optional_fields(self) -> None:
+        """All five optional fields can be set and the record stays frozen."""
+        record = _make_record(
+            varentropy=0.42,
+            min_p_used=0.025,
+            preset_active="creative_sampling",
+            h_ema=1.23,
+            vh_ema=0.55,
+        )
+        assert record.varentropy == 0.42
+        assert record.min_p_used == 0.025
+        assert record.preset_active == "creative_sampling"
+        assert record.h_ema == 1.23
+        assert record.vh_ema == 0.55
+        with pytest.raises(AttributeError):
+            record.varentropy = 0.0  # type: ignore[misc]
+
 
 class TestSamplingLogger:
     """Tests for SamplingLogger."""

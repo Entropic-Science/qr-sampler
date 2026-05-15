@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +29,11 @@ class TokenSamplingRecord:
         token_prob: Probability of the selected token.
         num_candidates: Number of tokens surviving filtering.
         config_hash: 16-char SHA-256 prefix of the active config.
+        varentropy: Varentropy ``VH`` of the logit distribution (HVH-Drift only).
+        min_p_used: Effective per-token min-p threshold applied by the selector.
+        preset_active: Name of the active preset (env-var derived), if any.
+        h_ema: Smoothed entropy EMA after the current update (HVH-Drift only).
+        vh_ema: Smoothed varentropy EMA after the current update (HVH-Drift only).
     """
 
     # Timing
@@ -58,3 +63,11 @@ class TokenSamplingRecord:
 
     # Config snapshot
     config_hash: str
+
+    # Optional HVH-Drift / preset diagnostics. ``None`` for non-HVH strategies
+    # so existing call sites and downstream consumers stay backward-compatible.
+    varentropy: float | None = field(default=None)
+    min_p_used: float | None = field(default=None)
+    preset_active: str | None = field(default=None)
+    h_ema: float | None = field(default=None)
+    vh_ema: float | None = field(default=None)
