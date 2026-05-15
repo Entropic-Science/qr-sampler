@@ -68,6 +68,7 @@ src/qr_sampler/
 +-- exceptions.py                  # QRSamplerError -> {EntropyUnavailableError, ConfigValidationError, SignalAmplificationError, TokenSelectionError}
 +-- processor.py                   # Re-export: VLLMAdapter as QRSamplerLogitsProcessor (backward compat)
 +-- py.typed                       # PEP 561 marker
++-- presets.py                     # BUILTIN_PRESETS, resolve_preset(), expand_extra_args() -- preset resolution layer over extra_args
 +-- core/                          # Engine-agnostic sampling pipeline (NO torch/vLLM imports)
 |   +-- __init__.py                # Re-exports SamplingPipeline, SamplingResult, build_pipeline, etc.
 |   +-- pipeline.py                # SamplingPipeline class + factory functions (build_pipeline, build_entropy_source, config_hash, accepts_config)
@@ -95,8 +96,11 @@ src/qr_sampler/
 |   |   +-- zscore_mean.yaml       # Z-score mean amplifier
 |   |   +-- ecdf.yaml              # ECDF amplifier
 |   +-- samplers/
-|       +-- fixed.yaml             # Fixed temperature sampler
-|       +-- edt.yaml               # Entropy-dependent temperature sampler
+|   |   +-- fixed.yaml             # Fixed temperature sampler
+|   |   +-- edt.yaml               # Entropy-dependent temperature sampler
+|   +-- presets/
+|       +-- creative_sampling.yaml # V6_HVD_R01_01 hvh_drift preset (experimental)
+|       +-- normal_t1.yaml         # Baseline fixed T=1 preset
 +-- cli/                           # Command-line interface (requires [cli] extra: click + jinja2)
 |   +-- __init__.py
 |   +-- main.py                    # Click group with version_option
@@ -142,6 +146,7 @@ src/qr_sampler/
     +-- registry.py                # TemperatureStrategyRegistry (passes vocab_size if constructor accepts it)
     +-- fixed.py                   # FixedTemperatureStrategy: constant temperature
     +-- edt.py                     # EDTTemperatureStrategy: entropy-dependent, H_norm^exp scaling
+    +-- hvh_drift.py               # HVHDriftStrategy: stateful per-request EMA-driven temperature + dynamic min-p (V6 creative_sampling)
 
 tests/
 +-- __init__.py
@@ -156,6 +161,10 @@ tests/
 +-- test_engines/
 |   +-- test_vllm_adapter.py       # VLLMAdapter delegates to pipeline, batch processing, one-hot forcing
 |   +-- test_registry.py           # EngineAdapterRegistry decorator, entry-point discovery, list_available
+|   +-- test_hvh_drift_lifecycle.py # Per-request state isolation for HVHDriftStrategy via _RequestState
++-- test_presets/
+|   +-- test_resolution.py         # resolve_preset, expand_extra_args, per-request precedence, env-var fallback
+|   +-- test_yaml_sync.py          # Drift guard: YAML overrides must match BUILTIN_PRESETS key-for-key
 +-- test_profiles/
 |   +-- test_schema.py             # Pydantic validation of profile models, frozen enforcement
 |   +-- test_loader.py             # Load built-in profiles, user overrides, missing profile error
@@ -164,7 +173,9 @@ tests/
 |   +-- test_validate.py           # Click CliRunner: exit codes 0/1/2 for known-working/untested/incompatible
 |   +-- test_build.py              # Compose generation, --dry-run, --output, --force
 |   +-- test_list.py               # All list subcommands return expected profile data
+|   +-- test_list_presets.py       # `qr-sampler list presets` shows both presets, experimental flag
 |   +-- test_info.py               # Detailed info output for each component type
+|   +-- test_info_preset.py        # `qr-sampler info preset <id>` outputs override map, V6 values
 +-- test_amplification/
 |   +-- test_zscore.py             # Known values, SEM derivation, edge cases, frozen immutability
 |   +-- test_ecdf.py               # ECDF amplifier tests
@@ -180,9 +191,11 @@ tests/
 |   +-- test_logger.py             # Record immutability, log levels, diagnostic mode, summary stats
 +-- test_selection/
 |   +-- test_selector.py           # CDF known values, top-k/top-p, edge cases
+|   +-- test_min_p.py              # min_p mask: no-op at 0.0, threshold semantics, ordering vs top_p
 +-- test_temperature/
     +-- test_fixed.py              # Constant output, Shannon entropy computation
     +-- test_edt.py                # Monotonicity, clamping, exponent effects
+    +-- test_hvh_drift.py          # HVHDriftStrategy: EMA init, drift formula, clamps, V6 reference values
 
 examples/
 +-- servers/
@@ -234,6 +247,12 @@ examples/
 15. **The core pipeline has zero engine dependencies.** `qr_sampler.core` is importable and functional without vLLM, torch, MLX, or any engine package. Only numpy and runtime deps (pydantic, grpcio, etc.) are used.
 
 16. **Profile loading never affects runtime sampling.** Profiles exist for CLI validation and documentation. The existing registry/config system drives all runtime decisions. Missing or corrupt profile YAML never causes sampling failure.
+
+17. **Stateful temperature strategies are per-request, not per-process.** The `hvh_drift` strategy carries EMA state (`H_ema`, `VH_ema`) on the strategy instance. Each request gets its own strategy instance via `_RequestState.strategy` (managed by the engine adapter). Strategy instances must never be shared across requests — that would leak distributional drift between concurrent users. Built-in stateless strategies (`fixed`, `edt`) are safe to share but are constructed fresh per request anyway for uniformity.
+
+18. **Selector pipeline order is `top-k → softmax → min-p → top-p → CDF`.** The `min_p` step (added for `hvh_drift`) sits between softmax and top-p so the threshold is applied to normalized probabilities relative to the top probability mass. `min_p=0.0` (the default) is a strict no-op and preserves prior behavior byte-for-byte. The threshold semantic is "keep tokens with `prob >= min_p * max_prob`"; if everything would be masked, argmax is reserved.
+
+19. **Presets are a thin resolution layer over `extra_args`, expanded inside `resolve_config` before `validate_extra_args`.** `BUILTIN_PRESETS` in `presets.py` is the runtime source of truth; YAML files under `profiles/presets/` are documentation only. A drift-guard test (`tests/test_presets/test_yaml_sync.py`) keeps the two in sync. `expand_extra_args` consumes a `qr_preset` key (per-request) or the `QR_PRESET` env var (process-wide default) and produces the equivalent `qr_*` extra_args dict, with caller-supplied keys winning over preset values. Engine adapters do not need to know about presets — resolution happens engine-agnostically.
 
 ## Coding conventions
 
@@ -405,6 +424,16 @@ All modes use `grpc.aio` (asyncio) on a background thread with sync wrappers via
 3. Include `id`, `name`, `description`, and all relevant compatibility cross-references
 4. Add tests in `tests/test_profiles/` to validate the new profile loads correctly
 5. User overrides go in `$QR_PROFILES_DIR` or `~/.qr-sampler/profiles/` (same directory structure)
+
+### New preset
+
+A preset is a named bundle of `qr_*` overrides that callers can opt into via `qr_preset` (per-request) or `QR_PRESET` (env var). The runtime entry lives in `presets.py`; the YAML entry is documentation only.
+
+1. Add a new entry to `BUILTIN_PRESETS` in `src/qr_sampler/presets.py` -- a dict of `qr_*` keys to values (omit the `qr_` prefix for the inner keys; `resolve_preset` adds it)
+2. Create the matching YAML file `src/qr_sampler/profiles/presets/<id>.yaml` with fields `id`, `name`, `description`, `experimental`, `origin`, and an `overrides:` map whose keys/values exactly match the `BUILTIN_PRESETS` entry
+3. The drift-guard test in `tests/test_presets/test_yaml_sync.py` iterates over `BUILTIN_PRESETS` automatically -- no test change needed if the YAML matches
+4. Add CLI integration tests in `tests/test_cli/test_list_presets.py` and `tests/test_cli/test_info_preset.py` if the preset has behaviour worth surfacing (e.g., experimental flag, origin link)
+5. If the preset is experimental, mention "experimental" prominently in the YAML `description` so it appears in `qr-sampler info preset <id>` output
 
 ## Testing approach
 
