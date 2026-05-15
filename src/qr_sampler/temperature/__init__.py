@@ -11,11 +11,13 @@ from qr_sampler.temperature.base import (
 )
 from qr_sampler.temperature.edt import EDTTemperatureStrategy
 from qr_sampler.temperature.fixed import FixedTemperatureStrategy
+from qr_sampler.temperature.hvh_drift import HVHDriftStrategy
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 __all__ = [
     "EDTTemperatureStrategy",
     "FixedTemperatureStrategy",
+    "HVHDriftStrategy",
     "TemperatureResult",
     "TemperatureStrategy",
     "TemperatureStrategyRegistry",
