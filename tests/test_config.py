@@ -273,14 +273,20 @@ class TestResolveConfig:
     def test_preset_not_in_per_request_fields(self, default_config: QRSamplerConfig) -> None:
         """preset is NOT per-request overridable via the normal field-merge path.
 
-        Step 5 will introduce expand_extra_args() which handles qr_preset before
-        validate_extra_args runs. Until then (and as a permanent contract guard),
-        qr_preset routed through validate_extra_args must be rejected so the two
-        paths cannot diverge.
+        ``preset`` itself is an infrastructure-only field (set by QR_PRESET),
+        so it must never appear in ``_PER_REQUEST_FIELDS``. The selection
+        surface uses ``qr_preset`` as a special key that ``resolve_config``
+        and ``validate_extra_args`` both recognize via the preset-resolution
+        layer (it expands into concrete qr_* overrides before merging).
         """
         assert "preset" not in _PER_REQUEST_FIELDS
-        with pytest.raises(ConfigValidationError, match="infrastructure field"):
-            validate_extra_args({"qr_preset": "creative_sampling"})
+        # Known preset names must be accepted (the validation hook needs to
+        # let qr_preset through so the vLLM per-request preset flow works).
+        validate_extra_args({"qr_preset": "creative_sampling"})
+        validate_extra_args({"qr_preset": "normal_t1"})
+        # Unknown preset names must be rejected with a helpful message.
+        with pytest.raises(ConfigValidationError, match="Unknown preset"):
+            validate_extra_args({"qr_preset": "not_a_real_preset"})
 
 
 # ---------------------------------------------------------------------------

@@ -331,14 +331,32 @@ def validate_extra_args(extra_args: dict[str, Any]) -> None:
     This is called by validate_params() at request creation time to
     reject bad keys early, before the request enters the batch.
 
+    ``qr_preset`` is accepted here as a special case (the preset itself
+    is not a per-request-overridable field, but selecting a preset *by
+    name* is the supported per-request surface; resolve_config()
+    expands it into concrete overrides before merging). The preset name
+    is validated against ``BUILTIN_PRESETS`` so unknown names fail at
+    the same point as unknown qr_* keys.
+
     Args:
         extra_args: Dictionary of extra arguments, potentially with qr_ prefix.
 
     Raises:
-        ConfigValidationError: If any qr_* key is unknown or non-overridable.
+        ConfigValidationError: If any qr_* key is unknown or non-overridable,
+            or if ``qr_preset`` names an unknown preset.
     """
+    # Imported lazily to mirror resolve_config's import-cycle workaround.
+    from qr_sampler.presets import BUILTIN_PRESETS
+
     for key in extra_args:
         if not key.startswith("qr_"):
+            continue
+        if key == "qr_preset":
+            preset_name = extra_args[key]
+            if preset_name not in BUILTIN_PRESETS:
+                raise ConfigValidationError(
+                    f"Unknown preset {preset_name!r}; known: {sorted(BUILTIN_PRESETS)}"
+                )
             continue
         field_name = _strip_prefix(key)
         if field_name not in _ALL_FIELDS:

@@ -447,6 +447,34 @@ class TestValidateParams:
         params = MockSamplingParams(extra_args=None)
         VLLMAdapter.validate_params(params)
 
+    def test_qr_preset_accepted(self) -> None:
+        """A known qr_preset must pass validation.
+
+        Regression guard: validate_params is vLLM's pre-batch validation
+        hook. Without preset awareness it would reject every request that
+        opts into a preset via ``extra_args={"qr_preset": "..."}``,
+        breaking the documented per-request preset flow (README curl
+        example, Open WebUI UserValves toggle, Python client examples).
+        """
+        params = MockSamplingParams(extra_args={"qr_preset": "creative_sampling"})
+        VLLMAdapter.validate_params(params)
+
+        params = MockSamplingParams(extra_args={"qr_preset": "normal_t1"})
+        VLLMAdapter.validate_params(params)
+
+    def test_qr_preset_with_extra_overrides_accepted(self) -> None:
+        """A preset alongside per-request overrides must pass validation."""
+        params = MockSamplingParams(
+            extra_args={"qr_preset": "creative_sampling", "qr_hvh_t_base": 1.2},
+        )
+        VLLMAdapter.validate_params(params)
+
+    def test_unknown_qr_preset_raises(self) -> None:
+        """Unknown preset name fails with a helpful error message."""
+        params = MockSamplingParams(extra_args={"qr_preset": "not_a_real_preset"})
+        with pytest.raises(ConfigValidationError, match="Unknown preset"):
+            VLLMAdapter.validate_params(params)
+
 
 # ---------------------------------------------------------------------------
 # Tests: Diagnostic logging

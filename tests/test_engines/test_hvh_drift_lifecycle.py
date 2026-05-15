@@ -189,6 +189,64 @@ def test_state_is_per_request() -> None:
         adapter.close()
 
 
+def test_no_state_leak_when_default_strategy_is_hvh_drift() -> None:
+    """Two requests with empty extra_args must STILL get independent strategies
+    when the *default config* itself selects ``hvh_drift``.
+
+    Regression guard: ``update_state`` previously reused
+    ``self._pipeline.strategy`` whenever ``req_config is self._default_config``
+    (the short-circuit path of ``resolve_config`` returns the defaults
+    object identity when ``extra_args`` is empty). For a stateless ``fixed``
+    or ``edt`` strategy that is harmless, but for ``hvh_drift`` it would
+    mean every request sharing the SAME EMA state — a covert channel
+    between concurrent users that violates CLAUDE.md invariant 17.
+    """
+    env = {
+        "QR_ENTROPY_SOURCE_TYPE": "mock_uniform",
+        "QR_FALLBACK_MODE": "error",
+        "QR_LOG_LEVEL": "none",
+        # Drive the pipeline default to hvh_drift via env var, NOT via preset.
+        # This is the scenario the reviewer flagged as unsafe.
+        "QR_TEMPERATURE_STRATEGY": "hvh_drift",
+    }
+    old: dict[str, str | None] = {k: os.environ.get(k) for k in env}
+    for k, v in env.items():
+        os.environ[k] = v
+    try:
+        adapter = VLLMAdapter(vllm_config=_MockVllmConfig(vocab_size=16))
+        try:
+            # Both requests have EMPTY extra_args -- so resolve_config's
+            # short-circuit returns the defaults object by identity.
+            adapter.update_state(
+                _MockBatchUpdate(
+                    added=[
+                        _MockAddedRequest(req_index=0, sampling_params=_MockSamplingParams()),
+                        _MockAddedRequest(req_index=1, sampling_params=_MockSamplingParams()),
+                    ],
+                ),
+            )
+
+            strat_a = adapter._request_states[0].strategy
+            strat_b = adapter._request_states[1].strategy
+            assert isinstance(strat_a, HVHDriftStrategy)
+            assert isinstance(strat_b, HVHDriftStrategy)
+            # Each request must hold its own fresh strategy instance.
+            assert strat_a is not strat_b, (
+                "Default-config request reused the pipeline's shared strategy: "
+                "EMA state would leak between concurrent users."
+            )
+            assert strat_a is not adapter.get_pipeline().strategy
+            assert strat_b is not adapter.get_pipeline().strategy
+        finally:
+            adapter.close()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_state_evicted_on_remove() -> None:
     """``update_state(removed=...)`` drops the adapter's reference to the
     request's strategy (NFR-3 memory bound / NFR-8a).
