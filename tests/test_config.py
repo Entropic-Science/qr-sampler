@@ -247,7 +247,6 @@ class TestNonOverridableFields:
             "grpc_api_key",
             "grpc_api_key_header",
             "fallback_mode",
-            "entropy_source_type",
             "oe_sources",
             "oe_parallel",
             "oe_timeout",
@@ -272,7 +271,6 @@ class TestNonOverridableFields:
             "grpc_api_key",
             "grpc_api_key_header",
             "fallback_mode",
-            "entropy_source_type",
             "oe_sources",
             "oe_parallel",
             "oe_timeout",
@@ -331,7 +329,11 @@ class TestFieldSets:
         assert "grpc_api_key" in infra_fields
         assert "grpc_api_key_header" in infra_fields
         assert "fallback_mode" in infra_fields
-        assert "entropy_source_type" in infra_fields
+
+    def test_entropy_source_type_is_per_request(self) -> None:
+        """entropy_source_type is per-request overridable so comparison mode
+        can route requests to different entropy sources on the same engine."""
+        assert "entropy_source_type" in _PER_REQUEST_FIELDS
 
     def test_all_fields_populated(self) -> None:
         """_ALL_FIELDS should contain every model field."""

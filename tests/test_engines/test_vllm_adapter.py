@@ -94,11 +94,16 @@ def _make_adapter(
     vocab_size: int = 10,
     entropy_source_type: str = "mock_uniform",
     fallback_mode: str = "error",
+    preinit_sources: str | None = None,
     **config_overrides: Any,
 ) -> VLLMAdapter:
     """Create an adapter using mock entropy (no gRPC, no GPU).
 
     Sets environment variables to configure, then instantiates.
+
+    ``preinit_sources`` (mapped to ``QR_PREINIT_ENTROPY_SOURCES``) defaults
+    to ``entropy_source_type`` so tests do not pay the gRPC connection cost
+    that the production default ``"quantum_grpc,system"`` would incur.
     """
     import os
 
@@ -106,6 +111,9 @@ def _make_adapter(
         "QR_ENTROPY_SOURCE_TYPE": entropy_source_type,
         "QR_FALLBACK_MODE": fallback_mode,
         "QR_LOG_LEVEL": "none",
+        "QR_PREINIT_ENTROPY_SOURCES": (
+            preinit_sources if preinit_sources is not None else entropy_source_type
+        ),
     }
     for key, value in config_overrides.items():
         env_vars[f"QR_{key.upper()}"] = str(value)
@@ -164,6 +172,7 @@ class TestVLLMAdapterInit:
         os.environ["QR_ENTROPY_SOURCE_TYPE"] = "mock_uniform"
         os.environ["QR_FALLBACK_MODE"] = "error"
         os.environ["QR_LOG_LEVEL"] = "none"
+        os.environ["QR_PREINIT_ENTROPY_SOURCES"] = "mock_uniform"
         try:
             adapter = VLLMAdapter(vllm_config=None)
             assert adapter._vocab_size == _DEFAULT_VOCAB_SIZE
@@ -171,6 +180,7 @@ class TestVLLMAdapterInit:
             os.environ.pop("QR_ENTROPY_SOURCE_TYPE", None)
             os.environ.pop("QR_FALLBACK_MODE", None)
             os.environ.pop("QR_LOG_LEVEL", None)
+            os.environ.pop("QR_PREINIT_ENTROPY_SOURCES", None)
 
     def test_init_with_nested_vllm_config(self) -> None:
         """Extracts vocab_size from nested vLLM config structure."""
@@ -511,3 +521,152 @@ class TestBackwardCompatibility:
         assert SamplingPipeline is not None
         assert SamplingResult is not None
         assert build_pipeline is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests: Per-request entropy source override
+# ---------------------------------------------------------------------------
+
+
+class TestPerRequestEntropySourceOverride:
+    """Tests for the per-request ``qr_entropy_source_type`` override.
+
+    Comparison mode depends on this: the OWUI pipe issues two parallel
+    requests against one vLLM engine, one with ``quantum_grpc`` entropy
+    and one with ``system`` entropy. The same model weights and KV cache
+    are shared; only the entropy source differs.
+    """
+
+    def test_preinit_sources_from_env(self) -> None:
+        """The adapter pre-initialises one pipeline per source in the env."""
+        adapter = _make_adapter(
+            entropy_source_type="mock_uniform",
+            preinit_sources="mock_uniform,system",
+        )
+        assert set(adapter._pipelines.keys()) == {"mock_uniform", "system"}
+        # Each pipeline points at the right entropy source class.
+        assert adapter._pipelines["mock_uniform"].entropy_source.name == "mock_uniform"
+        assert adapter._pipelines["system"].entropy_source.name == "system"
+        adapter.close()
+
+    def test_default_source_always_present(self) -> None:
+        """If the env list omits the default source, it is auto-included."""
+        adapter = _make_adapter(
+            entropy_source_type="mock_uniform",
+            preinit_sources="system",
+        )
+        # mock_uniform is the default → must be present even though the env
+        # list only mentioned 'system'.
+        assert "mock_uniform" in adapter._pipelines
+        assert "system" in adapter._pipelines
+        adapter.close()
+
+    def test_preinit_whitespace_tolerated(self) -> None:
+        """Whitespace around commas in the env list is stripped."""
+        adapter = _make_adapter(
+            entropy_source_type="mock_uniform",
+            preinit_sources=" mock_uniform , system ,",
+        )
+        assert set(adapter._pipelines.keys()) == {"mock_uniform", "system"}
+        adapter.close()
+
+    def test_per_request_source_override(self) -> None:
+        """Two requests in one batch with different qr_entropy_source_type
+        end up routed to pipelines with the correct entropy sources."""
+        from qr_sampler.entropy.mock import MockUniformSource
+        from qr_sampler.entropy.system import SystemEntropySource
+
+        adapter = _make_adapter(
+            entropy_source_type="mock_uniform",
+            preinit_sources="mock_uniform,system",
+        )
+
+        batch = MockBatchUpdate(
+            added=[
+                MockAddedRequest(
+                    req_index=0,
+                    sampling_params=MockSamplingParams(
+                        extra_args={"qr_entropy_source_type": "mock_uniform"},
+                    ),
+                ),
+                MockAddedRequest(
+                    req_index=1,
+                    sampling_params=MockSamplingParams(
+                        extra_args={"qr_entropy_source_type": "system"},
+                    ),
+                ),
+            ]
+        )
+        adapter.update_state(batch)
+
+        # Per the plan test description: assert each used the correct source
+        # via _request_states[i].source.__class__.__name__.
+        assert adapter._request_states[0].source.__class__ is MockUniformSource
+        assert adapter._request_states[1].source.__class__ is SystemEntropySource
+
+        # Both pipelines are distinct — fan-out is not aliasing one pipeline.
+        assert adapter._request_states[0].pipeline is not adapter._request_states[1].pipeline
+
+        # And apply() still produces valid one-hot output for both rows.
+        logits = np.array(
+            [
+                [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0],
+                [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0],
+            ]
+        )
+        result = adapter.apply(logits)
+        for i in range(2):
+            row = result[i]
+            assert np.sum(row == 0.0) == 1
+            assert np.sum(np.isneginf(row)) == 9
+
+        adapter.close()
+
+    def test_rejects_uninit_source(self) -> None:
+        """Requesting an entropy source that was not pre-initialised raises
+        a clean ConfigValidationError, not a KeyError or AttributeError."""
+        adapter = _make_adapter(
+            entropy_source_type="system",
+            preinit_sources="system",
+        )
+
+        batch = MockBatchUpdate(
+            added=[
+                MockAddedRequest(
+                    req_index=0,
+                    sampling_params=MockSamplingParams(
+                        extra_args={"qr_entropy_source_type": "openentropy"},
+                    ),
+                ),
+            ]
+        )
+        with pytest.raises(ConfigValidationError, match="not pre-initialised"):
+            adapter.update_state(batch)
+        adapter.close()
+
+    def test_validate_params_accepts_entropy_source_type(self) -> None:
+        """validate_params() accepts qr_entropy_source_type — the field is
+        per-request overridable. The hard rejection for un-preinit'd values
+        happens later in update_state(), once the adapter is in the loop."""
+        params = MockSamplingParams(extra_args={"qr_entropy_source_type": "system"})
+        VLLMAdapter.validate_params(params)  # Should not raise.
+
+    def test_no_override_uses_default_source(self) -> None:
+        """A request with no qr_entropy_source_type override routes to the
+        pipeline matching the default source."""
+        from qr_sampler.entropy.mock import MockUniformSource
+
+        adapter = _make_adapter(
+            entropy_source_type="mock_uniform",
+            preinit_sources="mock_uniform,system",
+        )
+
+        batch = MockBatchUpdate(
+            added=[
+                MockAddedRequest(req_index=0, sampling_params=MockSamplingParams()),
+            ]
+        )
+        adapter.update_state(batch)
+
+        assert adapter._request_states[0].source.__class__ is MockUniformSource
+        adapter.close()
