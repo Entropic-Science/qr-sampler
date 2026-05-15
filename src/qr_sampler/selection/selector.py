@@ -31,6 +31,7 @@ class TokenSelector:
         top_k: int,
         top_p: float,
         u: float,
+        min_p: float = 0.0,
     ) -> SelectionResult:
         """Select one token from the logit distribution using CDF lookup.
 
@@ -38,10 +39,11 @@ class TokenSelector:
             1. Temperature scaling: logits / T
             2. Top-k filtering: keep only k highest logits
             3. Softmax: convert to probabilities
-            4. Top-p (nucleus): keep minimal set with cumulative prob >= p
-            5. Descending sort by probability
-            6. Build CDF via cumulative sum
-            7. Binary search with u to select token
+            4. Min-p mask: keep tokens with prob >= min_p * max_prob
+            5. Top-p (nucleus): keep minimal set with cumulative prob >= p
+            6. Descending sort by probability
+            7. Build CDF via cumulative sum
+            8. Binary search with u to select token
 
         Args:
             logits: 1-D logit array (vocab_size,).
@@ -49,6 +51,9 @@ class TokenSelector:
             top_k: Number of top tokens to keep (<=0 disables).
             top_p: Nucleus sampling threshold in (0, 1] (1.0 disables).
             u: Uniform random value from signal amplification, in (0, 1).
+            min_p: Dynamic floor relative to peak probability. Keeps tokens with
+                ``prob >= min_p * max_prob``. ``0.0`` (default) disables, making
+                this a no-op so existing call sites are unaffected.
 
         Returns:
             SelectionResult with the selected token and diagnostics.
@@ -77,13 +82,16 @@ class TokenSelector:
         # 3. Softmax.
         probs = self._stable_softmax(scaled)
 
-        # 4. Top-p (nucleus) filtering.
+        # 4. Min-p mask.
+        probs, effective_min_p_candidates = self._apply_min_p(probs, min_p)
+
+        # 5. Top-p (nucleus) filtering.
         probs, effective_n = self._apply_top_p(probs, top_p)
 
         if effective_n == 0:
             raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
 
-        # 5-7. CDF selection.
+        # 6-8. CDF selection.
         vocab_idx, rank, prob, num_candidates = self._cdf_select(probs, u)
 
         return SelectionResult(
@@ -94,9 +102,46 @@ class TokenSelector:
             diagnostics={
                 "effective_top_k": effective_k,
                 "effective_top_p_candidates": effective_n,
+                "effective_min_p_candidates": effective_min_p_candidates,
+                "min_p_used": min_p,
                 "u": u,
             },
         )
+
+    @staticmethod
+    def _apply_min_p(probs: np.ndarray, min_p: float) -> tuple[np.ndarray, int]:
+        """Dynamic floor mask: keep tokens with prob >= min_p * max_prob.
+
+        Acts as a peak-relative cutoff that adapts to distribution shape: when
+        the distribution is peaked, few tokens survive; when flat, many do. This
+        is a numpy port of the V6 HVH-Drift reference (hvh_drift.py:157-163).
+
+        Args:
+            probs: Probability array (vocab_size,). Must already be normalized.
+            min_p: Threshold scale in [0, 1]. ``0.0`` disables (no-op).
+
+        Returns:
+            Tuple of (renormalized probability array, number of surviving tokens).
+            If ``min_p == 0.0``, returns the input unchanged with the count of
+            non-zero entries.
+        """
+        if min_p <= 0.0:
+            return probs, int(np.sum(probs > 0))
+
+        top_prob = float(probs.max())
+        mask = probs >= min_p * top_prob
+
+        if not mask.any():
+            # Pathological case: reserve argmax to avoid empty CDF.
+            mask = np.zeros_like(probs, dtype=bool)
+            mask[int(np.argmax(probs))] = True
+
+        result = np.where(mask, probs, 0.0)
+        total = float(result.sum())
+        if total > 0.0:
+            result = result / total
+
+        return result, int(mask.sum())
 
     @staticmethod
     def _apply_top_k(logits: np.ndarray, k: int) -> tuple[np.ndarray, int]:
