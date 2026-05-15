@@ -1,0 +1,30 @@
+id: creative_sampling
+name: "Creative Sampling"
+description: |
+  Experimental dynamic-temperature preset based on the HVH-Drift family.
+  Matches the V6_HVD_R01_01 winning configuration from
+  createmp-evalsuite (results/v6/round_final).
+
+  The strategy combines per-sequence EMA tracking of Shannon entropy (H)
+  and varentropy (VH) with drift-driven temperature and min-p scaling.
+  Quantum-entropy still drives final token selection; this preset only
+  shapes the temperature and min-p truncation per token.
+
+  Tuning is held verbatim from the V6 winner; per-request overrides
+  (``qr_hvh_*`` keys) take precedence if a caller supplies them.
+
+experimental: true
+origin: "V6_HVD_R01_01 (createmp-evalsuite/results/v6/round_final)"
+overrides:
+  temperature_strategy: hvh_drift
+  hvh_t_base: 1.35
+  hvh_alpha_h: 0.3
+  hvh_alpha_vh: -0.2
+  hvh_gamma_dh: 1.0
+  hvh_delta_dvh: 0.5
+  hvh_lambda_ema: 0.02
+  hvh_min_p_base: 0.025
+  hvh_kappa_h: 0.03
+  hvh_nu_dh: 0.02
+  top_k: 0
+  top_p: 1.0

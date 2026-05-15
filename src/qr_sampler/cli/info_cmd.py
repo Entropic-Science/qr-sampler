@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         AmplifierProfile,
         EngineProfile,
         EntropySourceProfile,
+        PresetProfile,
         SamplerProfile,
     )
 
@@ -114,11 +115,28 @@ def _print_sampler(profile: SamplerProfile) -> None:
     click.echo(_format_field("Requires vocab_size", str(profile.requires_vocab_size)))
 
 
+def _print_preset(profile: PresetProfile) -> None:
+    """Print detailed preset profile info."""
+    label = f"Preset: {profile.name}"
+    if profile.experimental:
+        label += " [experimental]"
+    click.echo(click.style(label, bold=True))
+    click.echo(_format_field("ID", profile.id))
+    if profile.origin:
+        click.echo(_format_field("Origin", profile.origin))
+    if profile.description:
+        click.echo(_format_field("Description", profile.description))
+    if profile.overrides:
+        click.echo("  Overrides:")
+        for k, v in sorted(profile.overrides.items()):
+            click.echo(f"    {k}: {v}")
+
+
 @click.command()
 @click.argument(
     "component_type",
     type=click.Choice(
-        ["engine", "entropy", "amplifier", "sampler"],
+        ["engine", "entropy", "amplifier", "sampler", "preset"],
         case_sensitive=False,
     ),
 )
@@ -126,8 +144,8 @@ def _print_sampler(profile: SamplerProfile) -> None:
 def info(component_type: str, name: str) -> None:
     """Show detailed info about a component profile.
 
-    COMPONENT_TYPE is one of: engine, entropy, amplifier, sampler.
-    NAME is the profile identifier (e.g. vllm, quantum_grpc).
+    COMPONENT_TYPE is one of: engine, entropy, amplifier, sampler, preset.
+    NAME is the profile identifier (e.g. vllm, quantum_grpc, creative_sampling).
     """
     loader = ProfileLoader()
 
@@ -140,5 +158,7 @@ def info(component_type: str, name: str) -> None:
             _print_amplifier(loader.load_amplifier(name))
         elif component_type == "sampler":
             _print_sampler(loader.load_sampler(name))
+        elif component_type == "preset":
+            _print_preset(loader.load_preset(name))
     except KeyError as exc:
         raise click.ClickException(str(exc)) from exc

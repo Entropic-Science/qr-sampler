@@ -104,3 +104,23 @@ class SamplerProfile(BaseModel):
     performance_impact: str = "none"
     build_time_locked: bool = False
     requires_vocab_size: bool = False
+
+
+class PresetProfile(BaseModel):
+    """Declarative profile for a named sampling preset.
+
+    A preset is a documented bundle of per-request overrides surfaced
+    through the CLI (``qr-sampler list presets`` / ``info preset <id>``)
+    and the Open WebUI user toggle. Runtime expansion lives in
+    ``qr_sampler.presets.BUILTIN_PRESETS``; this YAML-backed profile is
+    documentation that a sync test holds in lock-step with the dict.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    name: str
+    description: str
+    experimental: bool
+    origin: str | None = None
+    overrides: dict[str, Any] = Field(default_factory=dict)

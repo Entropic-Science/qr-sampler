@@ -121,3 +121,20 @@ def samplers() -> None:
         click.echo(f"  {p.id:<20s} {p.name}{impact}")
         if p.description:
             click.echo(f"  {'':<20s} {p.description}")
+
+
+@list_profiles.command()
+def presets() -> None:
+    """List available sampling preset profiles."""
+    loader = ProfileLoader()
+    profiles = loader.list_presets()
+    if not profiles:
+        click.echo("No preset profiles found.")
+        return
+    for p in profiles:
+        flag = " [experimental]" if p.experimental else ""
+        click.echo(f"  {p.id:<20s} {p.name}{flag}")
+        if p.origin:
+            click.echo(f"  {'':<20s} origin: {p.origin}")
+        if p.description:
+            click.echo(f"  {'':<20s} {p.description}")
