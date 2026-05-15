@@ -362,6 +362,10 @@ def resolve_config(
     Only fields in _PER_REQUEST_FIELDS are overridable. Keys without the
     'qr_' prefix are silently ignored (they belong to other processors).
 
+    Preset expansion runs first: ``qr_preset`` in extra_args (or
+    ``defaults.preset`` from QR_PRESET) is expanded into concrete
+    ``qr_*`` overrides before the normal field-merge path.
+
     Args:
         defaults: The base configuration loaded from environment.
         extra_args: Per-request overrides from SamplingParams.extra_args.
@@ -372,6 +376,10 @@ def resolve_config(
     Raises:
         ConfigValidationError: If any qr_* key is unknown or non-overridable.
     """
+    # Imported here to avoid a circular import (presets -> config).
+    from qr_sampler.presets import expand_extra_args
+
+    extra_args = expand_extra_args(extra_args, defaults)
     if not extra_args:
         return defaults
 
