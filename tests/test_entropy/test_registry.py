@@ -142,3 +142,41 @@ class TestEntropySourceRegistry:
         EntropySourceRegistry._reset()
         assert "reset_test" not in EntropySourceRegistry._registry
         assert EntropySourceRegistry._entry_points_loaded is False
+
+    def test_all_sources_returns_full_mapping(self) -> None:
+        """all_sources() returns name->class for every registered source."""
+
+        @EntropySourceRegistry.register("all_a")
+        class SourceA(_DummySource):
+            pass
+
+        @EntropySourceRegistry.register("all_b")
+        class SourceB(_DummySource):
+            pass
+
+        mapping = EntropySourceRegistry.all_sources()
+        assert mapping["all_a"] is SourceA
+        assert mapping["all_b"] is SourceB
+
+    def test_all_sources_triggers_entry_point_load(self) -> None:
+        """all_sources() loads entry points on first call, like list_available()."""
+        EntropySourceRegistry._entry_points_loaded = False
+        EntropySourceRegistry._registry.pop("ep_only", None)
+
+        mock_ep = MagicMock()
+        mock_ep.name = "ep_only"
+        mock_ep.value = "some.module:SomeClass"
+        mock_ep.load.return_value = _DummySource
+
+        with patch("importlib.metadata.entry_points", return_value=[mock_ep]):
+            mapping = EntropySourceRegistry.all_sources()
+
+        assert "ep_only" in mapping
+        assert mapping["ep_only"] is _DummySource
+
+    def test_all_sources_returns_independent_copy(self) -> None:
+        """Mutating the returned dict does not affect the registry."""
+        EntropySourceRegistry.register("copy_test")(_DummySource)
+        mapping = EntropySourceRegistry.all_sources()
+        mapping.pop("copy_test", None)
+        assert "copy_test" in EntropySourceRegistry._registry

@@ -38,6 +38,11 @@ _PER_REQUEST_FIELDS: frozenset[str] = frozenset(
         "log_level",
         "diagnostic_mode",
         "oe_conditioning",
+        # Per-request switchable so comparison mode can fan out two requests
+        # to the same engine instance with different entropy sources. The
+        # engine adapter additionally constrains the allowed values at startup
+        # to the set of entropy sources it has pre-initialised.
+        "entropy_source_type",
     }
 )
 

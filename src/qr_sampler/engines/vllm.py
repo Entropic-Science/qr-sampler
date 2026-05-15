@@ -21,6 +21,7 @@ separate instances for different sampling strategies.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -30,6 +31,7 @@ from qr_sampler.config import QRSamplerConfig, resolve_config, validate_extra_ar
 from qr_sampler.core.pipeline import SamplingPipeline, build_pipeline, config_hash
 from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.engines.registry import EngineAdapterRegistry
+from qr_sampler.exceptions import ConfigValidationError
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 if TYPE_CHECKING:
@@ -42,30 +44,46 @@ logger = logging.getLogger("qr_sampler")
 # Default vocabulary size when vllm_config does not provide one (testing).
 _DEFAULT_VOCAB_SIZE = 32000
 
+# Env var listing the entropy sources to pre-initialise at adapter startup.
+# Comma-separated; whitespace tolerated. A per-request ``qr_entropy_source_type``
+# override must name one of these — anything else is rejected when the request
+# is added to the batch.
+_PREINIT_ENV_VAR = "QR_PREINIT_ENTROPY_SOURCES"
+_DEFAULT_PREINIT = "quantum_grpc,system"
+
 
 class _RequestState:
     """Per-request state tracked across engine steps.
 
     Attributes:
+        pipeline: The pre-initialised pipeline whose entropy source matches
+            this request's ``entropy_source_type``. All sampling for this
+            request flows through this pipeline.
         config: Resolved per-request configuration.
         amplifier: Signal amplifier for this request.
         strategy: Temperature strategy for this request.
         config_hash_str: Short hash for logging.
+        source: The entropy source this request resolved to. Exposed for
+            test introspection; production code should treat the pipeline
+            as opaque.
     """
 
-    __slots__ = ("amplifier", "config", "config_hash_str", "strategy")
+    __slots__ = ("amplifier", "config", "config_hash_str", "pipeline", "source", "strategy")
 
     def __init__(
         self,
+        pipeline: SamplingPipeline,
         config: QRSamplerConfig,
         amplifier: SignalAmplifier,
         strategy: TemperatureStrategy,
         config_hash_str: str,
     ) -> None:
+        self.pipeline = pipeline
         self.config = config
         self.amplifier = amplifier
         self.strategy = strategy
         self.config_hash_str = config_hash_str
+        self.source = pipeline.entropy_source
 
 
 @EngineAdapterRegistry.register("vllm")
@@ -104,8 +122,18 @@ class VLLMAdapter(EngineAdapter):
         # --- Load default configuration ---
         self._default_config = QRSamplerConfig()
 
-        # --- Build the engine-agnostic pipeline ---
-        self._pipeline = build_pipeline(self._default_config, self._vocab_size)
+        # --- Pre-initialise one pipeline per allowed entropy source ---
+        # The default source from QR_ENTROPY_SOURCE_TYPE is always included
+        # so a request with no per-request override still resolves cleanly.
+        self._preinit_sources = self._resolve_preinit_sources(
+            self._default_config.entropy_source_type
+        )
+        self._pipelines: dict[str, SamplingPipeline] = {}
+        for source_type in self._preinit_sources:
+            self._pipelines[source_type] = self._build_pipeline_for_source(source_type)
+
+        # --- Default pipeline (used when no per-request state exists) ---
+        self._pipeline = self._pipelines[self._default_config.entropy_source_type]
 
         # --- Pre-compute default state ---
         self._default_config_hash = config_hash(self._default_config)
@@ -120,12 +148,45 @@ class VLLMAdapter(EngineAdapter):
 
         logger.info(
             "VLLMAdapter initialized: vocab_size=%d, "
-            "entropy_source=%s, amplifier=%s, temperature=%s",
+            "default_entropy_source=%s, preinit_sources=%s, "
+            "amplifier=%s, temperature=%s",
             self._vocab_size,
             self._pipeline.entropy_source.name,
+            sorted(self._pipelines.keys()),
             self._default_config.signal_amplifier_type,
             self._default_config.temperature_strategy,
         )
+
+    @staticmethod
+    def _resolve_preinit_sources(default_source_type: str) -> list[str]:
+        """Parse the pre-init source list from env, deduped and ordered.
+
+        The default source is always included so the no-override path is
+        always serviceable. Order is preserved (first occurrence wins) so
+        operators can document a canonical order in their env config.
+        """
+        raw = os.environ.get(_PREINIT_ENV_VAR, _DEFAULT_PREINIT)
+        parsed = [part.strip() for part in raw.split(",") if part.strip()]
+        if default_source_type not in parsed:
+            parsed.append(default_source_type)
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in parsed:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        return ordered
+
+    def _build_pipeline_for_source(self, source_type: str) -> SamplingPipeline:
+        """Build a SamplingPipeline whose entropy source is ``source_type``.
+
+        Mirrors ``self._default_config`` for every other field. Uses
+        ``model_validate`` so type coercion runs without re-reading env.
+        """
+        cfg_dump = self._default_config.model_dump()
+        cfg_dump["entropy_source_type"] = source_type
+        cfg = QRSamplerConfig.model_validate(cfg_dump)
+        return build_pipeline(cfg, self._vocab_size)
 
     def get_pipeline(self) -> SamplingPipeline:
         """Return the underlying SamplingPipeline.
@@ -270,20 +331,36 @@ class VLLMAdapter(EngineAdapter):
             # Resolve per-request config.
             req_config = resolve_config(self._default_config, extra_args)
 
-            # Build per-request components if config differs from default.
-            if req_config is self._default_config:
-                amplifier = self._pipeline.amplifier
-                strategy = self._pipeline.strategy
-                hash_str = self._default_config_hash
+            # Route to the pipeline matching the (possibly-overridden) source.
+            target_source_type = req_config.entropy_source_type
+            target_pipeline = self._pipelines.get(target_source_type)
+            if target_pipeline is None:
+                raise ConfigValidationError(
+                    f"Entropy source {target_source_type!r} is not pre-initialised "
+                    f"for this adapter. Pre-initialised sources: "
+                    f"{sorted(self._pipelines.keys())}. "
+                    f"Set {_PREINIT_ENV_VAR!s} at process startup to include it."
+                )
+
+            # Build per-request components if config differs from the target
+            # pipeline's defaults. We compare model_dumps so a request that
+            # only overrode the source type still hits the fast path.
+            if req_config is self._default_config or (
+                req_config.model_dump() == target_pipeline.default_config.model_dump()
+            ):
+                amplifier = target_pipeline.amplifier
+                strategy = target_pipeline.strategy
+                hash_str = config_hash(target_pipeline.default_config)
             else:
                 amplifier = AmplifierRegistry.build(req_config)
                 # Calibrate per-request amplifier if it supports calibration.
                 if hasattr(amplifier, "calibrate"):
-                    amplifier.calibrate(self._pipeline.entropy_source, req_config)
+                    amplifier.calibrate(target_pipeline.entropy_source, req_config)
                 strategy = TemperatureStrategyRegistry.build(req_config, self._vocab_size)
                 hash_str = config_hash(req_config)
 
             self._request_states[req_idx] = _RequestState(
+                pipeline=target_pipeline,
                 config=req_config,
                 amplifier=amplifier,
                 strategy=strategy,
@@ -321,11 +398,13 @@ class VLLMAdapter(EngineAdapter):
             # Get per-request state or fall back to defaults.
             state = self._request_states.get(i)
             if state is not None:
+                pipeline = state.pipeline
                 req_config: QRSamplerConfig | None = state.config
                 amplifier: SignalAmplifier | None = state.amplifier
                 strategy: TemperatureStrategy | None = state.strategy
                 hash_str: str | None = state.config_hash_str
             else:
+                pipeline = self._pipeline
                 req_config = None
                 amplifier = None
                 strategy = None
@@ -337,8 +416,8 @@ class VLLMAdapter(EngineAdapter):
             else:
                 row = logits[i] if is_numpy else self._to_numpy(logits[i])
 
-            # --- Delegate to pipeline ---
-            result = self._pipeline.sample_token(
+            # --- Delegate to pipeline (routed by entropy source) ---
+            result = pipeline.sample_token(
                 row,
                 config=req_config,
                 amplifier=amplifier,
@@ -429,5 +508,13 @@ class VLLMAdapter(EngineAdapter):
         return self._pipeline.sampling_logger
 
     def close(self) -> None:
-        """Release all resources held by the adapter."""
-        self._pipeline.close()
+        """Release all resources held by the adapter.
+
+        Closes every pre-initialised pipeline. Safe to call multiple times.
+        """
+        seen: set[int] = set()
+        for pipeline in self._pipelines.values():
+            if id(pipeline) in seen:
+                continue
+            seen.add(id(pipeline))
+            pipeline.close()

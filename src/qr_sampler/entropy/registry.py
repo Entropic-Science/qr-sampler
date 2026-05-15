@@ -99,6 +99,22 @@ class EntropySourceRegistry:
         return sorted(cls._registry.keys())
 
     @classmethod
+    def all_sources(cls) -> dict[str, type[EntropySource]]:
+        """Return a copy of the full ``name -> class`` registry mapping.
+
+        Triggers entry-point loading on first call so third-party sources
+        are included. The returned dict is a shallow copy; mutating it
+        does not affect the registry. Used by engine adapters at startup
+        to pre-initialise pipelines for every available entropy source.
+
+        Returns:
+            A new dict mapping each registered identifier to its class.
+        """
+        if not cls._entry_points_loaded:
+            cls._load_entry_points()
+        return dict(cls._registry)
+
+    @classmethod
     def _load_entry_points(cls) -> None:
         """Discover and register sources from the entry-point group.
 
