@@ -1,0 +1,79 @@
+# Local-dev parity profile for the entropic.science Modal deployment.
+#
+# Runs the same vLLM + qr-sampler + Open WebUI stack on a single Docker host,
+# wired against firefly-1 and the entropic.science dev API. Use this for
+# smoke-testing the OWUI filter + comparison Pipe changes locally before
+# pushing to Modal.
+#
+# Single-model only here (CPU/single-GPU dev hosts can't fit both reasoning
+# FP8 models at once). Override HF_MODEL in .env to pick which one to run.
+#
+# Quick start:
+#   cd deployments/entropic-science
+#   cp .env.example .env
+#   # edit .env: QR_GRPC_API_KEY, HF_TOKEN, SERVICE_TOKEN_SECRETS, ENTROPIC_API_BASE_URL
+#   docker compose --profile ui up --build
+
+services:
+  vllm:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile.vllm
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+    environment:
+      # --- qr-sampler: entropy source + pre-init both pipelines ---
+      QR_ENTROPY_SOURCE_TYPE: "${QR_ENTROPY_SOURCE_TYPE:-quantum_grpc}"
+      QR_PREINIT_ENTROPY_SOURCES: "${QR_PREINIT_ENTROPY_SOURCES:-quantum_grpc,system}"
+      QR_GRPC_SERVER_ADDRESS: "${QR_GRPC_SERVER_ADDRESS:-10.0.0.115:50051}"
+      QR_GRPC_MODE: "${QR_GRPC_MODE:-unary}"
+      QR_GRPC_TIMEOUT_MS: "${QR_GRPC_TIMEOUT_MS:-5000}"
+      QR_GRPC_METHOD_PATH: "${QR_GRPC_METHOD_PATH:-/qrng.QuantumRNG/GetRandomBytes}"
+      QR_GRPC_STREAM_METHOD_PATH: "${QR_GRPC_STREAM_METHOD_PATH:-}"
+      QR_GRPC_API_KEY: "${QR_GRPC_API_KEY:-}"
+      QR_GRPC_API_KEY_HEADER: "${QR_GRPC_API_KEY_HEADER:-api-key}"
+      QR_FALLBACK_MODE: "${QR_FALLBACK_MODE:-error}"
+
+      # --- qr-sampler: sampling parameters ---
+      QR_SAMPLE_COUNT: "${QR_SAMPLE_COUNT:-13312}"
+      QR_LOG_LEVEL: "${QR_LOG_LEVEL:-summary}"
+
+      # --- Model + auth (single model for local dev) ---
+      HF_MODEL: "${HF_MODEL:-google/gemma-4-31b-reasoning}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      VLLM_API_KEY: "${VLLM_API_KEY:-dev-vllm-key}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OWUI_BASE_TAG:-v0.5.0}
+    profiles: ["ui"]
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    environment:
+      OPENAI_API_BASE_URL: "http://vllm:8000/v1"
+      OPENAI_API_KEY: "${VLLM_API_KEY:-dev-vllm-key}"
+      WEBUI_AUTH: "${OPEN_WEBUI_AUTH:-false}"
+      # Trusted-header auth — leave unset for local dev so OWUI's own auth runs.
+      # WEBUI_AUTH_TRUSTED_EMAIL_HEADER: X-Trusted-Email
+      # WEBUI_AUTH_TRUSTED_NAME_HEADER: X-Trusted-Display-Name
+      # The OWUI filter + Pipe read these to talk to the local entropic.science API.
+      ENTROPIC_API_BASE_URL: "${ENTROPIC_API_BASE_URL:-http://host.docker.internal:3001/api}"
+      SERVICE_TOKEN_SECRETS: "${SERVICE_TOKEN_SECRETS:-}"
+    extra_hosts:
+      # Let OWUI reach the entropic.science dev API running on the Docker host.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - vllm
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:

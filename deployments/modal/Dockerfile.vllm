@@ -1,0 +1,52 @@
+# Dockerfile for the Modal-hosted vLLM container that serves
+# Gemma 4 31B Reasoning (FP8) + Qwen 3.6 27B Reasoning (FP8) on one B200.
+#
+# Built once and pushed by `modal deploy deployments/modal/app.py`.
+#
+# Base image notes
+# ----------------
+# The base tag MUST satisfy all of the following:
+#   * Blackwell / B200 CUDA support (CUDA 12.4+ with sm_100 kernels).
+#   * FP8 weight + FP8 KV cache support (vLLM >= 0.6.x with Transformer Engine v2).
+#   * Two `AsyncLLMEngine` siblings in one process (no single-engine assumptions
+#     in the OpenAI-compatible router code path).
+#
+# Pin a concrete tag at deploy time. If no stable tag yet satisfies all three,
+# pin to a nightly known-good commit (see deployments/modal/README.md).
+#
+# Build (Modal does this automatically from `Image.from_dockerfile`):
+#   modal deploy deployments/modal/app.py
+
+ARG VLLM_BASE_TAG=v0.6.6
+FROM vllm/vllm-openai:${VLLM_BASE_TAG}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /opt/qr-sampler
+
+# Copy only pyproject.toml first to leverage Docker layer caching.
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+# Install qr-sampler (with gRPC support) + the runtime libraries the Modal
+# entrypoint needs. huggingface_hub is required for the one-shot weights
+# download. fastapi/httpx/grpcio are runtime deps for the dispatcher and
+# the firefly-1 gRPC client.
+RUN pip install --no-cache-dir . \
+    && pip install --no-cache-dir \
+        "huggingface_hub>=0.24" \
+        "fastapi>=0.110" \
+        "httpx>=0.27" \
+        "grpcio>=1.62"
+
+# Default qr-sampler configuration. Overridden by the Modal Secret at runtime.
+ENV QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
+    QR_PREINIT_ENTROPY_SOURCES=quantum_grpc,system \
+    QR_FALLBACK_MODE=error \
+    QR_SAMPLE_COUNT=13312
+
+# Reset ENTRYPOINT set by vllm/vllm-openai base image so Modal's @modal.enter
+# method controls process start (not `vllm serve`).
+ENTRYPOINT []
+CMD ["python", "-m", "deployments.modal.vllm_serve"]
