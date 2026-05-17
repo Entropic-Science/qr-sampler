@@ -40,7 +40,39 @@ RUN pip install --no-cache-dir . \
         "httpx>=0.27" \
         "grpcio>=1.62"
 
+# --- Future: Cloudflare WARP for firefly-1 reachability --------------------
+#
+# Initial Modal deploy ships with QR_ENTROPY_SOURCE_TYPE=system (set in the
+# qr-sampler-prod Secret) because firefly-1 (10.0.0.115:50051) is only
+# reachable via a Cloudflare WARP tunnel (team "cipherstone"), and Modal
+# containers can't reach that RFC1918 address without a WARP client
+# running inside the container.
+#
+# To switch to quantum_grpc in production, uncomment the install block
+# below (also requires provisioning a Cloudflare Zero Trust *service
+# token* in the cipherstone team for non-interactive auth — the
+# interactive email/PIN flow won't work in a container):
+#
+#   RUN apt-get update && apt-get install -y --no-install-recommends \
+#       curl gnupg2 ca-certificates lsb-release && \
+#       curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
+#       echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+#         | tee /etc/apt/sources.list.d/cloudflare-client.list && \
+#       apt-get update && apt-get install -y cloudflare-warp && \
+#       rm -rf /var/lib/apt/lists/*
+#
+# Then in vllm_serve.py's @modal.enter (or a separate startup hook),
+# before build_engines() runs:
+#   - `warp-cli --accept-tos register` with the service token
+#   - `warp-cli connect`
+#   - Confirm 10.0.0.115:50051 is reachable (e.g., a small TCP probe)
+#
+# Track this as a follow-up alongside flipping the qr-sampler-prod
+# secret's QR_ENTROPY_SOURCE_TYPE from `system` -> `quantum_grpc`.
+
 # Default qr-sampler configuration. Overridden by the Modal Secret at runtime.
+# Note: v1 ships with the Modal Secret setting QR_ENTROPY_SOURCE_TYPE=system,
+# which overrides the quantum_grpc default below at request time.
 ENV QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
     QR_PREINIT_ENTROPY_SOURCES=quantum_grpc,system \
     QR_FALLBACK_MODE=error \

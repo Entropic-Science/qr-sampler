@@ -148,10 +148,11 @@ default configuration from environment variables.
 
 ## entropic.science integration
 
-A second deployment of this stack lives at
-[chat.entropic.science](https://chat.entropic.science), hosted on Modal with
-a B200 GPU. That deployment adds two responsibilities on top of the local
-profile above:
+A second deployment of this stack lives on **the entropic.science Replit**
+(the `chat.entropic.science` subdomain has been retired; OWUI now runs inside
+the main Replit app and the Modal-side surface is GPU-only — vLLM via the
+OpenAI-compatible adapter, scale-to-zero). That deployment adds three
+responsibilities on top of the local profile above:
 
 1. **Daily allowance metering** — the entropic.science site issues 128k
    weighted tokens (input + 3× output) per account per day. The qr-sampler
@@ -170,6 +171,15 @@ profile above:
    different `qr_entropy_source_type` values (`quantum_grpc` vs `system`)
    and renders the dual-column markdown live. Preflight + debit run with
    `comparisonMode=true` so the allowance gate uses ~2× cost.
+3. **Modal cold-start indicator** — because vLLM lives on a scale-to-zero
+   Modal app, the first prompt after a quiet period waits seconds for the
+   container to spin up. Both the filter and the pipe call a shared
+   `_modal_warmth.py` probe (`HEAD /v1/models`) before issuing the chat
+   completion and emit a "spinning up" OWUI status event if the probe
+   reports `"cold"`. The indicator is cleared on the first streamed token.
+   If the first token never arrives within `cold_start_first_token_timeout_s`,
+   the outlet skips the debit (PRD R-3.5: no charge for a snapshot-restore
+   failure).
 
 ### What's different from the local-dev install
 
@@ -180,15 +190,25 @@ profile above:
 | Pipe registered? | No (filter only) | Yes — both filter and pipe |
 | Per-request entropy source | Container env-only | Per-request override via filter / pipe |
 
-### Wiring on the Modal deployment
+### Wiring on the entropic.science Replit
 
-The Modal profile at [`deployments/modal/`](../../deployments/modal/) sets
-two env vars on the OWUI container that the filter and pipe both read:
+The Replit app sets four env vars on the OWUI process that the filter and
+pipe read:
 
-| Env var | Value |
-|---|---|
-| `ENTROPIC_API_BASE_URL` | `https://entropic.science/api` |
-| `SERVICE_TOKEN_SECRETS` | rolling-secret vector (see `deployments/modal/modal_secrets.md`) |
+| Env var | Value | Used by |
+|---|---|---|
+| `ENTROPIC_API_BASE_URL` | `https://entropic.science/api` | allowance + upsert calls |
+| `SERVICE_TOKEN_SECRETS` | rolling-secret vector | HMAC signing |
+| `OPENAI_API_BASE_URL` | Modal vLLM URL (e.g. `https://…modal.run/v1`) | cold-start probe target |
+| `QR_INTEGRATION_PROFILE` | `entropic.science` | activates entropic.science Valves defaults |
+
+The `QR_INTEGRATION_PROFILE` switch is **the** modularity boundary: when it
+is unset (or set to anything else), both plugins behave exactly as v0.2.0 —
+no probe, no indicator, no entropic.science-flavoured copy. The
+`entropic_science_profile.py` module is imported unconditionally but its
+`apply()` is a no-op outside the matched env value. Other operators of this
+filter/pipe pair can therefore drop the same files into their OWUI install
+without inheriting our defaults.
 
 The filter and pipe read `SERVICE_TOKEN_SECRETS` via OWUI's Valves
 (`service_token_secret`). The Valve's default is a `default_factory` that
@@ -197,9 +217,9 @@ the Valves UI. The signer always uses the **first** entry of the
 comma-separated vector; the entropic.science API verifier accepts a match
 against **any** entry (Pre-flight §11.4).
 
-### Installing the pipe on Modal's OWUI
+### Installing the plugins on the Replit OWUI
 
-After `modal deploy` and your first `chat.entropic.science` sign-in:
+After the Replit deployment is up and you have signed in once:
 
 1. **Admin Panel → Functions → Import** → upload
    `examples/open-webui/qr_sampler_filter.json`. Toggle to **Global**.
@@ -207,14 +227,48 @@ After `modal deploy` and your first `chat.entropic.science` sign-in:
    `examples/open-webui/qr_comparison_pipe.json`. The two pseudo-models
    appear in OWUI's model selector after a refresh.
 
+The JSON wrappers are **self-contained** — `bundle_owui_functions.py`
+inlines `_modal_warmth.py` and `entropic_science_profile.py` into each
+plugin's `.py` body before embedding it in the JSON envelope, so a single
+OWUI import gives you the cold-start probe, the entropic.science profile
+overlay, and the plugin itself. Re-run `python bundle_owui_functions.py`
+from this directory after any change to the sibling helpers or the plugin
+source.
+
 The filter Valves don't need editing — the defaults read the right env
-vars. The pipe Valves expose `base_models` (defaults to both reasoning
-models) and timeout knobs.
+vars (and `QR_INTEGRATION_PROFILE=entropic.science` overlays the cold-start
+defaults at filter `__init__` time). The pipe Valves expose `base_models`
+(defaults to both reasoning models), timeout knobs, and the same
+`cold_start_*` block.
+
+### Cold-start mechanics (filter + pipe)
+
+When `cold_start_enabled` is True (set by the entropic.science profile, or
+manually via Valves), every inbound prompt runs through this sequence:
+
+1. **Preflight** the allowance as before. If the user is over the gate
+   cost, the cold-start branch never runs — we don't probe Modal just to
+   tell the user "no".
+2. **Probe** the upstream via `HEAD <cold_start_probe_base_url>/models`
+   with `cold_start_probe_timeout_s` as the hard cap and
+   `cold_start_warm_threshold_s` as the warm/cold cutoff.
+3. If `"cold"`, emit `{type: "status", data: {description: <copy>,
+   done: False}}` via `__event_emitter__` so OWUI renders a spinner with
+   the configured message.
+4. The first non-empty streamed token clears the indicator
+   (`done: True`, empty description). The pipe shares this — the first
+   token from **either** column clears it.
+5. If the first token never arrives within
+   `cold_start_first_token_timeout_s`, the outlet sees the timeout flag
+   (set via `Filter.mark_first_token_timeout(chat_id)` or by the pipe's
+   internal `_wrap_first_token_timeout`) and **skips the debit**. Users
+   are not charged when Modal snapshot-restore fails.
 
 ### Source-of-truth design
 
 - [`../../deployments/modal/`](../../deployments/modal/) — Modal deployment
-  profile, with full deploy walkthrough.
+  profile (GPU-only now; the OWUI bits there are kept for non-Replit
+  operators who want a single Modal app for both).
 - [`../../CROSS-REPO-INTEGRATION.md`](../../CROSS-REPO-INTEGRATION.md) —
   cross-repo handshake with the entropic.science side.
 - `entropic.science/.zenflow/tasks/qr-sampler-integration-fad6/spec.md`

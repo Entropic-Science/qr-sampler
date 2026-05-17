@@ -2,7 +2,7 @@
 title: QR vs PRNG Comparison
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.1.0
+version: 0.2.0
 license: MIT
 description: Streaming dual-column comparison of quantum vs pseudo-random sampling.
 """
@@ -23,7 +23,28 @@ import httpx
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable
+
+try:
+    from . import (
+        _modal_warmth,  # type: ignore[import-not-found]
+        entropic_science_profile,  # type: ignore[import-not-found]
+    )
+except ImportError:
+    import importlib.util
+    from pathlib import Path
+
+    _here = Path(__file__).resolve().parent
+
+    def _load_sibling(name: str) -> Any:
+        spec = importlib.util.spec_from_file_location(name, _here / f"{name}.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    _modal_warmth = _load_sibling("_modal_warmth")
+    entropic_science_profile = _load_sibling("entropic_science_profile")
 
 # ---------------------------------------------------------------------------
 # Module constants
@@ -280,12 +301,70 @@ class Pipe:
             ),
         )
 
+        # --- Cold-start indicator (off by default; entropic.science profile
+        #     turns it on via QR_INTEGRATION_PROFILE=entropic.science) ---
+        cold_start_enabled: bool = Field(
+            default=False,
+            description=(
+                "Probe the upstream for warmth on each prompt and emit a single "
+                "status indicator above the dual-column message. Cleared on the "
+                "first delta from either side. Off by default."
+            ),
+        )
+        cold_start_probe_base_url: str = Field(
+            default="",
+            description=(
+                "Base URL probed for warmth (e.g. `https://…modal.run/v1`). Used "
+                "as the fallback when `model_base_urls` has no entry for the "
+                "current request's base model. When blank too, falls back to "
+                "`vllm_base_url`."
+            ),
+        )
+        model_base_urls: dict[str, str] = Field(
+            default_factory=dict,
+            description=(
+                "Per-model upstream + probe URL overrides: `{base_model_id: base_url}` "
+                "(e.g. `{'gemma-4-31b-reasoning': 'https://…vllmqrgemma-serve.modal.run/v1'}`)."
+                " The Pipe looks up the resolved `base_model` (pseudo-model with "
+                "`--qr-vs-prng` suffix stripped) here for both the cold-start probe "
+                "and the streaming chat-completion call. Falls back to "
+                "`cold_start_probe_base_url` / `vllm_base_url` when missing. Set "
+                "this when a single OWUI instance fronts multiple per-model Modal "
+                "endpoints so each prompt wakes only the model in use."
+            ),
+        )
+        cold_start_probe_timeout_s: float = Field(
+            default=1.0,
+            description="Hard cap on the warmth probe HTTP request.",
+        )
+        cold_start_warm_threshold_s: float = Field(
+            default=0.5,
+            description=(
+                "Latency cutoff. Responses faster than this are warm; "
+                "slower-but-within-`probe_timeout_s` are cold."
+            ),
+        )
+        cold_start_message: str = Field(
+            default="Spinning up the model — first request after a quiet period.",
+            description=(
+                "Markdown copy rendered as a status above the comparison table during a cold start."
+            ),
+        )
+        cold_start_first_token_timeout_s: float = Field(
+            default=60.0,
+            description=(
+                "First-token deadline per side. On timeout the side surfaces a "
+                "stream-error chunk and the debit is skipped (PRD R-3.5)."
+            ),
+        )
+
     def __init__(self) -> None:
         self.valves = self.Valves()
         # Manifold Pipe: OWUI groups entries under this name in the selector.
         self.type = "manifold"
         self.name = "QR vs PRNG · "
         self.id = "qr_vs_prng"
+        entropic_science_profile.apply(self.valves)
 
     # -- Public hooks -----------------------------------------------------
 
@@ -310,6 +389,7 @@ class Pipe:
         self,
         body: dict[str, Any],
         __user__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AsyncIterator[str]:
         """Stream the dual-column comparison.
 
@@ -318,7 +398,7 @@ class Pipe:
         overwrite the full message content on every tick so the table grows
         live in both columns.
         """
-        async for chunk in self._run(body, __user__):
+        async for chunk in self._run(body, __user__, __event_emitter__):
             yield chunk
 
     # -- Orchestration ----------------------------------------------------
@@ -327,6 +407,7 @@ class Pipe:
         self,
         body: dict[str, Any],
         __user__: dict[str, Any] | None,
+        emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
     ) -> AsyncIterator[str]:
         email = (__user__ or {}).get("email")
         if not isinstance(email, str) or not email:
@@ -369,11 +450,30 @@ class Pipe:
             yield "## Configuration error\n\nNo model id supplied by OWUI."
             return
 
+        # One probe per prompt — both columns share the wake. The probe targets
+        # the Modal endpoint serving `base_model`, so only that container wakes.
+        cold_indicator_emitted = await self._maybe_emit_cold_start(emitter, base_model)
+
         l_buf: list[str] = []
         r_buf: list[str] = []
         l_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         r_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         delta_event = asyncio.Event()
+        first_token_seen = False
+        side_timed_out = False
+
+        async def clear_indicator() -> None:
+            if not cold_indicator_emitted or emitter is None:
+                return
+            try:
+                await emitter(
+                    {
+                        "type": "status",
+                        "data": {"description": "", "done": True},
+                    }
+                )
+            except Exception as exc:
+                _log.warning("cold-start clear event failed: %s", exc)
 
         # Run both sides concurrently. Each side appends to its buffer and
         # signals `delta_event` so the emitter loop wakes up and re-renders.
@@ -382,20 +482,33 @@ class Pipe:
             buf: list[str],
             usage_out: dict[str, int],
         ) -> None:
+            nonlocal first_token_seen, side_timed_out
             try:
-                async for delta_text, usage in self._stream_completion(
+                source = self._stream_completion(
                     base_model=base_model,
                     body=body,
                     entropy_source_type=entropy_source,
-                ):
+                )
+                if self.valves.cold_start_enabled:
+                    source = self._wrap_first_token_timeout(
+                        source, self.valves.cold_start_first_token_timeout_s
+                    )
+                async for delta_text, usage in source:
                     if delta_text:
                         buf.append(delta_text)
+                        if not first_token_seen:
+                            first_token_seen = True
+                            await clear_indicator()
                     if usage:
                         usage_out["prompt_tokens"] = _coerce_nonneg_int(usage.get("prompt_tokens"))
                         usage_out["completion_tokens"] = _coerce_nonneg_int(
                             usage.get("completion_tokens")
                         )
                     delta_event.set()
+            except asyncio.TimeoutError:
+                side_timed_out = True
+                buf.append("_The service did not respond in time. Please retry._")
+                delta_event.set()
             except Exception as exc:
                 # Surface in-column, keep the other side running.
                 _log.warning("comparison side %s errored: %s", entropy_source, exc)
@@ -434,6 +547,11 @@ class Pipe:
                     t.cancel()
             await asyncio.gather(left_task, right_task, return_exceptions=True)
 
+        # If the indicator was never cleared (e.g. both sides errored), clear
+        # it now so the UI does not show a spinner indefinitely.
+        if cold_indicator_emitted and not first_token_seen:
+            await clear_indicator()
+
         prompt_total = l_usage["prompt_tokens"] + r_usage["prompt_tokens"]
         completion_total = l_usage["completion_tokens"] + r_usage["completion_tokens"]
 
@@ -449,9 +567,11 @@ class Pipe:
         if final_render != last_emitted:
             yield final_render
 
-        # Skip metering when nothing was actually produced (defensive against
-        # vLLM not returning usage on certain error paths).
-        if prompt_total == 0 and completion_total == 0:
+        # Skip metering when no tokens were generated (PRD R-3.5: cold-start
+        # timeout or upstream failure must not consume allowance).
+        if (prompt_total == 0 and completion_total == 0) or (
+            side_timed_out and not first_token_seen
+        ):
             return
 
         metadata = body.get("metadata") or {}
@@ -491,6 +611,78 @@ class Pipe:
             except PipeError as exc:
                 _log.warning("comparison upsert failed: %s", exc)
 
+    # -- Per-model upstream resolution ------------------------------------
+
+    def _resolve_upstream(self, base_model: str) -> str:
+        """Return the configured Modal base URL for `base_model`, or '' if unset.
+
+        Used by both the streaming chat-completion call and the cold-start
+        probe so they target the same per-model endpoint. Returning an empty
+        string lets the caller decide its own fallback (cold-start probe
+        falls back to `cold_start_probe_base_url` then `vllm_base_url`; the
+        streaming side falls back directly to `vllm_base_url`).
+        """
+        if not base_model:
+            return ""
+        return (self.valves.model_base_urls or {}).get(base_model, "").strip()
+
+    # -- Cold-start probe -------------------------------------------------
+
+    async def _maybe_emit_cold_start(
+        self,
+        emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        base_model: str,
+    ) -> bool:
+        """Probe the upstream and emit a status indicator if cold. Returns True if emitted.
+
+        Resolution order for the probe URL:
+          1. ``valves.model_base_urls[base_model]`` — per-model override.
+          2. ``valves.cold_start_probe_base_url`` — single fallback.
+          3. ``valves.vllm_base_url`` — legacy single-endpoint fallback.
+        """
+        if not self.valves.cold_start_enabled or emitter is None:
+            return False
+        probe_base = (
+            self._resolve_upstream(base_model)
+            or self.valves.cold_start_probe_base_url
+            or self.valves.vllm_base_url
+        ).strip()
+        if not probe_base:
+            return False
+        warmth = await _modal_warmth.probe_warmth(
+            probe_base,
+            timeout_s=self.valves.cold_start_probe_timeout_s,
+            warm_threshold_s=self.valves.cold_start_warm_threshold_s,
+        )
+        if warmth != "cold":
+            return False
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": self.valves.cold_start_message,
+                        "done": False,
+                    },
+                }
+            )
+        except Exception as exc:
+            _log.warning("cold-start emit failed: %s", exc)
+            return False
+        return True
+
+    @staticmethod
+    async def _wrap_first_token_timeout(
+        source: AsyncIterator[tuple[str, dict[str, Any] | None]],
+        timeout_s: float,
+    ) -> AsyncIterator[tuple[str, dict[str, Any] | None]]:
+        """Wrap a side stream so the first item must arrive within `timeout_s`."""
+        iterator = source.__aiter__()
+        first = await asyncio.wait_for(iterator.__anext__(), timeout_s)
+        yield first
+        async for chunk in iterator:
+            yield chunk
+
     # -- Streaming side ---------------------------------------------------
 
     async def _stream_completion(
@@ -509,7 +701,8 @@ class Pipe:
         it arrives.
         """
         request_body = self._build_side_body(body, base_model, entropy_source_type)
-        url = self.valves.vllm_base_url.rstrip("/") + "/chat/completions"
+        upstream = (self._resolve_upstream(base_model) or self.valves.vllm_base_url).rstrip("/")
+        url = upstream + "/chat/completions"
         headers = {"content-type": "application/json"}
         if self.valves.vllm_api_key:
             headers["authorization"] = f"Bearer {self.valves.vllm_api_key}"

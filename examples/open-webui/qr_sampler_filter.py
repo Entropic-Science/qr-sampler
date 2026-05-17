@@ -2,23 +2,51 @@
 title: QR-Sampler Parameters
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.2.0
+version: 0.3.0
 license: MIT
-description: qr-sampler params + entropic.science allowance metering.
+description: qr-sampler params + entropic.science allowance metering + cold-start indicator.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable
+
+try:
+    from . import (
+        _modal_warmth,  # type: ignore[import-not-found]
+        entropic_science_profile,  # type: ignore[import-not-found]
+    )
+except ImportError:
+    # OWUI loads the filter as a standalone module (not as a package), so the
+    # relative-import path above only works in tests. Fall back to file-relative
+    # discovery so the same file works in both shapes.
+    import importlib.util
+    from pathlib import Path
+
+    _here = Path(__file__).resolve().parent
+
+    def _load_sibling(name: str) -> Any:
+        spec = importlib.util.spec_from_file_location(name, _here / f"{name}.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    _modal_warmth = _load_sibling("_modal_warmth")
+    entropic_science_profile = _load_sibling("entropic_science_profile")
 
 # ---------------------------------------------------------------------------
 # Module constants
@@ -29,6 +57,7 @@ _CHARS_PER_TOKEN_ESTIMATE = 4
 _DEBIT_PATH = "/allowance/debit"
 _PREFLIGHT_PATH = "/allowance/preflight"
 _UPSERT_PATH = "/conversations/upsert"
+_DEFAULT_REQUEST_KEY = "__default__"
 
 _log = logging.getLogger("qr_sampler.open_webui_filter")
 
@@ -169,6 +198,53 @@ def _sign_service_token(path: str, secret: str, unix_ts: int | None = None) -> s
 
 
 # ---------------------------------------------------------------------------
+# First-token timeout helper (reusable by the Pipe and by callers wrapping
+# their own streams; the filter itself does not iterate OWUI's stream).
+# ---------------------------------------------------------------------------
+
+
+async def iter_with_first_token_timeout(
+    source: AsyncIterator[Any],
+    timeout_s: float,
+) -> AsyncIterator[Any]:
+    """Forward `source`, raising `asyncio.TimeoutError` if the first item is slow.
+
+    Subsequent items have no per-item timeout — they are forwarded as fast as
+    they arrive. The caller is expected to handle the `TimeoutError` (e.g.
+    surface a system-message error chunk and skip the debit).
+    """
+    iterator = source.__aiter__()
+    first = await asyncio.wait_for(iterator.__anext__(), timeout_s)
+    yield first
+    async for chunk in iterator:
+        yield chunk
+
+
+# ---------------------------------------------------------------------------
+# Cold-start request state (per OWUI request)
+# ---------------------------------------------------------------------------
+
+
+class _ColdStartState:
+    """Tracks per-request cold-start UI state shared across hook calls.
+
+    The filter's `inlet`, `stream`, and `outlet` are separate Python calls;
+    we key state by `chat_id` (from `body["metadata"]`) so a single Filter
+    instance can serve many concurrent OWUI requests without crossed wires.
+    Requests without a chat_id (rare — e.g. direct API tests) use a single
+    sentinel key.
+    """
+
+    __slots__ = ("first_token_seen", "indicator_emitted", "started_at", "timed_out")
+
+    def __init__(self) -> None:
+        self.indicator_emitted: bool = False
+        self.first_token_seen: bool = False
+        self.timed_out: bool = False
+        self.started_at: float = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
 # Filter
 # ---------------------------------------------------------------------------
 
@@ -177,10 +253,15 @@ class Filter:
     """Open WebUI filter — `qr_*` injection + entropic.science allowance metering.
 
     Inlet flow:
-        OWUI → preflight (rejects below gate cost) → inject qr_* params → vLLM
+        OWUI → preflight (rejects below gate cost) → cold-start probe
+             → emit indicator if cold → inject qr_* params → vLLM
+
+    Stream flow (per SSE chunk):
+        OWUI → filter.stream(event) → clear cold-start indicator on first
+        non-empty assistant token.
 
     Outlet flow:
-        vLLM (or final SSE chunk) → debit weighted tokens → upsert chat shadow row
+        vLLM (or final SSE chunk) → debit weighted tokens → upsert chat shadow row.
 
     Both flows degrade safely: a missing email, missing service-token secret,
     or unreachable API raises a `FilterError` from `inlet()` (so OWUI surfaces
@@ -233,6 +314,61 @@ class Filter:
         request_timeout_s: float = Field(
             default=5.0,
             description="Per-call HTTP timeout for the entropic.science API. No retries.",
+        )
+
+        # --- Cold-start indicator (off by default; entropic.science profile
+        #     turns it on via QR_INTEGRATION_PROFILE=entropic.science) ---
+        cold_start_enabled: bool = Field(
+            default=False,
+            description=(
+                "Probe the upstream for warmth on each inlet and emit a status "
+                "indicator above the assistant message when the upstream is "
+                "cold. Cleared on first assistant token. Off by default."
+            ),
+        )
+        cold_start_probe_base_url: str = Field(
+            default="",
+            description=(
+                "Base URL probed for warmth (typically the OpenAI-compatible "
+                "upstream, e.g. `https://…modal.run/v1`). Used as the fallback "
+                "when `model_base_urls` has no entry for the current request's "
+                "model. When blank too, the OPENAI_API_BASE_URL env var is read "
+                "at probe time."
+            ),
+        )
+        model_base_urls: dict[str, str] = Field(
+            default_factory=dict,
+            description=(
+                "Per-model probe URL overrides: `{model_id: base_url}` (e.g. "
+                "`{'gemma-4-31b-reasoning': 'https://…vllmqrgemma-serve.modal.run/v1'}`)."
+                " The cold-start probe looks up `body['model']` here first; "
+                "when missing or empty, falls back to `cold_start_probe_base_url`. "
+                "Set this when a single OWUI instance fronts multiple per-model "
+                "Modal endpoints so the probe wakes only the model in use."
+            ),
+        )
+        cold_start_probe_timeout_s: float = Field(
+            default=1.0,
+            description="Hard cap on the warmth probe HTTP request.",
+        )
+        cold_start_warm_threshold_s: float = Field(
+            default=0.5,
+            description=(
+                "Latency cutoff. Responses faster than this are warm; "
+                "slower-but-within-`probe_timeout_s` are cold."
+            ),
+        )
+        cold_start_message: str = Field(
+            default="Spinning up the model — first request after a quiet period.",
+            description="Markdown copy rendered above the assistant message during a cold start.",
+        )
+        cold_start_first_token_timeout_s: float = Field(
+            default=60.0,
+            description=(
+                "First-token deadline. Tracked via `iter_with_first_token_timeout`; "
+                "if no token arrives in this window the outlet skips the debit "
+                "(PRD R-3.5: no allowance consumed when no tokens generated)."
+            ),
         )
 
         # --- Token selection ---
@@ -293,6 +429,10 @@ class Filter:
 
     def __init__(self) -> None:
         self.valves = self.Valves()
+        # Per-request cold-start state, keyed by chat_id (or a sentinel).
+        self._cold_state: dict[str, _ColdStartState] = {}
+        # Apply integration profile overrides if env switch is set.
+        entropic_science_profile.apply(self.valves)
 
     # Fields that map to `qr_*` extra args on the vLLM request.
     _QR_FIELDS: frozenset[str] = frozenset(
@@ -318,8 +458,14 @@ class Filter:
         self,
         body: dict[str, Any],
         __user__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Preflight the allowance, then inject `qr_*` params.
+
+        When the cold-start probe is enabled and reports a cold upstream, a
+        `status` event is emitted via `__event_emitter__` before the body is
+        forwarded to vLLM. The corresponding "done" event is sent from
+        `stream()` on the first non-empty assistant token.
 
         Raises:
             FilterError: when preflight rejects or the email is missing.
@@ -354,8 +500,49 @@ class Filter:
         for field_name in self._QR_FIELDS:
             body[f"qr_{field_name}"] = valve_dict[field_name]
 
+        if self.valves.cold_start_enabled:
+            await self._maybe_emit_cold_start(body, __event_emitter__)
+
         # `stream: True` (or `False`) set by the caller is preserved as-is.
         return body
+
+    async def stream(
+        self,
+        event: dict[str, Any],
+        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        """Per-chunk hook — clear the cold-start indicator on first token.
+
+        OWUI calls this for every SSE chunk arriving from the upstream. We
+        watch for the first non-empty `choices[0].delta.content` and emit a
+        `{type: "status", data: {done: True}}` event to dismiss the indicator
+        we set in `inlet`. The event itself is forwarded unmodified.
+        """
+        if not self.valves.cold_start_enabled or __event_emitter__ is None:
+            return event
+
+        delta_text = _extract_delta_text(event)
+        if not delta_text:
+            return event
+
+        key = _state_key_from_event(event)
+        state = self._cold_state.get(key)
+        if state is None or state.first_token_seen:
+            return event
+
+        state.first_token_seen = True
+        if state.indicator_emitted:
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {"description": "", "done": True},
+                    }
+                )
+            except Exception as exc:
+                _log.warning("cold-start clear event failed: %s", exc)
+
+        return event
 
     async def outlet(
         self,
@@ -365,7 +552,8 @@ class Filter:
         """Debit the actual usage and upsert the conversation shadow row.
 
         Best-effort: any debit/upsert error is logged and swallowed. The
-        response body is returned unmodified either way.
+        response body is returned unmodified either way. When the cold-start
+        first-token timeout was hit, no debit is sent (PRD R-3.5).
         """
         if not self.valves.enable_qr_sampling:
             return body
@@ -374,15 +562,20 @@ class Filter:
         if not isinstance(email, str) or not email:
             return body
 
+        metadata = body.get("metadata") or {}
+        chat_id = metadata.get("chat_id")
+        state_key = chat_id if isinstance(chat_id, str) and chat_id else _DEFAULT_REQUEST_KEY
+        state = self._cold_state.pop(state_key, None)
+        if state is not None and state.timed_out and not state.first_token_seen:
+            return body
+
         usage = body.get("usage") or {}
         prompt_t = _coerce_nonneg_int(usage.get("prompt_tokens"))
         completion_t = _coerce_nonneg_int(usage.get("completion_tokens"))
         if prompt_t == 0 and completion_t == 0:
             return body
 
-        metadata = body.get("metadata") or {}
         comparison = bool(metadata.get("qr_comparison_mode"))
-        chat_id = metadata.get("chat_id")
         title = metadata.get("chat_title") or "Untitled"
 
         try:
@@ -419,7 +612,75 @@ class Filter:
 
         return body
 
+    def mark_first_token_timeout(self, chat_id: str | None) -> None:
+        """Mark a request as having missed the first-token deadline.
+
+        Callers that wrap their own stream (e.g. the comparison Pipe, or a
+        higher-level orchestrator using `iter_with_first_token_timeout`) call
+        this when `asyncio.TimeoutError` fires. The next `outlet()` for the
+        same `chat_id` will then skip the debit.
+        """
+        key = chat_id if isinstance(chat_id, str) and chat_id else _DEFAULT_REQUEST_KEY
+        state = self._cold_state.setdefault(key, _ColdStartState())
+        state.timed_out = True
+
     # -- Internal helpers -------------------------------------------------
+
+    async def _maybe_emit_cold_start(
+        self,
+        body: dict[str, Any],
+        emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """Probe the upstream and emit the cold-start status when slow.
+
+        Resolution order for the probe URL:
+          1. ``valves.model_base_urls[body['model']]`` — per-model override.
+          2. ``valves.cold_start_probe_base_url`` — single fallback.
+          3. ``OPENAI_API_BASE_URL`` env var — legacy single-endpoint fallback.
+
+        The per-model branch is the one that matters when OWUI fronts
+        multiple Modal endpoints (one per model) — only the endpoint serving
+        the requested model gets woken, leaving the others at zero.
+        """
+        requested_model = body.get("model")
+        per_model_url = ""
+        if isinstance(requested_model, str) and requested_model:
+            per_model_url = (self.valves.model_base_urls or {}).get(requested_model, "").strip()
+        probe_base = (
+            per_model_url
+            or self.valves.cold_start_probe_base_url
+            or os.environ.get("OPENAI_API_BASE_URL", "")
+        ).strip()
+        if not probe_base:
+            # No probe target configured — silently skip rather than fail.
+            return
+
+        metadata = body.get("metadata") or {}
+        chat_id = metadata.get("chat_id")
+        key = chat_id if isinstance(chat_id, str) and chat_id else _DEFAULT_REQUEST_KEY
+        state = self._cold_state.setdefault(key, _ColdStartState())
+
+        warmth = await _modal_warmth.probe_warmth(
+            probe_base,
+            timeout_s=self.valves.cold_start_probe_timeout_s,
+            warm_threshold_s=self.valves.cold_start_warm_threshold_s,
+        )
+        if warmth != "cold" or emitter is None:
+            return
+
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": self.valves.cold_start_message,
+                        "done": False,
+                    },
+                }
+            )
+            state.indicator_emitted = True
+        except Exception as exc:
+            _log.warning("cold-start emit failed: %s", exc)
 
     async def _call_api(
         self,
@@ -496,3 +757,40 @@ def _coerce_nonneg_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, result)
+
+
+def _extract_delta_text(event: dict[str, Any]) -> str:
+    """Pull the assistant-text delta out of one OpenAI-style SSE chunk.
+
+    Accepts both the raw chunk shape (`choices[0].delta.content`) and the
+    OWUI-event envelope shape (`{type: "message", data: {content: ...}}`)
+    so the same helper can serve both `stream()` callbacks.
+    """
+    if not isinstance(event, dict):
+        return ""
+    # OWUI envelope first.
+    data = event.get("data")
+    if isinstance(data, dict):
+        content = data.get("content")
+        if isinstance(content, str) and content:
+            return content
+    # OpenAI-style chunk fallback.
+    choices = event.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str):
+                    return content
+    return ""
+
+
+def _state_key_from_event(event: dict[str, Any]) -> str:
+    """Pull `chat_id` out of an OWUI stream event, or fall back to the default key."""
+    if isinstance(event, dict):
+        chat_id = event.get("chat_id")
+        if isinstance(chat_id, str) and chat_id:
+            return chat_id
+    return _DEFAULT_REQUEST_KEY

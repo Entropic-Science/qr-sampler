@@ -1,17 +1,36 @@
-# Modal profile — `chat.entropic.science`
+# Modal profile — `VllmQr` GPU inference
 
-Hosts the quantum-random LLM chatbot for [entropic.science](https://entropic.science).
+Modal-side surface for the quantum-random LLM chatbot at
+[entropic.science](https://entropic.science). This profile now hosts **only
+the GPU inference container**. Open WebUI itself and its auth bridge live on
+the entropic.science Replit deployment (see
+`entropic.science/spec.md §3.2` — the `artifacts/open-webui/` artifact and
+`middlewares/owuiAuthBridge.ts`).
 
 | Component | Modal object | Hardware | Idle timeout |
 |---|---|---|---|
 | Inference (dual-model) | `VllmQr` | 1× B200 (~180 GB HBM3e) | 3 min, `max_containers=1` |
-| Auth proxy | `owui_edge` | CPU | always-warm (`keep_warm=1`) |
-| Chat UI | `owui` (Open WebUI) | CPU | always-warm (`keep_warm=1`) |
+
+Topology, end-to-end:
+
+```
+Browser ── HTTPS ──▶ entropic.science (Replit Reserved VM)
+                        │
+                        ├── /api      → api-server artifact
+                        ├── /chat     → owuiAuthBridge → open-webui artifact (127.0.0.1:8081)
+                        └── (other)   → static-site artifact
+
+  open-webui ── HTTPS ─▶ VllmQr.serve  (this Modal app)
+                          │  https://<workspace>--qr-sampler-entropic-vllm-qr-serve.modal.run/v1
+                          ▼
+                         B200 GPU, dual AsyncLLMEngine, FP8 weights + FP8 KV
+```
 
 The `VllmQr` container runs **two `AsyncLLMEngine` siblings** in one
 process, both FP8, both 64k context — Gemma 4 31B Reasoning (default) and
-Qwen 3.6 27B Reasoning (selectable). The OWUI model selector exposes both
-real models plus two `--qr-vs-prng` comparison-Pipe pseudo-models.
+Qwen 3.6 27B Reasoning (selectable). The OWUI model selector (configured
+inside the Replit-hosted OWUI artifact) exposes both real models plus two
+`--qr-vs-prng` comparison-Pipe pseudo-models.
 
 Cold-start optimisation: pre-baked weights in a `modal.Volume` named
 `llm-weights` + `enable_memory_snapshot=True`. First request after deploy
@@ -64,18 +83,12 @@ The first request hitting `VllmQr.serve` pays the full init cost and Modal
 captures the snapshot afterwards. Watch the Modal dashboard for the
 "snapshot ready" event before measuring cold-start times.
 
-### 4. Wire the custom domain
+Record the Modal-assigned URL (e.g. `https://<workspace>--qr-sampler-entropic-vllm-qr-serve.modal.run`)
+and propagate it to the entropic.science Replit deployment as
+`OPENAI_API_BASE_URL` (with `/v1` suffix) and `MODAL_BASE_URL` (no suffix).
+See `entropic.science/spec.md §12.5` for the consolidated env-var list.
 
-```bash
-modal domain create chat.entropic.science --function owui_edge
-```
-
-Then add a CNAME on `entropic.science`'s DNS zone pointing
-`chat.entropic.science` → `<modal-generated-cname>.modal.run`. The same-cookie
-scope is satisfied because `chat.entropic.science` is a subdomain of
-`entropic.science`, and the session cookie has `Domain=.entropic.science`.
-
-### 5. firefly-1 reachability
+### 4. firefly-1 reachability
 
 Pre-flight decision §11.1: **(A) public-with-firewall** accepted. Before the
 first `VllmQr` request reaches firefly-1, add Modal's egress IP range to
@@ -84,25 +97,18 @@ the firefly-1 firewall. Read Modal's current egress range from
 to the firewall rules at the firefly-1 host. Tailscale (option B) is
 deferred to v2.
 
-### 6. Import the two OWUI Global Functions
+### 5. OWUI Global Functions (Replit-side, not Modal-side)
 
-Open `https://chat.entropic.science` while signed into a test entropic.science
-account (the auth-proxy will let you through once your session is valid).
-Then in OWUI's admin UI:
-
-1. **Admin Panel → Functions → Import** → upload
-   `examples/open-webui/qr_sampler_filter.json`. Toggle it to **Global** so
-   every chat goes through allowance preflight + debit.
-2. **Admin Panel → Functions → Import** → upload
-   `examples/open-webui/qr_comparison_pipe.json`. This Pipe registers two
-   pseudo-models (`gemma-4-31b-reasoning--qr-vs-prng` and
-   `qwen-3.6-27b-reasoning--qr-vs-prng`) in OWUI's model selector.
+The two OWUI Global Functions (`qr_sampler_filter.py` and
+`qr_comparison_pipe.py`) are imported into the **Replit-hosted** OWUI
+artifact, not into a Modal container. See
+`entropic.science/spec.md §12.6` (operator runbook) and
+`qr-sampler/examples/open-webui/README.md` for the operator steps.
 
 Both functions read their config from OWUI's Valves UI; the defaults pick up
-`SERVICE_TOKEN_SECRETS` and `ENTROPIC_API_BASE_URL` from the container env.
-
-A future iteration may automate this via OWUI's import API — for v1 it's a
-one-time manual step.
+`SERVICE_TOKEN_SECRETS` and `ENTROPIC_API_BASE_URL` from the OWUI container
+env. The first entry of `SERVICE_TOKEN_SECRETS` is the signer; this Modal
+app's `_verify_bearer` accepts any entry.
 
 ## Cold-start expectations
 
@@ -117,6 +123,11 @@ The 2× cost of dual-engine init only happens during the **first** request
 after a deploy (when Modal is recording the snapshot). Snapshot restore
 already includes both engines, so subsequent cold starts pay the same
 ~10–15 s regardless of dual vs single model.
+
+The branded cold-start indicator that users see in OWUI is emitted by the
+qr-sampler OWUI plugin (`examples/open-webui/qr_sampler_filter.py` +
+`qr_comparison_pipe.py`), gated on the `QR_INTEGRATION_PROFILE` env var —
+not by this Modal app. See `examples/open-webui/README.md`.
 
 ## Snapshot-failure fallback
 
@@ -161,18 +172,21 @@ See [`modal_secrets.md`](./modal_secrets.md) for the full procedure. TL;DR:
 3. **Remove old** on the next routine deploy.
 
 The signer always uses the first entry; the verifier accepts any. Adding a
-new secret never breaks live traffic.
+new secret never breaks live traffic. `_verify_bearer` in `vllm_serve.py`
+honours this contract symmetrically with the entropic.science api-server's
+HMAC verifier.
 
 ## Verification (manual, no CI in v1)
 
-Acceptance criteria from `spec.md` §10.3:
+Acceptance criteria from `entropic.science/spec.md §8.4`:
 
 1. `modal deploy deployments/modal/app.py` succeeds (no build / push errors).
-2. `curl https://chat.entropic.science/healthz` returns `{"status":"ok"}` (the
-   `owui_edge` proxy health endpoint).
-3. Sign in with a test entropic.science account, send a prompt through OWUI,
-   receive a response, and confirm a `debitAllowance` row appears in the dev
-   DB's `allowance_ledger` table.
+2. From the Replit deployment: `curl https://entropic.science/api/owui/upstream-health`
+   returns `{"status":"ok"|"starting","checkedAt":"..."}`.
+3. Sign in to entropic.science with a test account, click **Launch** on the
+   quantum-random-llm app, send a prompt through OWUI, receive a response,
+   and confirm a `debitAllowance` row appears in the dev DB's
+   `allowance_ledger` table.
 4. Switch to the `gemma-4-31b-reasoning--qr-vs-prng` model and observe two
    parallel columns of generation + a double-cost debit (one ledger row
    with `comparison_mode = true`).
@@ -187,7 +201,6 @@ Acceptance criteria from `spec.md` §10.3:
 | Deploy | `modal deploy deployments/modal/app.py` |
 | One-shot weights download | `modal run deployments/modal/app.py::download_weights` |
 | Tail logs (vLLM) | `modal app logs qr-sampler-entropic --function VllmQr` |
-| Tail logs (auth proxy) | `modal app logs qr-sampler-entropic --function owui_edge` |
 | Stop the app | `modal app stop qr-sampler-entropic` |
 | Update a secret | `modal secret update qr-sampler-prod KEY=value` |
 | List Modal volumes | `modal volume list` |
@@ -201,8 +214,8 @@ egress IP range and you're confident in the Modal deploy.
 
 ## Source-of-truth design
 
-- `entropic.science/.zenflow/tasks/qr-sampler-integration-fad6/spec.md` §1.3,
-  §5.5, §5.6, §5.7.
-- `entropic.science/.zenflow/tasks/qr-sampler-integration-fad6/requirements.md`
-  §10 (resolved decisions).
+- `entropic.science/.zenflow/tasks/qr-sampler-app-ui-ad88/spec.md` §3.2,
+  §4.1, §4.4, §12.
+- `entropic.science/.zenflow/tasks/qr-sampler-app-ui-ad88/requirements.md`
+  (NFR-COST-1, NFR-SEC-*).
 - Cross-repo handshake: [`../../CROSS-REPO-INTEGRATION.md`](../../CROSS-REPO-INTEGRATION.md).

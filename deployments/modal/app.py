@@ -1,12 +1,19 @@
-"""Modal app definition — vllm-qr (B200, dual-model) + owui-edge + owui.
+"""Modal app definition — vllm-qr (B200, per-model containers).
 
-Layout (matches spec.md §5.5):
+Layout (matches spec.md §5.5 / §4.1, with the labs-cutover per-model split):
 
     weights_volume     — Volume "llm-weights", mounted at /root/.cache/huggingface
     download_weights   — one-shot @app.function to populate weights_volume
-    VllmQr             — @app.cls (B200) running both vLLM engines in one process
-    owui_edge          — @app.function (CPU) FastAPI auth-proxy
-    owui               — @app.function (CPU) stock Open WebUI in trusted-header mode
+    VllmQrGemma        — @app.cls (B200) running google/gemma-4-31B alone
+    VllmQrQwen         — @app.cls (B200) running Qwen/Qwen3.6-27B alone
+
+Each model is its own scale-to-zero @app.cls so OWUI's model picker wakes
+only the requested container. The two classes share `vllm_image` (same
+Dockerfile, same qr-sampler install) — the split is purely runtime, not
+build-time. Open WebUI itself, and its auth bridge, live on the
+entropic.science Replit deployment alongside the api-server (see
+entropic.science/spec.md §3.2 — the `artifacts/open-webui/` artifact and
+`middlewares/owuiAuthBridge.ts`).
 
 Deploy:
     modal deploy deployments/modal/app.py
@@ -14,14 +21,11 @@ Deploy:
 One-shot weights download (before first deploy / on model upgrade):
     modal run deployments/modal/app.py::download_weights
 
-Custom domain (binds public chat.entropic.science -> owui_edge):
-    modal domain create chat.entropic.science --function owui_edge
-
 Snapshot-failure fallback (Pre-flight §11.7): if memory-snapshot restore
-fails on B200, set enable_memory_snapshot=False below and redeploy. Cold
-start becomes ~30-45s instead of ~10-15s; pre-baked weights still cut the
-majority of init time. Do NOT add keep_warm=1 on VllmQr — always-on B200
-cost is unacceptable per Pre-flight §11.7.
+fails on B200, set `enable_memory_snapshot=False` on the affected class
+and redeploy. Cold start becomes ~30-45s instead of ~10-15s; pre-baked
+weights still cut the majority of init time. Do NOT add `keep_warm=1`
+on either class — always-on B200 cost is unacceptable per Pre-flight §11.7.
 """
 
 from __future__ import annotations
@@ -35,20 +39,27 @@ import modal
 APP_NAME = "qr-sampler-entropic"
 
 # Repo root, computed relative to this file (deployments/modal/app.py).
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# Only meaningful at image-build time (locally). In a Modal container Modal
+# mounts app.py at /root/app.py, which has no parents[2] — we fall back to a
+# placeholder because _REPO_ROOT is only read by `Image.from_dockerfile`'s
+# `context_dir` arg at build time.
+try:
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+except IndexError:
+    _REPO_ROOT = Path("/")
 
 # --- Volumes ---------------------------------------------------------------
 
-# Both Gemma 4 31B Reasoning FP8 and Qwen 3.6 27B Reasoning FP8 directories
-# live in this volume. Populated by `download_weights`.
+# Both Gemma 4 31B and Qwen 3.6 27B directories live in this volume.
+# Populated by `download_weights`; each class mounts it read-only and reads
+# only its own subdirectory at engine init.
 weights_volume = modal.Volume.from_name("llm-weights", create_if_missing=True)
-owui_data_volume = modal.Volume.from_name("owui-data", create_if_missing=True)
 
 # --- Secrets ---------------------------------------------------------------
 
 # Provisioned via `modal secret create` — see deployments/modal/modal_secrets.md.
 qr_sampler_prod_secret = modal.Secret.from_name("qr-sampler-prod")
-hf_token_secret = modal.Secret.from_name("hf-token")
+hf_token_secret = modal.Secret.from_name("huggingface-secret")
 
 # --- Images ----------------------------------------------------------------
 
@@ -65,23 +76,20 @@ download_image = (
 )
 
 # GPU image built from Dockerfile.vllm, including the qr-sampler source.
+# `add_python="3.12"` tells Modal which Python version `add_local_python_source`
+# should target. The vllm/vllm-openai:v0.6.6 base ships Python 3.12 (visible
+# in the build log as /usr/local/lib/python3.12/dist-packages), but Modal's
+# from_dockerfile() introspection can't see that through Docker layers, so we
+# declare it. (Modal SDK 1.1.1: this is the documented kwarg name —
+# `python_version` is not accepted on from_dockerfile.)
+#
+# This image is shared by both VllmQrGemma and VllmQrQwen — the per-model
+# split is at the class/container level, not the image level.
 vllm_image = modal.Image.from_dockerfile(
     str(Path(__file__).parent / "Dockerfile.vllm"),
     context_dir=str(_REPO_ROOT),
+    add_python="3.12",
 ).add_local_python_source("deployments", copy=True)
-
-# OWUI image built from Dockerfile.owui (stock OWUI + httpx).
-owui_image = modal.Image.from_dockerfile(
-    str(Path(__file__).parent / "Dockerfile.owui"),
-    context_dir=str(Path(__file__).parent),
-)
-
-# Edge proxy image — CPU-only, FastAPI + httpx.
-owui_edge_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("fastapi>=0.110", "httpx>=0.27", "uvicorn>=0.30")
-    .add_local_python_source("deployments", copy=True)
-)
 
 # --- App -------------------------------------------------------------------
 
@@ -91,8 +99,8 @@ app = modal.App(APP_NAME)
 # ----- One-shot weights download -------------------------------------------
 
 
-_GEMMA_REPO = "google/gemma-4-31b-reasoning"
-_QWEN_REPO = "Qwen/Qwen-3.6-27B-Reasoning"
+_GEMMA_REPO = "google/gemma-4-31B"
+_QWEN_REPO = "Qwen/Qwen3.6-27B"
 # Pinned revisions are recorded here at deploy time. Empty string means
 # "latest at download time" — pin once you know the SHA you want to lock to.
 _GEMMA_REVISION = os.environ.get("GEMMA_REVISION", "")
@@ -134,106 +142,88 @@ def download_weights() -> dict[str, str]:
     }
 
 
-# ----- VllmQr GPU class ----------------------------------------------------
+# ----- Per-model GPU classes -----------------------------------------------
+#
+# Each class:
+#   * Loads ONE model into ONE B200 container.
+#   * Scales to zero independently via `scaledown_window=180` (3 min idle).
+#   * Exposes its own public Modal URL via `@modal.asgi_app()`.
+#
+# OWUI is configured with one Connection per Modal URL (see
+# entropic.science/.zenflow/tasks/qr-sampler-app-ui-ad88/labs-cutover-handoff.md
+# §3.5); the model the user picks in the OWUI dropdown determines which
+# container wakes.
+#
+# Sharing the @app.cls config: the two classes only differ in their
+# class-level `SERVED_MODEL_NAME` and `HF_REPO_ID`. Everything else
+# (image, secrets, volume mount, GPU type, scale-to-zero window, max
+# concurrent inputs) is identical.
 
 
-@app.cls(
-    image=vllm_image,
-    gpu="B200",
-    region="us-east-1",
-    volumes={"/root/.cache/huggingface": weights_volume},
-    secrets=[qr_sampler_prod_secret, hf_token_secret],
-    enable_memory_snapshot=True,
-    container_idle_timeout=180,  # 3 min idle -> shutdown
-    allow_concurrent_inputs=8,
-    max_containers=1,  # Pre-flight §11.8 cost ceiling
-    timeout=60 * 60,
-)
-class VllmQr:
-    """Two ``AsyncLLMEngine`` siblings on one B200, plus an ASGI dispatcher.
+_CLS_KWARGS: dict[str, Any] = {
+    "image": vllm_image,
+    "gpu": "B200",
+    "region": "us-east-1",
+    "volumes": {"/root/.cache/huggingface": weights_volume},
+    "secrets": [qr_sampler_prod_secret, hf_token_secret],
+    "enable_memory_snapshot": True,
+    "scaledown_window": 180,  # 3 min idle -> shutdown
+    "max_containers": 1,  # Pre-flight §11.8 cost ceiling, per model
+    "timeout": 60 * 60,
+}
 
-    Memory-snapshot phase (``@modal.enter(snap=True)``) builds both engines
-    and pre-initialises both entropy pipelines per engine. Modal captures
-    the post-init state; subsequent cold starts restore from the snapshot.
+
+@app.cls(**_CLS_KWARGS)
+@modal.concurrent(max_inputs=8)
+class VllmQrGemma:
+    """One ``AsyncLLMEngine`` serving ``google/gemma-4-31B`` at full precision.
+
+    Memory-snapshot phase (``@modal.enter(snap=True)``) builds the engine
+    and pre-initialises both entropy pipelines (per
+    ``QR_PREINIT_ENTROPY_SOURCES``). Modal captures the post-init state;
+    subsequent cold starts restore from the snapshot.
     """
+
+    SERVED_MODEL_NAME = "gemma-4-31b-reasoning"
+    HF_REPO_ID = "google/gemma-4-31B"
 
     @modal.enter(snap=True)
     def load(self) -> None:
         import asyncio
 
-        from deployments.modal.vllm_serve import build_dispatcher
+        from deployments.modal.vllm_serve import build_dispatcher_for
 
-        # build_dispatcher() instantiates AsyncLLMEngines (which warm
-        # qr-sampler's VLLMAdapter and its pre-init entropy pipelines)
-        # and composes the OpenAI-protocol dispatcher in front of them.
-        self._asgi_app = asyncio.run(build_dispatcher())
+        self._asgi_app = asyncio.run(
+            build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
+        )
 
     @modal.asgi_app()
     def serve(self) -> Any:
         return self._asgi_app
 
 
-# ----- owui_edge (CPU auth-proxy) ------------------------------------------
+@app.cls(**_CLS_KWARGS)
+@modal.concurrent(max_inputs=8)
+class VllmQrQwen:
+    """One ``AsyncLLMEngine`` serving ``Qwen/Qwen3.6-27B`` at full precision.
 
-
-@app.function(
-    image=owui_edge_image,
-    region="us-east-1",
-    secrets=[qr_sampler_prod_secret],
-    keep_warm=1,  # CPU-only, cheap; keeps the public-edge latency low
-    timeout=60 * 5,
-)
-@modal.asgi_app()
-def owui_edge() -> Any:
-    """FastAPI auth-proxy in front of OWUI.
-
-    Bound to the public custom domain ``chat.entropic.science`` via
-    ``modal domain create chat.entropic.science --function owui_edge``.
+    See ``VllmQrGemma`` for the snapshot/scale-to-zero design — identical
+    here, only the model identity differs.
     """
-    from deployments.modal.owui_edge import build_app
 
-    return build_app()
+    SERVED_MODEL_NAME = "qwen-3.6-27b-reasoning"
+    HF_REPO_ID = "Qwen/Qwen3.6-27B"
 
+    @modal.enter(snap=True)
+    def load(self) -> None:
+        import asyncio
 
-# ----- owui (CPU web app) --------------------------------------------------
+        from deployments.modal.vllm_serve import build_dispatcher_for
 
-
-@app.function(
-    image=owui_image,
-    region="us-east-1",
-    volumes={"/app/backend/data": owui_data_volume},
-    secrets=[qr_sampler_prod_secret],
-    keep_warm=1,  # CPU-only; instant per-user response on the chat surface
-    timeout=60 * 30,
-)
-@modal.web_server(port=8080, startup_timeout=120)
-def owui() -> None:
-    """Stock Open WebUI, trusted-header auth mode.
-
-    Trusted headers are populated by ``owui_edge``. OWUI never sees the
-    entropic.science session cookie directly.
-
-    The two Global Functions (``qr_sampler_filter.py`` and
-    ``qr_comparison_pipe.py``) are imported manually via OWUI admin UI on
-    first deploy — see deployments/modal/README.md.
-
-    The ``OPENAI_API_BASE_URL`` env var is set from the Modal Secret so OWUI
-    forwards every chat request to ``VllmQr.serve``'s internal endpoint.
-    The base image's entrypoint launches the OWUI server on port 8080.
-    """
-    # Modal's @web_server decorator runs the image's CMD/ENTRYPOINT. We add
-    # an env precheck so the container fails loudly if a required setting
-    # is missing instead of producing a silently misconfigured OWUI.
-    required = (
-        "WEBUI_AUTH",
-        "ENABLE_SIGNUP",
-        "WEBUI_AUTH_TRUSTED_EMAIL_HEADER",
-        "WEBUI_AUTH_TRUSTED_NAME_HEADER",
-        "OPENAI_API_BASE_URL",
-    )
-    missing = [name for name in required if not os.environ.get(name)]
-    if missing:
-        raise RuntimeError(
-            f"owui container is missing required env vars: {missing}. "
-            "Populate them via the qr-sampler-prod Modal Secret."
+        self._asgi_app = asyncio.run(
+            build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
         )
+
+    @modal.asgi_app()
+    def serve(self) -> Any:
+        return self._asgi_app

@@ -1,9 +1,15 @@
-# Local-dev parity profile for the entropic.science Modal deployment.
+# Local-dev parity profile for the entropic.science deployment.
 #
-# Runs the same vLLM + qr-sampler + Open WebUI stack on a single Docker host,
-# wired against firefly-1 and the entropic.science dev API. Use this for
-# smoke-testing the OWUI filter + comparison Pipe changes locally before
-# pushing to Modal.
+# As of 2026-05-16, the production deployment shape changed: OWUI runs on the
+# entropic.science Replit app (not Modal, and the `chat.entropic.science`
+# subdomain has been retired). The Modal app is **GPU-only** — it serves
+# vLLM + qr-sampler via the OpenAI-compatible adapter and scales to zero.
+#
+# This compose file still runs the full stack (vLLM + qr-sampler + OWUI) on
+# a single Docker host so a developer can smoke-test the OWUI filter + Pipe
+# end-to-end without standing up a Replit shadow. The OWUI service in here is
+# convenience, not production parity. For production parity of just the
+# vLLM/GPU surface, use `deployments/modal/`.
 #
 # Single-model only here (CPU/single-GPU dev hosts can't fit both reasoning
 # FP8 models at once). Override HF_MODEL in .env to pick which one to run.
@@ -11,7 +17,11 @@
 # Quick start:
 #   cd deployments/entropic-science
 #   cp .env.example .env
-#   # edit .env: QR_GRPC_API_KEY, HF_TOKEN, SERVICE_TOKEN_SECRETS, ENTROPIC_API_BASE_URL
+#   # edit .env: QR_GRPC_API_KEY, HF_TOKEN, SERVICE_TOKEN_SECRETS,
+#   #            ENTROPIC_API_BASE_URL, OPENAI_API_BASE_URL (for cold-start
+#   #            probe; locally this is http://vllm:8000/v1), and optionally
+#   #            QR_INTEGRATION_PROFILE=entropic.science to activate the
+#   #            entropic.science Valves defaults in the OWUI plugins.
 #   docker compose --profile ui up --build
 
 services:
@@ -66,6 +76,14 @@ services:
       # The OWUI filter + Pipe read these to talk to the local entropic.science API.
       ENTROPIC_API_BASE_URL: "${ENTROPIC_API_BASE_URL:-http://host.docker.internal:3001/api}"
       SERVICE_TOKEN_SECRETS: "${SERVICE_TOKEN_SECRETS:-}"
+      # Cold-start probe target. The filter + Pipe issue HEAD /v1/models here
+      # before each chat completion; if the response is slow they emit a
+      # "spinning up" OWUI status event. Defaults to the local vLLM service.
+      # In production this points at the Modal app's OpenAI endpoint.
+      OPENAI_API_BASE_URL: "${OPENAI_API_BASE_URL:-http://vllm:8000/v1}"
+      # Activates entropic.science Valves defaults in the OWUI plugins (cold-
+      # start timeouts, copy, etc.). Unset → plugins behave as v0.2.0.
+      QR_INTEGRATION_PROFILE: "${QR_INTEGRATION_PROFILE:-}"
     extra_hosts:
       # Let OWUI reach the entropic.science dev API running on the Docker host.
       - "host.docker.internal:host-gateway"

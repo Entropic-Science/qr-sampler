@@ -3,9 +3,50 @@
 **Status**: Planned. Implementation has not started yet.
 **Other repo**: `C:\Code\Entropic-Science\entropic.science\`
 **Source-of-truth artefacts**: `entropic.science/.zenflow/tasks/qr-sampler-integration-fad6/` (PRD `requirements.md`, spec `spec.md`, plan `plan.md`).
-**Last updated**: 2026-05-15 (Pre-flight decisions).
+**Last updated**: 2026-05-16 (cold-start probe + Replit hosting move).
 
 This file exists so a second Claude agent working in `qr-sampler` knows what is about to land here from the `entropic.science` side. It is a heads-up, not a directive. The authoritative design lives in `spec.md` in the other repo.
+
+---
+
+## ⚠ Heads-up — OWUI hosting + cold-start indicator on 2026-05-16
+
+Two architectural shifts have landed in `examples/open-webui/`. Neither
+changes the qr-sampler library code, but both change how the OWUI plugins
+are deployed and configured.
+
+1. **OWUI now lives on the entropic.science Replit, not Modal.** The
+   `chat.entropic.science` subdomain has been retired. The Replit app hosts
+   OWUI directly and the Modal app is **GPU-only** — it serves vLLM via the
+   OpenAI-compatible adapter and scales to zero between prompts. The plugin
+   files in this repo are imported into the Replit OWUI install.
+2. **Cold-start indicator** — because Modal scales to zero, the first
+   prompt after a quiet period waits several seconds for the container to
+   spin up. Both `qr_sampler_filter.py` and `qr_comparison_pipe.py` now
+   probe `HEAD <upstream>/v1/models` before issuing the chat completion,
+   and emit a `{type: "status", data: {description, done}}` OWUI event with
+   a "spinning up" message if the probe reports cold. The first streamed
+   token clears the indicator. If the first token never arrives within the
+   configured timeout, the outlet **skips the debit** (PRD R-3.5: no charge
+   for a snapshot-restore failure).
+3. **Plugin modularity gated by `QR_INTEGRATION_PROFILE`.** The cold-start
+   defaults (timeout values, copy, probe target) live in a new sibling
+   module `entropic_science_profile.py`. The plugin imports it
+   unconditionally but its `apply()` is a no-op unless
+   `QR_INTEGRATION_PROFILE=entropic.science` is set in the environment.
+   Other operators using the plugins keep v0.2.0 behaviour. The probe
+   helper itself (`_modal_warmth.py`) is operator-agnostic.
+
+The deployment artefacts in this repo:
+
+- `examples/open-webui/_modal_warmth.py` — reusable warmth probe.
+- `examples/open-webui/entropic_science_profile.py` — opt-in defaults.
+- `examples/open-webui/qr_sampler_filter.py` (v0.3.0) — filter w/ probe + indicator + first-token timeout.
+- `examples/open-webui/qr_comparison_pipe.py` (v0.2.0) — pipe w/ single probe shared by both columns.
+- `examples/open-webui/qr_sampler_filter.json` + `qr_comparison_pipe.json` — self-contained JSON wrappers; `bundle_owui_functions.py` inlines the helpers so OWUI's single-file import still works.
+
+Authoritative details in
+`entropic.science/.zenflow/tasks/qr-sampler-app-ui-ad88/plan.md`.
 
 ---
 
