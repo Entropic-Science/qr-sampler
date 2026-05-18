@@ -59,6 +59,17 @@ _PREFLIGHT_PATH = "/allowance/preflight"
 _UPSERT_PATH = "/conversations/upsert"
 _DEFAULT_REQUEST_KEY = "__default__"
 
+# Fallback-visibility hook (plan R2, spec §11.5): when the configured entropy
+# primary is the quantum source but the response metadata reports it actually
+# resolved to ``system`` (urandom), surface that to the user as a warning.
+# Otherwise users can't tell quantum-sampled tokens from PRNG-sampled ones in
+# the rendered output. ``QR_ENTROPY_SOURCE_TYPE`` is the canonical name of the
+# configured primary, set by the operator in the qr-sampler Modal Secret.
+_FALLBACK_WARNING_MSG = (
+    "Quantum entropy source unavailable; this response used local "
+    "pseudo-random entropy. Operator: see DEPLOY.md."
+)
+
 _log = logging.getLogger("qr_sampler.open_webui_filter")
 
 
@@ -431,6 +442,12 @@ class Filter:
         self.valves = self.Valves()
         # Per-request cold-start state, keyed by chat_id (or a sentinel).
         self._cold_state: dict[str, _ColdStartState] = {}
+        # Per-chat dedup set for the fallback-visibility warning (plan R2).
+        # An entry means "the user has already been told their entropy source
+        # fell back to urandom in this chat session". Cleared on filter
+        # restart; OWUI's Filter instance is process-lived so this matches
+        # the user's session lifetime.
+        self._fallback_warned: set[str] = set()
         # Apply integration profile overrides if env switch is set.
         entropic_science_profile.apply(self.valves)
 
@@ -548,15 +565,24 @@ class Filter:
         self,
         body: dict[str, Any],
         __user__: dict[str, Any] | None = None,
+        __event_emitter__: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Debit the actual usage and upsert the conversation shadow row.
 
         Best-effort: any debit/upsert error is logged and swallowed. The
         response body is returned unmodified either way. When the cold-start
         first-token timeout was hit, no debit is sent (PRD R-3.5).
+
+        Also surfaces the fallback-visibility warning (plan R2) when the
+        response's ``qr_metadata.last_source_used`` differs from the
+        configured primary (``QR_ENTROPY_SOURCE_TYPE``). Runs before the
+        allowance branches so the warning fires even on the OWUI-only
+        deploy profile that does not gate on email.
         """
         if not self.valves.enable_qr_sampling:
             return body
+
+        await self._maybe_warn_fallback_visibility(body, __event_emitter__)
 
         email = (__user__ or {}).get("email")
         if not isinstance(email, str) or not email:
@@ -625,6 +651,68 @@ class Filter:
         state.timed_out = True
 
     # -- Internal helpers -------------------------------------------------
+
+    async def _maybe_warn_fallback_visibility(
+        self,
+        body: dict[str, Any],
+        emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """Emit a one-shot fallback warning when entropy primary != actual.
+
+        The vLLM serve layer attaches ``body["qr_metadata"]["last_source_used"]``
+        (the name of the entropy source that actually produced bytes for this
+        response). The configured primary is read from
+        ``QR_ENTROPY_SOURCE_TYPE`` at call time so an operator flipping the
+        Modal Secret takes effect on the next response.
+
+        Silently no-ops in three benign cases:
+          * the response carries no ``qr_metadata`` (legacy / pre-R2 vLLM
+            serve layer that does not yet attach it),
+          * the configured primary env var is unset (no primary to compare),
+          * OWUI did not pass an event emitter to outlet (no UI channel).
+
+        Dedup is per ``chat_id`` (or the default-key sentinel for non-chat
+        requests) so a single fallback session does not spam the user with
+        one warning per turn.
+        """
+        if emitter is None:
+            return
+
+        qr_metadata = body.get("qr_metadata")
+        if not isinstance(qr_metadata, dict):
+            return
+        last_source = qr_metadata.get("last_source_used")
+        if not isinstance(last_source, str) or not last_source:
+            return
+
+        configured = os.environ.get("QR_ENTROPY_SOURCE_TYPE", "").strip()
+        if not configured or configured == last_source:
+            return
+
+        metadata = body.get("metadata") or {}
+        chat_id = metadata.get("chat_id")
+        dedup_key = (
+            chat_id if isinstance(chat_id, str) and chat_id else _DEFAULT_REQUEST_KEY
+        )
+        if dedup_key in self._fallback_warned:
+            return
+
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "level": "warning",
+                        "description": _FALLBACK_WARNING_MSG,
+                        "done": True,
+                    },
+                }
+            )
+        except Exception as exc:
+            _log.warning("fallback-visibility emit failed: %s", exc)
+            return
+
+        self._fallback_warned.add(dedup_key)
 
     async def _maybe_emit_cold_start(
         self,

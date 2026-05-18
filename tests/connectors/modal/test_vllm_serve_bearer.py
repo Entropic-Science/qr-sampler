@@ -12,9 +12,9 @@ verifier"):
   request branch count does not depend on which entry matched (the loop runs
   to completion even after a match).
 
-The module under test imports FastAPI, which is available in the deployments
-toolchain (the GPU container ships it). When the dev environment lacks
-fastapi, these tests skip cleanly rather than fail-load.
+The module under test imports FastAPI, which is available in the modal
+connector toolchain (the GPU container ships it). When the dev environment
+lacks fastapi, these tests skip cleanly rather than fail-load.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import inspect
 import pytest
 
 _vllm_serve = pytest.importorskip(
-    "deployments.modal.vllm_serve",
+    "qr_sampler.connectors.modal.vllm_serve",
     reason="fastapi not installed in this environment",
 )
 

@@ -13,15 +13,18 @@ inlined where the sibling-import block lives, producing one self-contained
 
 Run from this directory:
 
-    python bundle_owui_functions.py
+    python bundle_owui_functions.py            # write bundles
+    python bundle_owui_functions.py --check    # idempotency check; exit 1 on drift
 
 Outputs `qr_sampler_filter.json` and `qr_comparison_pipe.json` in place.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -114,7 +117,8 @@ def _bundle(plugin_filename: str, function_id: str, function_name: str) -> dict:
     }
 
 
-def main() -> None:
+def _render_bundles() -> dict[str, str]:
+    """Build both envelopes and return ``{relative_path: serialized_json}``."""
     filter_envelope = _bundle(
         "qr_sampler_filter.py",
         "qr_sampler_parameters",
@@ -125,17 +129,50 @@ def main() -> None:
         "qr_comparison_pipe",
         "QR vs PRNG Comparison",
     )
+    return {
+        "qr_sampler_filter.json": json.dumps([filter_envelope], indent=2) + "\n",
+        "qr_comparison_pipe.json": json.dumps([pipe_envelope], indent=2) + "\n",
+    }
 
-    (_HERE / "qr_sampler_filter.json").write_text(
-        json.dumps([filter_envelope], indent=2) + "\n",
-        encoding="utf-8",
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Render bundles in memory and diff against on-disk files; exit 1 "
+            "with a one-line summary on any drift. Used by CI / plan-step "
+            "verification to guarantee `python bundle_owui_functions.py` is "
+            "idempotent and committed."
+        ),
     )
-    (_HERE / "qr_comparison_pipe.json").write_text(
-        json.dumps([pipe_envelope], indent=2) + "\n",
-        encoding="utf-8",
-    )
+    args = parser.parse_args(argv)
+
+    rendered = _render_bundles()
+
+    if args.check:
+        drifted: list[str] = []
+        for relpath, content in rendered.items():
+            path = _HERE / relpath
+            current = path.read_text(encoding="utf-8") if path.exists() else ""
+            if current != content:
+                drifted.append(relpath)
+        if drifted:
+            print(
+                f"bundles drifted: {', '.join(drifted)} — "
+                "run `python bundle_owui_functions.py` and commit the changes.",
+                file=sys.stderr,
+            )
+            return 1
+        print("bundles are up to date")
+        return 0
+
+    for relpath, content in rendered.items():
+        (_HERE / relpath).write_text(content, encoding="utf-8")
     print("wrote qr_sampler_filter.json and qr_comparison_pipe.json")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

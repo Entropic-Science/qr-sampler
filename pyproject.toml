@@ -62,6 +62,7 @@ openentropy = [
 ]
 vllm = []
 vllm-metal = []
+modal = ["modal>=0.66,<1.0"]
 
 [project.entry-points."vllm.logits_processors"]
 qr_sampler = "qr_sampler.processor:QRSamplerLogitsProcessor"
@@ -81,6 +82,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "qr_sampler" = ["profiles/**/*.yaml", "templates/**/*.j2", "py.typed"]
+"qr_sampler.connectors.modal" = ["Dockerfile.vllm", "modal_secrets.md", "README.md"]
 
 [tool.setuptools_scm]
 fallback_version = "0.1.0.dev0"

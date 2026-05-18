@@ -125,9 +125,9 @@ def _verify_bearer(token: str) -> bool:
 
 
 def _check_vllm_api_key(request: Request) -> None:
-    """Bearer-token gate. The signer is OWUI on the entropic.science Replit
-    deployment; both sides read ``SERVICE_TOKEN_SECRETS`` from the same
-    rolling-secret vector (see modal_secrets.md).
+    """Bearer-token gate. The signer is the OWUI deployment in front of
+    this vLLM endpoint; both sides read ``SERVICE_TOKEN_SECRETS`` from the
+    same rolling-secret vector (see modal_secrets.md).
 
     Fail-closed: when ``SERVICE_TOKEN_SECRETS`` is empty, requests are rejected
     with 503 unless ``ALLOW_UNAUTHENTICATED_INFERENCE=1`` is set as an explicit
