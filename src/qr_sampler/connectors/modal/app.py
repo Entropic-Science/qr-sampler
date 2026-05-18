@@ -267,6 +267,15 @@ _OWUI_IMAGE = (
         # against either).
         "bcrypt>=4.1,<6",
         "psycopg[binary]>=3.1,<4",
+        # OWUI imports `pgvector.sqlalchemy` at module load when
+        # VECTOR_DB=pgvector (set in qr-llm-chat-prod). Pin matches
+        # what OWUI 0.9.5's pgvector_client.py was developed against.
+        "pgvector>=0.3,<0.4",
+        # OWUI 0.9.5's pgvector client uses psycopg2 (v2 driver) even
+        # though admin_bootstrap goes through SQLAlchemy. Without this
+        # `import open_webui.main` fails on the pgvector branch with
+        # ModuleNotFoundError("No module named 'psycopg2'").
+        "psycopg2-binary>=2.9,<3",
     )
     .env(
         {
@@ -284,6 +293,11 @@ _OWUI_IMAGE = (
     )
     .add_local_python_source("qr_sampler", copy=True)
     .add_local_python_source("qr_llm_chat", copy=True)
+    # `obs` is a top-level package living at qr-llm-chat's repo root
+    # (not under src/). Five qr_llm_chat modules import from `obs.events`
+    # / `obs.logging`; without shipping it the snapshot pre-import fails
+    # with ModuleNotFoundError("No module named 'obs'").
+    .add_local_python_source("obs", copy=True)
 )
 
 # OWUI-specific secret — separate from qr_sampler_prod_secret per spec §11.6.
