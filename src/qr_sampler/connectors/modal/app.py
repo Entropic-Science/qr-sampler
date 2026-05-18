@@ -261,7 +261,11 @@ _OWUI_IMAGE = (
     .apt_install("libpq-dev", "build-essential", "curl")
     .pip_install(
         "open-webui==0.9.5",
-        "bcrypt>=4.1,<5",
+        # OWUI 0.9.5 transitively pins bcrypt==5.0.0; widening from
+        # <5 to <6 lets pip resolve the image build (4.x's Python API
+        # is unchanged in 5.x, so qr_llm_chat.admin_bootstrap works
+        # against either).
+        "bcrypt>=4.1,<6",
         "psycopg[binary]>=3.1,<4",
     )
     .env(
