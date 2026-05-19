@@ -204,6 +204,124 @@ def build_app(served_model_name: str, engine: AsyncLLMEngine) -> FastAPI:
     async def health() -> dict[str, Any]:
         return {"status": "ok", "model": served_model_name}
 
+    @app.get("/health/entropy")
+    async def health_entropy() -> dict[str, Any]:
+        """Quantum-entropy source connectivity probe.
+
+        Called by OWUI's setup-orchestrator (see qr_llm_chat.setup_orchestrator)
+        to confirm the per-container cloudflared sidecar + Cipherstone gRPC
+        backend are reachable. NOT auth-gated for the same reason ``/health``
+        is not — operators and the OWUI status poller need to read it without
+        a bearer token round-trip.
+
+        Probe sequence:
+
+        1. **TCP-connect** to ``QR_GRPC_SERVER_ADDRESS`` (default
+           ``127.0.0.1:50051``) with a 1s deadline. Proves the cloudflared
+           sidecar is listening. A failure here points at the sidecar's
+           own startup (check ``cloudflared.*`` events in modal logs).
+        2. **RPC ping** — a single ``GetRandomBytes(16)`` call against the
+           gRPC service with a 2s deadline. Proves the full path
+           container -> sidecar -> Cloudflare Access -> Cipherstone backend
+           is up AND that the ``QR_GRPC_API_KEY`` is currently accepted.
+           Consumes 16 entropy bytes (negligible).
+
+        Response shape (always 200 — the probe's job is to report status,
+        not to fail the request; OWUI reads the JSON fields)::
+
+            {
+                "model": "<served_model_name>",
+                "address": "127.0.0.1:50051",
+                "tcp_ok": true,
+                "tcp_error": null,
+                "rpc_ok": true,
+                "rpc_error": null,
+                "rpc_latency_ms": 42.3,
+                "bytes_received": 16,
+                "summary": "quantum_grpc reachable (rpc=42ms)"
+            }
+        """
+        import socket
+        import time as _time
+
+        address = os.environ.get("QR_GRPC_SERVER_ADDRESS", "127.0.0.1:50051")
+        host, _, port_s = address.partition(":")
+        try:
+            port = int(port_s)
+        except ValueError:
+            return {
+                "model": served_model_name,
+                "address": address,
+                "tcp_ok": False,
+                "tcp_error": f"malformed address: {address!r}",
+                "rpc_ok": False,
+                "rpc_error": "skipped (tcp failed)",
+                "rpc_latency_ms": None,
+                "bytes_received": 0,
+                "summary": f"misconfigured QR_GRPC_SERVER_ADDRESS={address!r}",
+            }
+
+        tcp_ok = False
+        tcp_error: str | None = None
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                tcp_ok = True
+        except OSError as err:
+            tcp_error = f"{type(err).__name__}: {err}"
+
+        if not tcp_ok:
+            return {
+                "model": served_model_name,
+                "address": address,
+                "tcp_ok": False,
+                "tcp_error": tcp_error,
+                "rpc_ok": False,
+                "rpc_error": "skipped (tcp failed)",
+                "rpc_latency_ms": None,
+                "bytes_received": 0,
+                "summary": f"cloudflared sidecar unreachable at {address}",
+            }
+
+        rpc_ok = False
+        rpc_error: str | None = None
+        rpc_latency_ms: float | None = None
+        bytes_received = 0
+        try:
+            from qr_sampler.config import QRSamplerConfig
+            from qr_sampler.entropy.quantum import QuantumGrpcSource
+
+            cfg = QRSamplerConfig(entropy_source_type="quantum_grpc")
+            src = QuantumGrpcSource(cfg)
+            try:
+                t0 = _time.perf_counter()
+                data = src.get_random_bytes(16)
+                rpc_latency_ms = (_time.perf_counter() - t0) * 1000.0
+                bytes_received = len(data)
+                rpc_ok = bytes_received == 16
+                if not rpc_ok:
+                    rpc_error = f"short read: got {bytes_received} bytes, expected 16"
+            finally:
+                src.close()
+        except Exception as err:  # noqa: BLE001 — probe must always return 200
+            rpc_error = f"{type(err).__name__}: {err}"
+
+        if rpc_ok:
+            summary = f"quantum_grpc reachable (rpc={rpc_latency_ms:.0f}ms)"
+        else:
+            summary = f"gRPC probe failed: {rpc_error}"
+
+        return {
+            "model": served_model_name,
+            "address": address,
+            "tcp_ok": tcp_ok,
+            "tcp_error": tcp_error,
+            "rpc_ok": rpc_ok,
+            "rpc_error": rpc_error,
+            "rpc_latency_ms": rpc_latency_ms,
+            "bytes_received": bytes_received,
+            "summary": summary,
+        }
+
     @app.get("/v1/models")
     async def list_models(request: Request) -> dict[str, Any]:
         _check_vllm_api_key(request)
