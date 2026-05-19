@@ -1,11 +1,11 @@
-"""Modal app definition — vllm-qr (B200, per-model containers).
+"""Modal app definition — vllm-qr (H200, per-model containers).
 
 Layout (matches spec.md §5.5 / §4.1, with the labs-cutover per-model split):
 
     weights_volume     — Volume "llm-weights", mounted at /root/.cache/huggingface
     download_weights   — one-shot @app.function to populate weights_volume
-    VllmQrGemma        — @app.cls (B200) running google/gemma-4-31B alone
-    VllmQrQwen         — @app.cls (B200) running Qwen/Qwen3.6-27B alone
+    VllmQrGemma        — @app.cls (H200) running google/gemma-4-31B alone
+    VllmQrQwen         — @app.cls (H200) running Qwen/Qwen3.6-27B alone
 
 Each model is its own scale-to-zero @app.cls so OWUI's model picker wakes
 only the requested container. The two classes share `vllm_image` (same
@@ -23,14 +23,24 @@ One-shot weights download (before first deploy / on model upgrade):
     modal run -m qr_sampler.connectors.modal.app::download_weights
 
 Snapshot-failure fallback (Pre-flight §11.7): if memory-snapshot restore
-fails on B200, set `enable_memory_snapshot=False` on the affected class
+fails on H200, set `enable_memory_snapshot=False` on the affected class
 and redeploy. Cold start becomes ~30-45s instead of ~10-15s; pre-baked
 weights still cut the majority of init time. Do NOT add `keep_warm=1`
-on either class — always-on B200 cost is unacceptable per Pre-flight §11.7.
+on either class — always-on H200 cost is unacceptable per Pre-flight §11.7.
+
+GPU history: this app shipped initially on B200 pinned to us-east-1.
+The B200 pool in that region was capacity-starved at first deploy time
+(2026-05-19) — Modal scheduling sat in a "waiting to be scheduled" state
+for both classes. Stepping down one tier to H200 (still fits both
+31B/27B models at native bf16 with the default max_model_len=65536)
+widens the schedulable pool while keeping the us-east-1 region pin in
+place. If H200 still queues in us-east-1, the next knob is to relax
+that region pin (see comment in `_CLS_KWARGS`).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 from typing import Any
@@ -49,6 +59,38 @@ try:
     _REPO_ROOT = Path(__file__).resolve().parents[4]
 except IndexError:
     _REPO_ROOT = Path("/")
+
+
+def _qr_llm_chat_functions_dir() -> Path:
+    """Resolve the on-disk location of `qr_llm_chat/functions/` at deploy time.
+
+    Used by `_OWUI_IMAGE.add_local_dir(...)` below to ship the JSON
+    Function envelopes (`qr_sampler_filter.json`, `qr_comparison_pipe.json`)
+    into the container alongside the Python source. Resolves the package via
+    Python's own import machinery so the path is correct whether qr-llm-chat
+    is installed as a `pip install -e` sibling editable or a published wheel.
+
+    Hard-failing here (rather than returning a sentinel) is intentional: if
+    `qr_llm_chat` is not importable on the deploy host, neither
+    `add_local_python_source("qr_llm_chat")` above nor any of the lifespan
+    hooks below can possibly work, and a single clear error here beats a
+    confusing stack trace inside a Modal restore.
+    """
+    spec = importlib.util.find_spec("qr_llm_chat")
+    if spec is None or spec.origin is None:
+        raise RuntimeError(
+            "qr_llm_chat is not importable in the deploy host's Python env. "
+            "Run `pip install -e <path/to/qr-llm-chat>` in the venv you use "
+            "for `modal deploy` and try again."
+        )
+    functions_dir = Path(spec.origin).resolve().parent / "functions"
+    if not functions_dir.is_dir():
+        raise RuntimeError(
+            f"Expected `qr_llm_chat/functions/` at {functions_dir}; not found. "
+            "If the package layout has changed, update _qr_llm_chat_functions_dir "
+            "in qr_sampler/connectors/modal/app.py."
+        )
+    return functions_dir
 
 # --- Volumes ---------------------------------------------------------------
 
@@ -164,7 +206,12 @@ def download_weights() -> dict[str, str]:
 
 _CLS_KWARGS: dict[str, Any] = {
     "image": vllm_image,
-    "gpu": "B200",
+    # H200 (141 GB HBM3e) fits both Gemma 4 31B and Qwen 3.6 27B at
+    # native bf16 with max_model_len=65536 + gpu_memory_utilization=0.90,
+    # and has a wider schedulable pool than B200. If queueing persists,
+    # the next knob is to relax `region` below (drop the line or widen to
+    # `["us-east", "us-west", ...]`).
+    "gpu": "H200",
     "region": "us-east-1",
     "volumes": {"/root/.cache/huggingface": weights_volume},
     "secrets": [qr_sampler_prod_secret, hf_token_secret],
@@ -298,6 +345,30 @@ _OWUI_IMAGE = (
     # / `obs.logging`; without shipping it the snapshot pre-import fails
     # with ModuleNotFoundError("No module named 'obs'").
     .add_local_python_source("obs", copy=True)
+    # Function envelope JSON bundles -- `add_local_python_source` above
+    # only ships `.py`/`.pyi` files, so the JSON envelopes in
+    # `src/qr_llm_chat/functions/*.json` (consumed by
+    # `qr_llm_chat.bootstrap_functions._load_bundles`) never reach the
+    # container without this explicit dir add. Symptom of regression:
+    # ``no Function bundles found under /root/qr_llm_chat/functions``
+    # in `modal app logs` at restore, followed by "no models available"
+    # in the OWUI UI.
+    #
+    # We resolve the on-disk location via `importlib.util.find_spec` so
+    # the path stays correct whether qr-llm-chat is installed as an
+    # editable (`pip install -e`) sibling repo or a published wheel --
+    # `add_local_python_source` itself uses the same resolver, so
+    # whatever path it ships .py files FROM is the path we ship the JSON
+    # files from too. `remote_path` is pinned to match the resolved
+    # location of `qr_llm_chat/functions/` inside the container --
+    # `add_local_python_source(..., copy=True)` lands the package under
+    # `/root/qr_llm_chat/` (visible in the log path quoted above), so
+    # the JSON sibling goes there too.
+    .add_local_dir(
+        str(_qr_llm_chat_functions_dir()),
+        remote_path="/root/qr_llm_chat/functions",
+        copy=True,
+    )
 )
 
 # OWUI-specific secret — separate from qr_sampler_prod_secret per spec §11.6.
