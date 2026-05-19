@@ -23,7 +23,11 @@ classifiers = [
 ]
 readme = "README.md"
 dependencies = [
-    "numpy>=2.0.0",
+    # vllm 0.6.6 (production base image) pins numpy<2.0.0; we only use
+    # stable APIs (frombuffer/argpartition/searchsorted/cumsum/exp/etc.)
+    # that work on both 1.x and 2.x, so the floor is the lowest 1.x we
+    # actually exercise.
+    "numpy>=1.26,<3",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.5.0",
     "grpcio>=1.68.0",

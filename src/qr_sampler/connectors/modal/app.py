@@ -429,6 +429,13 @@ _OWUI_IMAGE = (
             # use RAG/document retrieval in this deploy, so an empty model
             # name takes the falsy short-circuit in
             # ``open_webui.routers.retrieval.get_ef`` and skips the loader.
+            #
+            # The env var alone is insufficient when OWUI's ``config`` row
+            # already holds a DB-persisted ``rag.embedding_model`` from an
+            # earlier deploy: ``PersistentConfig`` prefers the DB value over
+            # env. qr-llm-chat's ``lifespan_hooks._strip_stale_rag_embedding_config``
+            # strips that DB key in pre_snapshot before OWUI is imported so
+            # this env value actually wins.
             "RAG_EMBEDDING_MODEL": "",
             "PYTHONUNBUFFERED": "1",
         }
