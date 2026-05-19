@@ -233,7 +233,7 @@ class VllmQrGemma:
     subsequent cold starts restore from the snapshot.
     """
 
-    SERVED_MODEL_NAME = "gemma-4-31b-reasoning"
+    SERVED_MODEL_NAME = "gemma"
     HF_REPO_ID = "google/gemma-4-31B"
 
     @modal.enter(snap=True)
@@ -260,7 +260,7 @@ class VllmQrQwen:
     here, only the model identity differs.
     """
 
-    SERVED_MODEL_NAME = "qwen-3.6-27b-reasoning"
+    SERVED_MODEL_NAME = "qwen"
     HF_REPO_ID = "Qwen/Qwen3.6-27B"
 
     @modal.enter(snap=True)
