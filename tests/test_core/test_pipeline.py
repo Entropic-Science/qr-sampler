@@ -20,6 +20,7 @@ from qr_sampler.core.pipeline import (
 )
 from qr_sampler.core.types import SamplingResult
 from qr_sampler.entropy.fallback import FallbackEntropySource
+from qr_sampler.temperature.base import TemperatureResult, TemperatureStrategy
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -319,6 +320,82 @@ class TestSampleToken:
 # ---------------------------------------------------------------------------
 # Tests: SamplingPipeline.close
 # ---------------------------------------------------------------------------
+
+
+class _StaticTempStrategy(TemperatureStrategy):
+    """Returns a fixed TemperatureResult with caller-supplied diagnostics."""
+
+    def __init__(self, temperature: float, diagnostics: dict[str, Any]) -> None:
+        self._temperature = temperature
+        self._diagnostics = diagnostics
+
+    def compute_temperature(
+        self, logits: np.ndarray, config: QRSamplerConfig
+    ) -> TemperatureResult:
+        return TemperatureResult(
+            temperature=self._temperature,
+            shannon_entropy=1.0,
+            diagnostics=dict(self._diagnostics),
+        )
+
+
+class TestMinPThreading:
+    """Pipeline reads ``min_p`` from temperature diagnostics with config fallback."""
+
+    def test_min_p_from_temp_diagnostics_overrides_config_default(self) -> None:
+        """Strategy diagnostics ``min_p`` wins over ``config.min_p_base``."""
+        pipeline = _make_pipeline(min_p_base=0.0)
+        # Highly skewed logits; min_p=0.1 means only the dominant token survives.
+        logits = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        strategy = _StaticTempStrategy(temperature=1.0, diagnostics={"min_p": 0.1})
+        result = pipeline.sample_token(logits, strategy=strategy)
+        assert result.record.min_p_used == 0.1
+        pipeline.close()
+
+    def test_min_p_falls_back_to_config_when_strategy_omits_it(self) -> None:
+        """Without ``min_p`` in diagnostics, the selector sees ``config.min_p_base``."""
+        pipeline = _make_pipeline(min_p_base=0.07)
+        logits = np.array([5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0])
+        strategy = _StaticTempStrategy(temperature=1.0, diagnostics={})
+        result = pipeline.sample_token(logits, strategy=strategy)
+        assert result.record.min_p_used == 0.07
+        pipeline.close()
+
+
+class TestRecordOptionalFields:
+    """Optional HVH/preset diagnostic fields on TokenSamplingRecord."""
+
+    def test_record_populated_with_hvh_diagnostics(self) -> None:
+        """Using ``hvh_drift`` strategy populates varentropy/h_ema/vh_ema/min_p_used."""
+        # Importing the module registers HVHDriftStrategy in the registry.
+        import qr_sampler.temperature.hvh_drift  # noqa: F401
+
+        pipeline = _make_pipeline(temperature_strategy="hvh_drift")
+        logits = np.array([5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0])
+        result = pipeline.sample_token(logits)
+
+        assert result.record.varentropy is not None
+        assert result.record.varentropy >= 0.0
+        assert result.record.h_ema is not None
+        assert result.record.vh_ema is not None
+        assert result.record.min_p_used is not None
+        pipeline.close()
+
+    def test_record_unaffected_for_fixed_strategy(self) -> None:
+        """Fixed strategy leaves all five optional fields at sensible defaults."""
+        pipeline = _make_pipeline(temperature_strategy="fixed")
+        logits = np.array([5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0])
+        result = pipeline.sample_token(logits)
+
+        # HVH-only diagnostics are absent → None.
+        assert result.record.varentropy is None
+        assert result.record.h_ema is None
+        assert result.record.vh_ema is None
+        # No env-var preset configured → None.
+        assert result.record.preset_active is None
+        # min_p_used always populated from selector diagnostics; defaults to 0.0.
+        assert result.record.min_p_used == 0.0
+        pipeline.close()
 
 
 class TestPipelineClose:

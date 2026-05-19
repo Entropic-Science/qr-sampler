@@ -65,6 +65,26 @@ class TestDefaults:
         assert default_config.log_level == "summary"
         assert default_config.diagnostic_mode is False
 
+    def test_hvh_fields_have_v6_winner_defaults(self, default_config: QRSamplerConfig) -> None:
+        """All hvh_* fields default to the V6_HVD_R01_01 winning configuration."""
+        assert default_config.hvh_t_base == 1.35
+        assert default_config.hvh_alpha_h == 0.3
+        assert default_config.hvh_alpha_vh == -0.2
+        assert default_config.hvh_gamma_dh == 1.0
+        assert default_config.hvh_delta_dvh == 0.5
+        assert default_config.hvh_lambda_ema == 0.02
+        assert default_config.hvh_min_p_base == 0.025
+        assert default_config.hvh_kappa_h == 0.03
+        assert default_config.hvh_nu_dh == 0.02
+
+    def test_min_p_base_defaults_to_zero(self, default_config: QRSamplerConfig) -> None:
+        """min_p_base defaults to 0.0 so the selector remains a no-op (NFR-7)."""
+        assert default_config.min_p_base == 0.0
+
+    def test_preset_defaults_to_none(self, default_config: QRSamplerConfig) -> None:
+        """preset defaults to None so no preset is applied unless QR_PRESET is set."""
+        assert default_config.preset is None
+
 
 # ---------------------------------------------------------------------------
 # Environment variable loading
@@ -135,6 +155,18 @@ class TestEnvVarLoading:
         with patch.dict(os.environ, {"OTHER_TOP_K": "999"}):
             config = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
         assert config.top_k == 0  # Unchanged default
+
+    def test_qr_hvh_t_base_env_var(self) -> None:
+        """QR_HVH_T_BASE is auto-bound by pydantic-settings."""
+        with patch.dict(os.environ, {"QR_HVH_T_BASE": "2.0"}):
+            config = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
+        assert config.hvh_t_base == 2.0
+
+    def test_qr_preset_env_var(self) -> None:
+        """QR_PRESET populates the preset field on the config."""
+        with patch.dict(os.environ, {"QR_PRESET": "creative_sampling"}):
+            config = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
+        assert config.preset == "creative_sampling"
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +257,36 @@ class TestResolveConfig:
         """Pydantic should coerce 'true' to True."""
         result = resolve_config(default_config, {"qr_diagnostic_mode": "true"})
         assert result.diagnostic_mode is True
+
+    def test_per_request_override_hvh_field(self, default_config: QRSamplerConfig) -> None:
+        """An hvh_* hyperparameter is overridable per-request and defaults stay clean."""
+        result = resolve_config(default_config, {"qr_hvh_t_base": 1.5})
+        assert result.hvh_t_base == 1.5
+        assert default_config.hvh_t_base == 1.35  # defaults unchanged
+
+    def test_min_p_base_per_request_override(self, default_config: QRSamplerConfig) -> None:
+        """min_p_base is overridable per-request via qr_min_p_base."""
+        result = resolve_config(default_config, {"qr_min_p_base": 0.05})
+        assert result.min_p_base == 0.05
+        assert default_config.min_p_base == 0.0  # defaults unchanged
+
+    def test_preset_not_in_per_request_fields(self, default_config: QRSamplerConfig) -> None:
+        """preset is NOT per-request overridable via the normal field-merge path.
+
+        ``preset`` itself is an infrastructure-only field (set by QR_PRESET),
+        so it must never appear in ``_PER_REQUEST_FIELDS``. The selection
+        surface uses ``qr_preset`` as a special key that ``resolve_config``
+        and ``validate_extra_args`` both recognize via the preset-resolution
+        layer (it expands into concrete qr_* overrides before merging).
+        """
+        assert "preset" not in _PER_REQUEST_FIELDS
+        # Known preset names must be accepted (the validation hook needs to
+        # let qr_preset through so the vLLM per-request preset flow works).
+        validate_extra_args({"qr_preset": "creative_sampling"})
+        validate_extra_args({"qr_preset": "normal_t1"})
+        # Unknown preset names must be rejected with a helpful message.
+        with pytest.raises(ConfigValidationError, match="Unknown preset"):
+            validate_extra_args({"qr_preset": "not_a_real_preset"})
 
 
 # ---------------------------------------------------------------------------

@@ -141,6 +141,37 @@ class TestTokenSelector:
         # token_prob is one candidate's probability — it should be > 0 and < 1.
         assert 0.0 < result.token_prob <= 1.0
 
+    @pytest.mark.parametrize(
+        ("logits", "top_k", "top_p", "u"),
+        [
+            (np.array([5.0, 4.0, 3.0, 2.0, 1.0]), 0, 1.0, 0.001),
+            (np.array([5.0, 4.0, 3.0, 2.0, 1.0]), 0, 1.0, 0.999),
+            (np.array([5.0, 4.0, 3.0, 2.0, 1.0]), 3, 1.0, 0.5),
+            (np.array([5.0, 1.0, 0.0, -1.0, -5.0]), 0, 0.5, 0.3),
+            (np.array([10.0, 5.0, 4.0, 3.0, 2.0]), 3, 0.5, 0.3),
+            (np.array([1.0, 1.0, 1.0, 1.0]), 0, 1.0, 0.5),
+            (np.array([100.0, -100.0, -100.0]), 1, 1.0, 0.5),
+            (np.array([-np.inf, -np.inf, 5.0, -np.inf]), 0, 1.0, 0.5),
+        ],
+    )
+    def test_default_min_p_zero_is_noop_across_fixtures(
+        self,
+        selector: TokenSelector,
+        logits: np.ndarray,
+        top_k: int,
+        top_p: float,
+        u: float,
+    ) -> None:
+        """Calling select() without min_p must match select(..., min_p=0.0) exactly."""
+        legacy = selector.select(logits, temperature=1.0, top_k=top_k, top_p=top_p, u=u)
+        explicit = selector.select(
+            logits, temperature=1.0, top_k=top_k, top_p=top_p, u=u, min_p=0.0
+        )
+        assert legacy.token_id == explicit.token_id
+        assert legacy.token_rank == explicit.token_rank
+        assert legacy.token_prob == explicit.token_prob
+        assert legacy.num_candidates == explicit.num_candidates
+
 
 class TestSelectionResultImmutability:
     """Tests for SelectionResult frozen dataclass."""

@@ -23,6 +23,7 @@ from qr_sampler.profiles.schema import (
     AmplifierProfile,
     EngineProfile,
     EntropySourceProfile,
+    PresetProfile,
     SamplerProfile,
 )
 
@@ -36,6 +37,7 @@ _CATEGORIES: dict[str, tuple[str, type[BaseModel]]] = {
     "entropy": ("entropy", EntropySourceProfile),
     "amplifiers": ("amplifiers", AmplifierProfile),
     "samplers": ("samplers", SamplerProfile),
+    "presets": ("presets", PresetProfile),
 }
 
 
@@ -231,3 +233,21 @@ class ProfileLoader:
     def list_samplers(self) -> list[SamplerProfile]:
         """Load and return all sampler profiles."""
         return self._list_profiles("samplers")  # type: ignore[return-value]
+
+    def load_preset(self, preset_id: str) -> PresetProfile:
+        """Load a single preset profile by id.
+
+        Args:
+            preset_id: Profile identifier (e.g. ``'creative_sampling'``).
+
+        Returns:
+            Validated ``PresetProfile``.
+
+        Raises:
+            KeyError: If no profile matches ``preset_id``.
+        """
+        return self._load_profile("presets", preset_id)  # type: ignore[return-value]
+
+    def list_presets(self) -> list[PresetProfile]:
+        """Load and return all preset profiles."""
+        return self._list_profiles("presets")  # type: ignore[return-value]

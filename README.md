@@ -218,6 +218,7 @@ qr-sampler list models --engine vllm # Known-working models for an engine
 qr-sampler list entropy-sources      # All entropy source profiles
 qr-sampler list amplifiers           # Signal amplification algorithms
 qr-sampler list samplers             # Temperature strategies
+qr-sampler list presets              # Preset bundles (creative_sampling, normal_t1)
 ```
 
 ### `qr-sampler info`
@@ -229,6 +230,7 @@ qr-sampler info engine vllm
 qr-sampler info entropy quantum_grpc
 qr-sampler info amplifier zscore_mean
 qr-sampler info sampler edt
+qr-sampler info preset creative_sampling
 ```
 
 ### `qr-sampler validate`
@@ -405,6 +407,68 @@ T = clamp(T, min_temp, max_temp)    # Bounds enforcement
 ```
 
 High-entropy (uncertain) distributions get higher temperatures; low-entropy (confident) distributions get lower temperatures. This creates a feedback loop where the model's own uncertainty calibrates the randomness of selection.
+
+---
+
+## Creative Sampling (experimental)
+
+`creative_sampling` is an **experimental** preset bundling the `hvh_drift` temperature strategy plus a dynamic per-token `min_p` mask. The default hyperparameters reproduce the winning configuration (`V6_HVD_R01_01`) from the v6 phase of the [createmp-evalsuite](https://github.com/alchemystack/createmp-evalsuite) sampler-evaluation testbed. The strategy tracks Shannon entropy (`H`) and varentropy (`VH`) of each step's distribution, maintains per-request EMAs of both, and uses the drift between the current and EMA values to drive temperature and min-p adjustments token-by-token.
+
+Two presets ship out of the box:
+
+| Preset | What it does | Status |
+|---|---|---|
+| `creative_sampling` | `hvh_drift` strategy with V6 winner hyperparameters + dynamic min-p | **Experimental** |
+| `normal_t1` | Vanilla `fixed` strategy at T=1, no top-k or top-p filtering | Stable baseline |
+
+### Process-wide via env var
+
+```bash
+QR_PRESET=creative_sampling python -m vllm serve Qwen/Qwen2.5-1.5B-Instruct
+```
+
+### Per-request via `extra_args`
+
+```python
+client.completions.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct",
+    prompt="The nature of consciousness is",
+    max_tokens=100,
+    extra_body={"extra_args": {"qr_preset": "creative_sampling"}},
+)
+```
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "prompt": "The nature of consciousness is",
+    "max_tokens": 100,
+    "extra_args": {"qr_preset": "creative_sampling"}
+  }'
+```
+
+### Precedence
+
+Per-request `qr_preset` beats the `QR_PRESET` env var. Per-request `qr_*` keys override individual values inside whichever preset is active, so you can pin a single hyperparameter without abandoning the preset:
+
+```json
+{"extra_args": {"qr_preset": "creative_sampling", "qr_hvh_t_base": 1.2}}
+```
+
+### Open WebUI toggle
+
+The bundled [Open WebUI filter](examples/open-webui/) exposes a per-user `UserValves.preset` dropdown so end users can flip between `creative_sampling` (experimental) and `normal_t1` from the chat UI without touching admin settings. See the filter README for installation steps.
+
+### Inspecting a preset
+
+```bash
+qr-sampler list presets             # Both presets, with experimental flag and origin
+qr-sampler info preset creative_sampling
+```
+
+> **Heads up:** `creative_sampling` is research-grade. It changes token distributions in non-obvious ways and carries per-request state. Pin to `normal_t1` (or omit `qr_preset` entirely) for reproducible baselines.
 
 ---
 
@@ -744,6 +808,7 @@ src/qr_sampler/
 ├── __main__.py                    # CLI entry: python -m qr_sampler
 ├── config.py                      # Pydantic-settings configuration
 ├── exceptions.py                  # Exception hierarchy
+├── presets.py                     # BUILTIN_PRESETS + extra_args expansion (creative_sampling, normal_t1)
 ├── processor.py                   # Backward compat: re-exports VLLMAdapter
 ├── py.typed                       # PEP 561 type hint marker
 ├── core/                          # Engine-agnostic pipeline (NO torch)
@@ -760,7 +825,8 @@ src/qr_sampler/
 │   ├── engines/                   # Engine profiles (vllm, vllm_metal)
 │   ├── entropy/                   # Entropy profiles (system, quantum_grpc, ...)
 │   ├── amplifiers/                # Amplifier profiles (zscore_mean, ecdf)
-│   └── samplers/                  # Sampler profiles (fixed, edt)
+│   ├── samplers/                  # Sampler profiles (fixed, edt)
+│   └── presets/                   # Preset profiles (creative_sampling, normal_t1)
 ├── cli/                           # CLI commands (requires [cli] extra)
 │   ├── main.py                    # Click group
 │   ├── validate_cmd.py            # qr-sampler validate
@@ -798,7 +864,8 @@ src/qr_sampler/
     ├── base.py                    # TemperatureStrategy ABC, Shannon entropy
     ├── registry.py                # TemperatureStrategyRegistry
     ├── fixed.py                   # Fixed temperature
-    └── edt.py                     # Entropy-dependent temperature
+    ├── edt.py                     # Entropy-dependent temperature
+    └── hvh_drift.py               # Stateful per-request EMA-driven temperature + dynamic min-p (creative_sampling)
 
 examples/
 ├── servers/                       # Example entropy servers

@@ -17,6 +17,7 @@ from qr_sampler.profiles.schema import (
     EngineProfile,
     EntropySourceProfile,
     PlatformConstraint,
+    PresetProfile,
     SamplerProfile,
 )
 
@@ -29,6 +30,7 @@ __all__ = [
     "EngineProfile",
     "EntropySourceProfile",
     "PlatformConstraint",
+    "PresetProfile",
     "ProfileLoader",
     "SamplerProfile",
 ]

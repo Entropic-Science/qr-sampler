@@ -11,6 +11,7 @@ from qr_sampler.profiles.schema import (
     EngineProfile,
     EntropySourceProfile,
     PlatformConstraint,
+    PresetProfile,
     SamplerProfile,
 )
 
@@ -192,3 +193,63 @@ class TestSamplerProfile:
         sp = SamplerProfile(id="fix", name="Fixed", sampler_class="m:C")
         with pytest.raises(ValidationError):
             sp.id = "other"  # type: ignore[misc]
+
+
+class TestPresetProfile:
+    """Tests for PresetProfile model."""
+
+    def test_preset_profile_validates_required_fields(self) -> None:
+        pp = PresetProfile(
+            id="creative_sampling",
+            name="Creative Sampling",
+            description="Experimental V6 winner preset.",
+            experimental=True,
+            origin="V6_HVD_R01_01",
+            overrides={"temperature_strategy": "hvh_drift"},
+        )
+        assert pp.id == "creative_sampling"
+        assert pp.name == "Creative Sampling"
+        assert pp.experimental is True
+        assert pp.origin == "V6_HVD_R01_01"
+        assert pp.overrides == {"temperature_strategy": "hvh_drift"}
+
+    def test_origin_defaults_to_none(self) -> None:
+        pp = PresetProfile(
+            id="normal_t1",
+            name="Normal T=1",
+            description="Vanilla baseline.",
+            experimental=False,
+            overrides={"temperature_strategy": "fixed"},
+        )
+        assert pp.origin is None
+
+    def test_missing_required_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            PresetProfile(id="x", name="X")  # type: ignore[call-arg]
+
+    def test_preset_profile_is_frozen(self) -> None:
+        pp = PresetProfile(
+            id="creative_sampling",
+            name="Creative Sampling",
+            description="x",
+            experimental=True,
+            overrides={},
+        )
+        with pytest.raises(ValidationError):
+            pp.id = "other"  # type: ignore[misc]
+
+    def test_preset_profile_overrides_accepts_arbitrary_keys(self) -> None:
+        pp = PresetProfile(
+            id="creative_sampling",
+            name="Creative Sampling",
+            description="x",
+            experimental=True,
+            overrides={
+                "temperature_strategy": "hvh_drift",
+                "hvh_t_base": 1.35,
+                "top_k": 0,
+                "top_p": 1.0,
+            },
+        )
+        assert pp.overrides["hvh_t_base"] == 1.35
+        assert pp.overrides["top_k"] == 0

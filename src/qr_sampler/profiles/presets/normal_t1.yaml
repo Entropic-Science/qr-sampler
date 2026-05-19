@@ -1,0 +1,17 @@
+id: normal_t1
+name: "Normal (T=1)"
+description: |
+  Vanilla fixed-temperature 1.0 baseline. Quantum entropy still drives
+  token selection; no temperature scaling, no top-k / top-p truncation,
+  no dynamic min-p.
+
+  Use this preset to compare against ``creative_sampling`` when
+  evaluating the qualitative effect of the HVH-Drift dynamics.
+
+experimental: false
+origin: null
+overrides:
+  temperature_strategy: fixed
+  fixed_temperature: 1.0
+  top_k: 0
+  top_p: 1.0

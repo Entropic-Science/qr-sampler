@@ -7,7 +7,7 @@ license: MIT
 description: qr-sampler params + entropic.science allowance metering + cold-start indicator.
 """
 
-from __future__ import annotations
+from typing import Literal, Optional
 
 import asyncio
 import hashlib
@@ -438,6 +438,26 @@ class Filter:
             description="Store all token records in memory for analysis.",
         )
 
+    class UserValves(BaseModel):
+        """Per-user qr-sampler preset selector.
+
+        Open WebUI renders this as a dropdown / toggle in each user's
+        per-filter settings (it introspects pydantic ``Literal`` fields).
+        Distinct from ``Valves``: ``UserValves`` is editable by every
+        user, while ``Valves`` is admin-only.
+        """
+
+        preset: Literal["creative_sampling", "normal_t1"] = Field(
+            default="normal_t1",
+            description=(
+                "Token sampling preset. 'creative_sampling' is EXPERIMENTAL, "
+                "based on the V6_HVD_R01_01 winner from createmp-evalsuite "
+                "(hvh_drift family with per-sequence EMA state and dynamic min-p). "
+                "'normal_t1' is the vanilla T=1 baseline (quantum entropy still "
+                "drives selection)."
+            ),
+        )
+
     def __init__(self) -> None:
         self.valves = self.Valves()
         # Per-request cold-start state, keyed by chat_id (or a sentinel).
@@ -517,10 +537,20 @@ class Filter:
         for field_name in self._QR_FIELDS:
             body[f"qr_{field_name}"] = valve_dict[field_name]
 
-        if self.valves.cold_start_enabled:
-            await self._maybe_emit_cold_start(body, __event_emitter__)
+        user_valves = None
+        if __user__ is not None:
+            user_valves = (
+                __user__.get("valves")
+                if isinstance(__user__, dict)
+                else getattr(__user__, "valves", None)
+            )
+        if user_valves is not None:
+            preset_name = getattr(user_valves, "preset", None)
+            if preset_name is None and isinstance(user_valves, dict):
+                preset_name = user_valves.get("preset")
+            if preset_name:
+                body["qr_preset"] = preset_name
 
-        # `stream: True` (or `False`) set by the caller is preserved as-is.
         return body
 
     async def stream(

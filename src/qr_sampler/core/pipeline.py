@@ -242,6 +242,10 @@ class SamplingPipeline:
         # --- 1. Compute temperature ---
         temp_result = active_strategy.compute_temperature(logits, active_config)
 
+        # Per-token min-p: HVH-Drift publishes a value via diagnostics; other
+        # strategies omit the key, so fall back to the config-level default.
+        min_p = float(temp_result.diagnostics.get("min_p", active_config.min_p_base))
+
         # --- 2. Fetch entropy just-in-time ---
         t_fetch_start = time.perf_counter_ns()
         entropy_is_fallback = False
@@ -269,6 +273,7 @@ class SamplingPipeline:
             active_config.top_k,
             active_config.top_p,
             amp_result.u,
+            min_p=min_p,
         )
 
         # --- 5. Build one-hot numpy array ---
@@ -280,6 +285,9 @@ class SamplingPipeline:
         t_end_ns = time.perf_counter_ns()
         total_sampling_ms = (t_end_ns - t_start_ns) / 1_000_000.0
 
+        # Optional HVH-Drift / preset diagnostics. ``.get`` returns ``None``
+        # for non-HVH strategies and pre-Step-2 selectors that omit min_p_used.
+        temp_diag = temp_result.diagnostics
         record = TokenSamplingRecord(
             timestamp_ns=t_start_ns,
             entropy_fetch_ms=entropy_fetch_ms,
@@ -297,6 +305,11 @@ class SamplingPipeline:
             token_prob=selection.token_prob,
             num_candidates=selection.num_candidates,
             config_hash=hash_str,
+            varentropy=temp_diag.get("varentropy"),
+            min_p_used=selection.diagnostics.get("min_p_used"),
+            preset_active=active_config.preset,
+            h_ema=temp_diag.get("h_ema"),
+            vh_ema=temp_diag.get("vh_ema"),
         )
 
         # --- 7. Log ---

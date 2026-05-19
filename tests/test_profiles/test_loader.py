@@ -12,6 +12,7 @@ from qr_sampler.profiles.schema import (
     AmplifierProfile,
     EngineProfile,
     EntropySourceProfile,
+    PresetProfile,
     SamplerProfile,
 )
 
@@ -89,6 +90,25 @@ class TestLoadBuiltinProfiles:
         assert sampler.id == "edt"
         assert sampler.requires_vocab_size is True
 
+    def test_load_preset_creative_sampling(self, loader: ProfileLoader) -> None:
+        preset = loader.load_preset("creative_sampling")
+        assert isinstance(preset, PresetProfile)
+        assert preset.id == "creative_sampling"
+        assert preset.experimental is True
+        assert preset.origin is not None
+        assert "V6_HVD_R01_01" in preset.origin
+        assert preset.overrides["temperature_strategy"] == "hvh_drift"
+        assert preset.overrides["hvh_t_base"] == 1.35
+
+    def test_load_preset_normal_t1(self, loader: ProfileLoader) -> None:
+        preset = loader.load_preset("normal_t1")
+        assert isinstance(preset, PresetProfile)
+        assert preset.id == "normal_t1"
+        assert preset.experimental is False
+        assert preset.origin is None
+        assert preset.overrides["temperature_strategy"] == "fixed"
+        assert preset.overrides["fixed_temperature"] == 1.0
+
 
 class TestListProfiles:
     """Test listing all profiles for each category."""
@@ -121,6 +141,12 @@ class TestListProfiles:
         assert "fixed" in ids
         assert "edt" in ids
 
+    def test_list_presets_returns_both(self, loader: ProfileLoader) -> None:
+        presets = loader.list_presets()
+        ids = [p.id for p in presets]
+        assert "creative_sampling" in ids
+        assert "normal_t1" in ids
+
 
 class TestMissingProfile:
     """Test error handling for nonexistent profiles."""
@@ -140,6 +166,10 @@ class TestMissingProfile:
     def test_missing_sampler(self, loader: ProfileLoader) -> None:
         with pytest.raises(KeyError, match="nonexistent"):
             loader.load_sampler("nonexistent")
+
+    def test_load_preset_missing_raises(self, loader: ProfileLoader) -> None:
+        with pytest.raises(KeyError, match="nonexistent"):
+            loader.load_preset("nonexistent")
 
 
 class TestUserOverrides:

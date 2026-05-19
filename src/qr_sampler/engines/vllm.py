@@ -342,21 +342,28 @@ class VLLMAdapter(EngineAdapter):
                     f"Set {_PREINIT_ENV_VAR!s} at process startup to include it."
                 )
 
-            # Build per-request components if config differs from the target
-            # pipeline's defaults. We compare model_dumps so a request that
-            # only overrode the source type still hits the fast path.
+            # Always build a fresh strategy. Stateful strategies (e.g.
+            # hvh_drift) carry per-request EMA state on the instance, so
+            # sharing the target pipeline's default would leak distributional
+            # drift between concurrent requests (CLAUDE.md invariant 17).
+            # The cost is one constructor call per addition.
+            strategy = TemperatureStrategyRegistry.build(req_config, self._vocab_size)
+
+            # Amplifier is safe to share when the resolved config matches
+            # the target pipeline's defaults (it carries only calibration
+            # state, which depends on config). Rebuild only when the config
+            # differs. We compare model_dumps so a request that only overrode
+            # the entropy source type still hits the fast path.
             if req_config is self._default_config or (
                 req_config.model_dump() == target_pipeline.default_config.model_dump()
             ):
                 amplifier = target_pipeline.amplifier
-                strategy = target_pipeline.strategy
                 hash_str = config_hash(target_pipeline.default_config)
             else:
                 amplifier = AmplifierRegistry.build(req_config)
                 # Calibrate per-request amplifier if it supports calibration.
                 if hasattr(amplifier, "calibrate"):
                     amplifier.calibrate(target_pipeline.entropy_source, req_config)
-                strategy = TemperatureStrategyRegistry.build(req_config, self._vocab_size)
                 hash_str = config_hash(req_config)
 
             self._request_states[req_idx] = _RequestState(
