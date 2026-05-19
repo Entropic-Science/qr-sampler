@@ -270,17 +270,18 @@ _CLS_KWARGS: dict[str, Any] = {
     # native bf16 with max_model_len=65536 + gpu_memory_utilization=0.90,
     # and has a wider schedulable pool than B200.
     "gpu": "H200",
-    # Region pool: widened from "us-east-1" (single zone) to the
-    # QRNG-adjacent zone group, NOT all of US, after Modal's scheduler
-    # surfaced "Function VllmQrGemma.* is waiting to be scheduled on a
-    # GPU_H200 worker. Relaxing requirements (region=us-east-1 or setting
-    # regions=[us-east]) may lead to faster scheduling." (2026-05-19).
-    # Both Gemma and Qwen were stuck pending for >4 min on first restore
-    # — the curl probes saw the symptom as HTTP 303 +
-    # ``__modal_function_call_id`` + hang.
+    # Region pool: widened to the full US triple after the QRNG-adjacent
+    # pair ("us-central", "us-east") still produced capacity-pending
+    # warnings on H200 (2026-05-19). Operational priority is scheduling
+    # success first — Modal's H200 supply across a single region group
+    # is bursty enough that even us-central + us-east left both Gemma
+    # and Qwen queued, surfacing as HTTP 303 + ``__modal_function_call_id``
+    # + hang on the curl-side probe. Modal does NOT accept a wildcard
+    # "us" string; only the explicit region-cluster list is valid.
     #
-    # WHY not "all of US" (e.g. us-east + us-west)
-    # --------------------------------------------
+    # QRNG-LATENCY CAVEAT (documented honestly so the next operator
+    # decides knowingly)
+    # ------------------------------------------------------------
     # qr-sampler's ``QuantumGrpcSource`` runs a synchronous GetRandomBytes
     # gRPC RPC PER TOKEN on the inference hot path — vLLM's
     # ``LogitsProcessor`` blocks token emission until the QRNG returns.
@@ -292,15 +293,14 @@ _CLS_KWARGS: dict[str, Any] = {
     # coast H200 would add ~30–50 ms RTT to every sampled token — at
     # 50 tok/s that is 1.5–2.5 s of added wall-clock per second of
     # generated output, plainly visible in OWUI's streaming UI.
-    # So the colocation is a correctness-for-usable-latency constraint,
-    # not just a nice-to-have. We widen the *zone* pool within the
-    # QRNG-adjacent region group instead of widening across the country.
     #
-    # If "us-central" remains capacity-starved, the next knob is adding
-    # specific east-coast zones (e.g. ["us-east-1", "us-east-2",
-    # "us-central"]) — still short backbone hops to central-US — rather
-    # than reaching for us-west.
-    "region": ["us-central", "us-east"],
+    # We accept that penalty for the workloads that land on us-west
+    # because the alternative is workloads that do not land at all.
+    # If steady-state QRNG latency becomes the dominant pain point and
+    # H200 capacity in us-central + us-east stabilises, narrow this
+    # back to ``["us-central", "us-east"]`` — the prior comment block
+    # in git history explains the latency math in detail.
+    "region": ["us-east", "us-central", "us-west"],
     "volumes": {"/root/.cache/huggingface": weights_volume},
     "secrets": [qr_sampler_prod_secret, hf_token_secret],
     "enable_memory_snapshot": True,
