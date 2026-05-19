@@ -3,6 +3,122 @@
 Cross-cutting notes about architectural pivots, observed runtime quirks, and
 decisions whose rationale is too long for a commit message. Newest first.
 
+## 2026-05-19 — vLLM deploy unblock: image deps, region widening, container-restore tolerance
+
+After landing the qr-llm-chat split (R2) the first end-to-end smoke against
+`modal deploy -m qr_sampler.connectors.modal.app` surfaced three distinct
+failure modes in sequence. Each fix exposed the next, classic onion-peeling.
+
+### Failure 1 — `ModuleNotFoundError: No module named 'pydantic'` in vLLM containers
+
+`modal app logs <ap-id>` showed the GPU containers crashing immediately on
+restore at `from qr_sampler.config import ...` (which imports pydantic).
+
+**Root cause.** The `vllm_image` declaration was:
+
+```python
+vllm_image = modal.Image.from_dockerfile(
+    str(Path(__file__).parent / "Dockerfile.vllm"),
+    context_dir=str(_REPO_ROOT),
+    add_python="3.12",
+).add_local_python_source("qr_sampler", copy=True)
+```
+
+`add_python="3.12"` tells Modal to install Python 3.12 as a parallel
+interpreter on top of the base image. `add_local_python_source` then ships
+`/root/qr_sampler/` as importable from 3.12's site-packages. **But** the
+Dockerfile's `pip install --no-cache-dir .` only installs to the BASE image's
+Python (whatever vllm/vllm-openai:v0.6.6 ships with), not to Modal's added
+3.12. So at container restore, 3.12 imports `/root/qr_sampler` but has no
+pydantic to satisfy `qr_sampler.config`.
+
+**Fix.** Add `.pip_install(...)` after `from_dockerfile(...)` listing
+qr-sampler's runtime deps from `pyproject.toml` (`numpy`, `pydantic`,
+`pydantic-settings`, `grpcio`, `protobuf`, `pyyaml`) plus `vllm_serve.py`
+needs (`fastapi`, `httpx`). The `.pip_install` layer is built by Modal in
+the add_python-selected Python, so the deps land where the import looks.
+
+The pre-existing Dockerfile `pip install .` stays — it's harmless and useful
+for any subprocess that uses the base image's Python (e.g. the cloudflared
+sidecar's Python).
+
+### Failure 2 — VllmQr* "waiting to be scheduled on GPU_H200 worker"
+
+After fix 1, the GPU container loaded its code, but Modal's scheduler emitted:
+
+> *Function VllmQrGemma.* is waiting to be scheduled on a GPU_H200 worker.
+> Relaxing requirements (region=us-east-1 or setting regions=[us-east])
+> may lead to faster scheduling.*
+
+H200 capacity in `us-east-1` alone was insufficient. Curl-side symptom was
+HTTP 303 + `__modal_function_call_id` query param + 60-90s timeout on the
+polled URL — Modal's standard "function-call queued, poll for result"
+pattern, which hangs when the function never gets scheduled.
+
+**Fix.** Widen `_CLS_KWARGS["region"]` from `"us-east-1"` (str) to
+`["us-east", "us-west"]` (list — the multi-region form Modal's hint
+suggests). Both us-east and us-west are valid Modal region groups; the
+scheduler picks any available H200 zone within them. QRNG entropy reaches
+every container via Cloudflare's global edge, so there is no latency reason
+to pin a specific zone. Staying US-only keeps weights in-region for the
+`llm-weights` Volume and aligns egress with OWUI's billing zone.
+
+### Failure 3 — `_qr_llm_chat_functions_dir()` raises in vLLM containers
+
+After fixes 1+2, vLLM containers scheduled successfully and started loading.
+The next restore failed earlier in the import chain with our own
+RuntimeError: *"qr_llm_chat is not importable in the deploy host's Python
+env."*
+
+**Root cause.** Modal's `_container_entrypoint` does
+`importlib.import_module("qr_sampler.connectors.modal.app")` to find the
+`VllmQrGemma` class definition. That runs the ENTIRE module body, including:
+
+```python
+_OWUI_IMAGE = (
+    modal.Image.debian_slim(...)
+    ...
+    .add_local_dir(
+        str(_qr_llm_chat_functions_dir()),   # <-- evaluated at import time
+        remote_path="/root/qr_llm_chat/functions",
+        copy=True,
+    )
+)
+```
+
+`_qr_llm_chat_functions_dir()` calls `importlib.util.find_spec("qr_llm_chat")`
+and raises if missing. The vLLM containers only ship `qr_sampler` (via
+`add_local_python_source` on `vllm_image`, not `_OWUI_IMAGE`), so
+qr_llm_chat is genuinely absent there. Pre-fix-1 this never surfaced because
+the pydantic crash happened first.
+
+**Fix.** Gate the hard-fail on `MODAL_TASK_ID` being unset — that env var
+is set inside every Modal container at runtime and absent on the deploy
+host. Container-side, the function returns a placeholder Path. Image
+construction (`.add_local_dir(...)`) happens at deploy time on the host
+where the real path is returned; container-side, the placeholder is
+metadata that Modal never re-reads.
+
+Lesson: any top-level code in `connectors/modal/app.py` that depends on
+the deploy host's filesystem must tolerate running inside Modal's
+container-restore import chain, where only the package's own files are
+present.
+
+### Cross-repo bug surfaced in passing — comparison-pipe URL
+
+While diagnosing the above, an OWUI Playwright smoke surfaced
+`Unexpected token 'm', "modal-http"... is not valid JSON` errors in
+chat completions. Root cause: `qr_llm_chat.bootstrap_connections._normalize_url`
+strips a trailing `/v1` before writing valve URLs, but
+`qr_comparison_pipe._stream_completion` (and `_probe_warmth`) was appending
+only `/chat/completions` (and `/models`) — landing on routes the FastAPI
+dispatcher does not mount. Fixed on the qr-llm-chat side in the same session.
+
+The URL convention is now explicit: bootstrap stores the bare host
+(no /v1), the pipe + probe re-append `/v1/<route>`. This matches how
+`bootstrap_connections._build_connection_state` already handles OWUI's
+Connections (which DO want /v1 on the URL).
+
 ## 2026-05-18 — qr-llm split, step R2: OWUIService class + fallback-visibility hook
 
 **Context.** As part of the qr-llm-chat split (entropic.science → standalone

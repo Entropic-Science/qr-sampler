@@ -70,14 +70,42 @@ def _qr_llm_chat_functions_dir() -> Path:
     Python's own import machinery so the path is correct whether qr-llm-chat
     is installed as a `pip install -e` sibling editable or a published wheel.
 
-    Hard-failing here (rather than returning a sentinel) is intentional: if
-    `qr_llm_chat` is not importable on the deploy host, neither
-    `add_local_python_source("qr_llm_chat")` above nor any of the lifespan
-    hooks below can possibly work, and a single clear error here beats a
-    confusing stack trace inside a Modal restore.
+    Container-restore tolerance
+    ---------------------------
+    This module is imported in EVERY container in the deploy (OWUI, both
+    vLLM classes) because Modal does ``importlib.import_module`` on the
+    class's defining module when restoring the container. The vLLM
+    containers do NOT ship qr_llm_chat (their image only adds qr_sampler),
+    so `find_spec("qr_llm_chat")` returns None there.
+
+    At RESTORE time the image is already built; ``.add_local_dir(...)``
+    is metadata Modal does not re-read. So returning a placeholder Path
+    when qr_llm_chat is missing keeps module import working in vLLM
+    containers without affecting the OWUI image build (which always
+    runs on the deploy host, where qr_llm_chat is installed and the
+    real path is returned).
+
+    Hard-failing the deploy host's case is still important — if the
+    operator forgot ``pip install -e qr-llm-chat`` before
+    ``modal deploy``, ``add_local_dir`` would silently upload an empty
+    placeholder and the OWUI Function-bundle import would fail at first
+    restore. So we keep the loud error, but gate it on
+    ``MODAL_TASK_ID`` being unset (= we are on the deploy host, not in
+    a Modal container). Modal sets ``MODAL_TASK_ID`` for every container
+    at runtime; on the deploy host it is absent.
     """
     spec = importlib.util.find_spec("qr_llm_chat")
+    in_modal_container = bool(os.environ.get("MODAL_TASK_ID"))
     if spec is None or spec.origin is None:
+        if in_modal_container:
+            # vLLM containers ship qr_sampler but not qr_llm_chat. They
+            # never consume the OWUI image, so returning a placeholder
+            # path here is safe — Modal does not rebuild images at
+            # restore time and ``.add_local_dir(...)`` metadata is not
+            # re-validated. The placeholder is intentionally an obvious
+            # marker so a future regression that DOES try to use the
+            # path produces a greppable error.
+            return Path("/__qr_llm_chat_functions_unavailable_in_container__")
         raise RuntimeError(
             "qr_llm_chat is not importable in the deploy host's Python env. "
             "Run `pip install -e <path/to/qr-llm-chat>` in the venv you use "
@@ -85,6 +113,8 @@ def _qr_llm_chat_functions_dir() -> Path:
         )
     functions_dir = Path(spec.origin).resolve().parent / "functions"
     if not functions_dir.is_dir():
+        if in_modal_container:
+            return Path("/__qr_llm_chat_functions_unavailable_in_container__")
         raise RuntimeError(
             f"Expected `qr_llm_chat/functions/` at {functions_dir}; not found. "
             "If the package layout has changed, update _qr_llm_chat_functions_dir "
@@ -127,13 +157,43 @@ download_image = (
 # declare it. (Modal SDK 1.1.1: this is the documented kwarg name —
 # `python_version` is not accepted on from_dockerfile.)
 #
+# Why the explicit `.pip_install(...)` below: when `add_python="3.12"` is set
+# on `from_dockerfile`, Modal installs Python 3.12 as a parallel interpreter,
+# and `add_local_python_source("qr_sampler", copy=True)` ships qr-sampler's
+# .py files into a path that 3.12 imports from. The Dockerfile's
+# `pip install --no-cache-dir .` only populates the BASE image's Python
+# site-packages, NOT the Modal-added 3.12's site-packages — so importing
+# qr_sampler from /root/qr_sampler fails with
+# ModuleNotFoundError("No module named 'pydantic'") at container restore.
+#
+# Fix: install qr-sampler's runtime dependencies in the Modal Image layer
+# explicitly, so 3.12 has them. We mirror the pinning floors from
+# qr-sampler's pyproject.toml runtime block; the Dockerfile install stays
+# (it covers the cloudflared sidecar's process which uses the base image's
+# Python) but is no longer load-bearing for the snap-frozen module imports.
+#
 # This image is shared by both VllmQrGemma and VllmQrQwen — the per-model
 # split is at the class/container level, not the image level.
-vllm_image = modal.Image.from_dockerfile(
-    str(Path(__file__).parent / "Dockerfile.vllm"),
-    context_dir=str(_REPO_ROOT),
-    add_python="3.12",
-).add_local_python_source("qr_sampler", copy=True)
+vllm_image = (
+    modal.Image.from_dockerfile(
+        str(Path(__file__).parent / "Dockerfile.vllm"),
+        context_dir=str(_REPO_ROOT),
+        add_python="3.12",
+    )
+    .pip_install(
+        # qr_sampler runtime deps — see qr-sampler pyproject.toml [project].dependencies.
+        "numpy>=2.0.0",
+        "pydantic>=2.5.0",
+        "pydantic-settings>=2.5.0",
+        "grpcio>=1.68.0",
+        "protobuf>=5.26.0",
+        "pyyaml>=6.0",
+        # vllm_serve.py runtime deps — FastAPI dispatcher around the engine.
+        "fastapi>=0.110",
+        "httpx>=0.27",
+    )
+    .add_local_python_source("qr_sampler", copy=True)
+)
 
 # --- App -------------------------------------------------------------------
 
@@ -208,11 +268,39 @@ _CLS_KWARGS: dict[str, Any] = {
     "image": vllm_image,
     # H200 (141 GB HBM3e) fits both Gemma 4 31B and Qwen 3.6 27B at
     # native bf16 with max_model_len=65536 + gpu_memory_utilization=0.90,
-    # and has a wider schedulable pool than B200. If queueing persists,
-    # the next knob is to relax `region` below (drop the line or widen to
-    # `["us-east", "us-west", ...]`).
+    # and has a wider schedulable pool than B200.
     "gpu": "H200",
-    "region": "us-east-1",
+    # Region pool: widened from "us-east-1" (single zone) to the
+    # QRNG-adjacent zone group, NOT all of US, after Modal's scheduler
+    # surfaced "Function VllmQrGemma.* is waiting to be scheduled on a
+    # GPU_H200 worker. Relaxing requirements (region=us-east-1 or setting
+    # regions=[us-east]) may lead to faster scheduling." (2026-05-19).
+    # Both Gemma and Qwen were stuck pending for >4 min on first restore
+    # — the curl probes saw the symptom as HTTP 303 +
+    # ``__modal_function_call_id`` + hang.
+    #
+    # WHY not "all of US" (e.g. us-east + us-west)
+    # --------------------------------------------
+    # qr-sampler's ``QuantumGrpcSource`` runs a synchronous GetRandomBytes
+    # gRPC RPC PER TOKEN on the inference hot path — vLLM's
+    # ``LogitsProcessor`` blocks token emission until the QRNG returns.
+    # The Cloudflare-Access front (cloudflared sidecar → CF PoP → CF
+    # backbone → CF PoP → QRNG origin) accelerates only the edge hops,
+    # not the backbone hop between PoPs; that hop is fiber-bound by the
+    # physical distance between the container and the QRNG origin. The
+    # Cipherstone QRNG service is colocated in **central US**. A west-
+    # coast H200 would add ~30–50 ms RTT to every sampled token — at
+    # 50 tok/s that is 1.5–2.5 s of added wall-clock per second of
+    # generated output, plainly visible in OWUI's streaming UI.
+    # So the colocation is a correctness-for-usable-latency constraint,
+    # not just a nice-to-have. We widen the *zone* pool within the
+    # QRNG-adjacent region group instead of widening across the country.
+    #
+    # If "us-central" remains capacity-starved, the next knob is adding
+    # specific east-coast zones (e.g. ["us-east-1", "us-east-2",
+    # "us-central"]) — still short backbone hops to central-US — rather
+    # than reaching for us-west.
+    "region": ["us-central", "us-east"],
     "volumes": {"/root/.cache/huggingface": weights_volume},
     "secrets": [qr_sampler_prod_secret, hf_token_secret],
     "enable_memory_snapshot": True,
