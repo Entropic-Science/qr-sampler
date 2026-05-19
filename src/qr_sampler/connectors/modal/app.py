@@ -150,27 +150,43 @@ download_image = (
 )
 
 # GPU image built from Dockerfile.vllm, including the qr-sampler source.
-# `add_python="3.12"` tells Modal which Python version `add_local_python_source`
-# should target. The vllm/vllm-openai:v0.6.6 base ships Python 3.12 (visible
-# in the build log as /usr/local/lib/python3.12/dist-packages), but Modal's
-# from_dockerfile() introspection can't see that through Docker layers, so we
-# declare it. (Modal SDK 1.1.1: this is the documented kwarg name —
-# `python_version` is not accepted on from_dockerfile.)
 #
-# Why the explicit `.pip_install(...)` below: when `add_python="3.12"` is set
-# on `from_dockerfile`, Modal installs Python 3.12 as a parallel interpreter,
-# and `add_local_python_source("qr_sampler", copy=True)` ships qr-sampler's
-# .py files into a path that 3.12 imports from. The Dockerfile's
-# `pip install --no-cache-dir .` only populates the BASE image's Python
-# site-packages, NOT the Modal-added 3.12's site-packages — so importing
-# qr_sampler from /root/qr_sampler fails with
-# ModuleNotFoundError("No module named 'pydantic'") at container restore.
+# Why NO `add_python` kwarg here (was previously `add_python="3.12"`):
+# `add_python="X"` makes Modal install an ADDITIONAL Python interpreter as a
+# parallel layer, with its own site-packages. The Dockerfile's
+# `pip install --no-cache-dir .` (and the `vllm/vllm-openai:v0.6.6` base's
+# preinstalled vllm + torch + CUDA wheels) live in the BASE image's Python
+# only — invisible to a parallel 3.12. Result with the old setting: container
+# restore crashed with `ModuleNotFoundError: No module named 'vllm'` on
+# `from vllm.engine.arg_utils import AsyncEngineArgs` in
+# `qr_sampler.connectors.modal.vllm_serve`, after Modal's qr_sampler import
+# happened against the empty parallel 3.12.
 #
-# Fix: install qr-sampler's runtime dependencies in the Modal Image layer
-# explicitly, so 3.12 has them. We mirror the pinning floors from
-# qr-sampler's pyproject.toml runtime block; the Dockerfile install stays
-# (it covers the cloudflared sidecar's process which uses the base image's
-# Python) but is no longer load-bearing for the snap-frozen module imports.
+# Dropping `add_python` makes Modal use the base image's Python (verified
+# safe via Modal SDK source: `modal/image.py:1852-1897` — stage-2 setup
+# skips Python install entirely when `add_python=None`). The base ships
+# Python 3.12 at /usr/local/lib/python3.12/dist-packages with vllm + torch
+# + CUDA already installed; that is now also where `add_local_python_source`
+# below ships qr_sampler, where the Dockerfile installed its runtime deps,
+# and where Modal restores from snapshot.
+#
+# No `.pip_install(...)` layer here: the Dockerfile's
+# `pip install --no-cache-dir .` already installs qr-sampler (which pulls
+# numpy / pydantic / pydantic-settings / grpcio / protobuf / pyyaml
+# transitively via pyproject.toml [project].dependencies), and the
+# Dockerfile separately installs `huggingface_hub`, `fastapi`, `httpx`,
+# and `grpcio`. A redundant `.pip_install()` here would actually BREAK
+# the build: Modal's build harness invokes `python -m pip install ...` on
+# this layer, but the vllm/vllm-openai base image ships only
+# `/usr/local/bin/python3.12` (no bare `python` alias) — with `add_python`
+# removed there is no parallel-interpreter `python` either, so the layer
+# fails with `/bin/sh: 1: python: not found`. Keep deps in the Dockerfile.
+#
+# `.add_local_python_source("qr_sampler", copy=True)` is kept because it
+# ships the LOCAL source on every deploy. Without it, only the Dockerfile-
+# baked qr_sampler is reachable, which goes stale between image rebuilds.
+# This step is a file-level copy (it does not invoke Python in the image)
+# so it is unaffected by the `python` alias absence.
 #
 # This image is shared by both VllmQrGemma and VllmQrQwen — the per-model
 # split is at the class/container level, not the image level.
@@ -178,19 +194,6 @@ vllm_image = (
     modal.Image.from_dockerfile(
         str(Path(__file__).parent / "Dockerfile.vllm"),
         context_dir=str(_REPO_ROOT),
-        add_python="3.12",
-    )
-    .pip_install(
-        # qr_sampler runtime deps — see qr-sampler pyproject.toml [project].dependencies.
-        "numpy>=2.0.0",
-        "pydantic>=2.5.0",
-        "pydantic-settings>=2.5.0",
-        "grpcio>=1.68.0",
-        "protobuf>=5.26.0",
-        "pyyaml>=6.0",
-        # vllm_serve.py runtime deps — FastAPI dispatcher around the engine.
-        "fastapi>=0.110",
-        "httpx>=0.27",
     )
     .add_local_python_source("qr_sampler", copy=True)
 )

@@ -23,6 +23,19 @@ FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# The vllm/vllm-openai base ships only `python3.12` + `pip` on PATH (pip's
+# shebang hardcodes /usr/local/bin/python3.12). Modal's image-attach step
+# probes a bare `python` to determine the interpreter version when
+# `add_python` is unset; without this symlink it errors with
+# "We were unable to determine the version of Python installed in the
+# Image". We deliberately do NOT set `add_python` because it would create a
+# parallel interpreter that does not see vllm/torch/CUDA from the base
+# (see src/qr_sampler/connectors/modal/app.py:vllm_image comment block for
+# the full reasoning).
+RUN ln -sf "$(command -v python3.12 || command -v python3 || command -v python)" \
+        /usr/local/bin/python \
+    && python --version
+
 WORKDIR /opt/qr-sampler
 
 # Copy only pyproject.toml first to leverage Docker layer caching.
