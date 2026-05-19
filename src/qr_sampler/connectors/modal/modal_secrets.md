@@ -19,54 +19,90 @@ GPU container (see `app.py`).
 modal secret create qr-sampler-prod \
   QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
   QR_PREINIT_ENTROPY_SOURCES=quantum_grpc,system \
-  QR_FALLBACK_MODE=error \
-  QR_SAMPLE_COUNT=13312 \
-  QR_GRPC_SERVER_ADDRESS=10.0.0.115:50051 \
+  QR_FALLBACK_MODE=system \
+  QR_SAMPLE_COUNT=12800 \
+  QR_GRPC_SERVER_ADDRESS=127.0.0.1:50051 \
   QR_GRPC_MODE=unary \
   QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes \
   QR_GRPC_STREAM_METHOD_PATH= \
-  QR_GRPC_API_KEY=<firefly-1 api key> \
+  QR_GRPC_API_KEY=<QRNG api-key> \
   QR_GRPC_API_KEY_HEADER=api-key \
   QR_GRPC_TIMEOUT_MS=5000 \
+  QRNG_TUNNEL_HOSTNAME=qbert-grpc.cipherstone.co \
+  CF_ACCESS_CLIENT_ID=<Cloudflare Access Service Token client id> \
+  CF_ACCESS_CLIENT_SECRET=<Cloudflare Access Service Token client secret> \
   VLLM_MODELS=gemma-4-31b-reasoning,qwen-3.6-27b-reasoning \
   VLLM_DEFAULT_MODEL=gemma-4-31b-reasoning \
   VLLM_MAX_MODEL_LEN=65536 \
   VLLM_GPU_MEMORY_UTILIZATION_PER_ENGINE=0.45 \
-  ENTROPIC_API_BASE_URL=https://entropic.science/api \
   SERVICE_TOKEN_SECRETS=<random 32-byte base64>
 ```
 
-### v1 (prototyping): system entropy until WARP-in-Modal lands
+### QRNG via Cloudflare Access
 
-firefly-1 at `10.0.0.115:50051` is only reachable via the `cipherstone`
-Cloudflare WARP tunnel. Modal containers can't reach RFC1918 addresses
-without a WARP client *inside* the container — see the future-work block
-in `Dockerfile.vllm`. The initial deploy therefore ships with
-`QR_ENTROPY_SOURCE_TYPE=system` so chat works end-to-end without QRNG.
-firefly-1 creds stay in the Secret (parked) so the future flip is a
-single-line `modal secret update`:
+The QRNG gRPC service (`qbert-grpc.cipherstone.co`) is published behind a
+Cloudflare Zero Trust Access TCP application. Each `VllmQr*` container
+runs a `cloudflared access tcp` sidecar (managed by
+`qr_sampler.connectors.modal.cloudflared_sidecar`) that opens a loopback
+listener at `127.0.0.1:50051` and forwards every byte through Cloudflare's
+edge to the tunnel origin. The qr-sampler `QuantumGrpcSource` dials the
+loopback address — it does not see Cloudflare or the QRNG public hostname
+directly, which keeps auth and transport concerns isolated to the sidecar.
 
-```bash
-# Override on first deploy:
-modal secret update qr-sampler-prod \
-  QR_ENTROPY_SOURCE_TYPE=system \
-  QR_PREINIT_ENTROPY_SOURCES=system,quantum_grpc \
-  QR_FALLBACK_MODE=fallback
+Three env vars drive the sidecar:
 
-# Once WARP-in-Modal is wired up, flip back to:
-modal secret update qr-sampler-prod \
-  QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
-  QR_PREINIT_ENTROPY_SOURCES=quantum_grpc,system \
-  QR_FALLBACK_MODE=error
-```
+| Var | Required | Provisioned by | Notes |
+|---|---|---|---|
+| `QRNG_TUNNEL_HOSTNAME` | yes | QRNG admin | Hostname of the Cloudflare Access TCP app. Default in production is `qbert-grpc.cipherstone.co`. |
+| `CF_ACCESS_CLIENT_ID` | yes | QRNG admin (Cloudflare Zero Trust → Access → Service Auth → Service Tokens) | Service Token client id. Handed over out-of-band. |
+| `CF_ACCESS_CLIENT_SECRET` | yes | QRNG admin (same screen) | Service Token client secret. Handed over out-of-band. |
 
-Note: in v1, the two `--qr-vs-prng` comparison-mode pseudo-models on
-Replit's `MODELS_FILTERED` will fall back to system entropy on the
-"quantum" side (because `QR_FALLBACK_MODE=fallback`), so comparison
-mode is honest-but-uninteresting until firefly-1 is reachable. If you
-want comparison-mode requests to hard-fail instead of silently fall
-back, omit the two pseudo-model entries from Replit's
-`MODELS_FILTERED` for v1.
+Optional tuning:
+
+| Var | Default | When to override |
+|---|---|---|
+| `QRNG_TUNNEL_BIND_HOST` | `127.0.0.1` | Almost never — the gRPC client must use the same value via `QR_GRPC_SERVER_ADDRESS`. |
+| `QRNG_TUNNEL_BIND_PORT` | `50051` | Only if another process in the container already owns 50051. |
+| `QRNG_TUNNEL_STARTUP_TIMEOUT_S` | `15.0` | Raise if cloudflared startup is slow on a degraded edge POP. |
+
+The QRNG service contract (sourced from the operator-supplied
+`artifacts/qrng.proto` / `artifacts/README.md`):
+
+* Wire format: `qrng.proto`, package `qrng`, service `QuantumRNG`, method
+  `GetRandomBytes(RandomRequest) returns (RandomResponse)`. Request encodes
+  `num_bytes` as protobuf field 1 (varint); response returns the random
+  bytes as protobuf field 1 (length-delimited). Compatible with the
+  qr-sampler protocol-agnostic gRPC client without code-generated stubs.
+* Auth: the API key is sent as gRPC metadata under the literal header
+  `api-key` (lowercase). Wire path: `QR_GRPC_API_KEY` env var →
+  `QuantumGrpcSource._metadata` tuple → gRPC `metadata=` kwarg.
+* Streaming: the QRNG proto defines unary only; `QR_GRPC_STREAM_METHOD_PATH`
+  MUST be the empty string so the streaming code paths stay disabled.
+* Rate limits (per the QRNG team's handoff):
+
+  | Limit | Default |
+  |---|---|
+  | Per request | 35,200 bytes |
+  | Per minute  | 500 requests |
+  | Per day     | 500 MB |
+
+  The default `QR_SAMPLE_COUNT=12800` stays comfortably under the 13,000-byte
+  current cap on the production API key. Requests exceeding the limits return
+  gRPC `RESOURCE_EXHAUSTED`; the qr-sampler client surfaces this as
+  `EntropyUnavailableError` and the FallbackEntropySource degrades to
+  `os.urandom` until the next minute / day budget refills.
+
+### Fallback to `os.urandom`
+
+`QR_FALLBACK_MODE=system` wires `QuantumGrpcSource` -> `FallbackEntropySource`
+-> `SystemEntropySource`. On every primary failure (timeout, circuit-breaker
+open, RESOURCE_EXHAUSTED) the wrapper logs a `entropy.degraded` warning with
+the structured fields `event`, `primary`, `fallback`, `error`, and a
+rate-limited `entropy.degraded.alert` once per minute so the degradation is
+loud in `modal app logs` without flooding it on a sustained outage. The
+alternative is `QR_FALLBACK_MODE=error`, which raises `EntropyUnavailableError`
+and surfaces a 503 to the OWUI side; pick that for experiments where
+quantum-vs-classical comparability cannot be silently broken.
 
 Generate random values:
 

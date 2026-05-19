@@ -32,7 +32,7 @@ COPY src/ ./src/
 # Install qr-sampler (with gRPC support) + the runtime libraries the Modal
 # entrypoint needs. huggingface_hub is required for the one-shot weights
 # download. fastapi/httpx/grpcio are runtime deps for the dispatcher and
-# the firefly-1 gRPC client.
+# the QRNG gRPC client.
 RUN pip install --no-cache-dir . \
     && pip install --no-cache-dir \
         "huggingface_hub>=0.24" \
@@ -40,43 +40,53 @@ RUN pip install --no-cache-dir . \
         "httpx>=0.27" \
         "grpcio>=1.62"
 
-# --- Future: Cloudflare WARP for firefly-1 reachability --------------------
+# --- cloudflared sidecar for QRNG reachability -----------------------------
 #
-# Initial Modal deploy ships with QR_ENTROPY_SOURCE_TYPE=system (set in the
-# qr-sampler-prod Secret) because firefly-1 (10.0.0.115:50051) is only
-# reachable via a Cloudflare WARP tunnel (team "cipherstone"), and Modal
-# containers can't reach that RFC1918 address without a WARP client
-# running inside the container.
+# The QRNG gRPC service (qbert-grpc.cipherstone.co) is published behind a
+# Cloudflare Zero Trust Access TCP application. Modal workers reach it via
+# a per-container `cloudflared access tcp` sidecar that opens a loopback
+# listener at 127.0.0.1:50051 and forwards every byte through Cloudflare's
+# edge to the tunnel origin. Auth is a Service Token (CF_ACCESS_CLIENT_ID +
+# CF_ACCESS_CLIENT_SECRET) provisioned in the cipherstone Cloudflare team.
 #
-# To switch to quantum_grpc in production, uncomment the install block
-# below (also requires provisioning a Cloudflare Zero Trust *service
-# token* in the cipherstone team for non-interactive auth — the
-# interactive email/PIN flow won't work in a container):
+# Sidecar lifecycle is owned by `qr_sampler.connectors.modal.cloudflared_sidecar`;
+# it is started in `@modal.enter(snap=False)` (post-restore) so no live socket
+# is captured in the snapshot.
 #
-#   RUN apt-get update && apt-get install -y --no-install-recommends \
-#       curl gnupg2 ca-certificates lsb-release && \
-#       curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && \
-#       echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
-#         | tee /etc/apt/sources.list.d/cloudflare-client.list && \
-#       apt-get update && apt-get install -y cloudflare-warp && \
-#       rm -rf /var/lib/apt/lists/*
-#
-# Then in vllm_serve.py's @modal.enter (or a separate startup hook),
-# before build_engines() runs:
-#   - `warp-cli --accept-tos register` with the service token
-#   - `warp-cli connect`
-#   - Confirm 10.0.0.115:50051 is reachable (e.g., a small TCP probe)
-#
-# Track this as a follow-up alongside flipping the qr-sampler-prod
-# secret's QR_ENTROPY_SOURCE_TYPE from `system` -> `quantum_grpc`.
+# `cloudflared` is a single static binary — no daemon, no kernel modules, no
+# NET_ADMIN capability. Installing from the official .deb (rather than `apt
+# install cloudflared`, which is not in Debian's default repos) keeps us on a
+# pinned-by-URL recent build.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL \
+        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+        -o /tmp/cloudflared.deb \
+    && dpkg -i /tmp/cloudflared.deb \
+    && rm /tmp/cloudflared.deb \
+    && rm -rf /var/lib/apt/lists/*
 
 # Default qr-sampler configuration. Overridden by the Modal Secret at runtime.
-# Note: v1 ships with the Modal Secret setting QR_ENTROPY_SOURCE_TYPE=system,
-# which overrides the quantum_grpc default below at request time.
+# The defaults below match the QRNG service (cf. artifacts/qrng.proto):
+#   - method path: /qrng.QuantumRNG/GetRandomBytes (unary only — qrng.proto
+#     does not define a streaming RPC).
+#   - api-key header: literal "api-key" (lowercase), per the QRNG team's
+#     contract in artifacts/README.md.
+#   - sample count: 12800 = comfortably under the 13000-byte-per-request
+#     limit of the production API key.
+#   - fallback: `system` (os.urandom) so a transient cloudflared outage
+#     degrades to CSPRNG entropy rather than aborting inference. The
+#     FallbackEntropySource layer emits a structured DEGRADED warning on
+#     every fallback so operators see the degradation in `modal app logs`.
 ENV QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
     QR_PREINIT_ENTROPY_SOURCES=quantum_grpc,system \
-    QR_FALLBACK_MODE=error \
-    QR_SAMPLE_COUNT=13312
+    QR_FALLBACK_MODE=system \
+    QR_SAMPLE_COUNT=12800 \
+    QR_GRPC_SERVER_ADDRESS=127.0.0.1:50051 \
+    QR_GRPC_MODE=unary \
+    QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes \
+    QR_GRPC_STREAM_METHOD_PATH= \
+    QR_GRPC_API_KEY_HEADER=api-key
 
 # Reset ENTRYPOINT set by vllm/vllm-openai base image so Modal's @modal.enter
 # method controls process start (not `vllm serve`).

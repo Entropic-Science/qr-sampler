@@ -227,13 +227,25 @@ _CLS_KWARGS: dict[str, Any] = {
 class VllmQrGemma:
     """One ``AsyncLLMEngine`` serving ``google/gemma-4-31B`` at full precision.
 
-    Memory-snapshot phase (``@modal.enter(snap=True)``) builds the engine
-    and pre-initialises both entropy pipelines (per
-    ``QR_PREINIT_ENTROPY_SOURCES``). Modal captures the post-init state;
-    subsequent cold starts restore from the snapshot.
+    Lifecycle:
+
+    * ``@modal.enter(snap=True) load`` — builds the engine and pre-initialises
+      both entropy pipelines (per ``QR_PREINIT_ENTROPY_SOURCES``). Modal
+      captures the post-init state; cold starts restore from the snapshot.
+    * ``@modal.enter(snap=False) start_tunnel`` — spawns the per-container
+      ``cloudflared access tcp`` sidecar that fronts the QRNG gRPC service.
+      Runs in the snap=False phase so no live socket is frozen into the
+      snapshot.
+    * ``@modal.exit() stop_tunnel`` — terminates the sidecar on container
+      shutdown.
     """
 
-    SERVED_MODEL_NAME = "gemma"
+    # Machine-friendly ID echoed by vLLM's /v1/models endpoint and used as
+    # the routing key throughout OWUI + the comparison Pipe. No spaces or
+    # parens here -- the human-readable display label
+    # ("gemma-4-31b (quantum-random)") is set via an OWUI ``model`` table
+    # row override seeded by ``qr_llm_chat.bootstrap_connections``.
+    SERVED_MODEL_NAME = "gemma-4-31b"
     HF_REPO_ID = "google/gemma-4-31B"
 
     @modal.enter(snap=True)
@@ -246,6 +258,14 @@ class VllmQrGemma:
             build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
         )
 
+    @modal.enter(snap=False)
+    def start_tunnel(self) -> None:
+        self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
+
+    @modal.exit()
+    def stop_tunnel(self) -> None:
+        _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
+
     @modal.asgi_app()
     def serve(self) -> Any:
         return self._asgi_app
@@ -256,11 +276,12 @@ class VllmQrGemma:
 class VllmQrQwen:
     """One ``AsyncLLMEngine`` serving ``Qwen/Qwen3.6-27B`` at full precision.
 
-    See ``VllmQrGemma`` for the snapshot/scale-to-zero design — identical
-    here, only the model identity differs.
+    See ``VllmQrGemma`` for the lifecycle design — identical here, only the
+    model identity differs.
     """
 
-    SERVED_MODEL_NAME = "qwen"
+    # See VllmQrGemma.SERVED_MODEL_NAME for the naming contract.
+    SERVED_MODEL_NAME = "qwen-3.6-27b"
     HF_REPO_ID = "Qwen/Qwen3.6-27B"
 
     @modal.enter(snap=True)
@@ -273,9 +294,75 @@ class VllmQrQwen:
             build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
         )
 
+    @modal.enter(snap=False)
+    def start_tunnel(self) -> None:
+        self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
+
+    @modal.exit()
+    def stop_tunnel(self) -> None:
+        _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
+
     @modal.asgi_app()
     def serve(self) -> Any:
         return self._asgi_app
+
+
+# ----- QRNG cloudflared sidecar wiring -------------------------------------
+#
+# Both per-model classes share the same sidecar bootstrap. We import the
+# sidecar module lazily inside the helpers so this file stays importable
+# at deploy-host introspection time (where qr_sampler is on the path but
+# the cloudflared binary is not).
+
+
+def _start_qrng_tunnel(served_model_name: str) -> Any:
+    """Spawn the cloudflared sidecar for one VllmQr* container.
+
+    The sidecar listens on 127.0.0.1:50051 and forwards through Cloudflare
+    Access to ``QRNG_TUNNEL_HOSTNAME``. The qr-sampler ``QuantumGrpcSource``
+    dials the loopback address (set via ``QR_GRPC_SERVER_ADDRESS`` in the
+    Dockerfile, overridable via the qr-sampler-prod Modal Secret).
+
+    Failure is hard: if the Cloudflare Access service token is missing,
+    revoked, or the tunnel hostname is wrong, the container fails to enter
+    with a structured error rather than silently degrading to urandom.
+    Operators see the cloudflared stderr tail in ``modal app logs``.
+    """
+    import logging
+
+    from qr_sampler.connectors.modal.cloudflared_sidecar import (
+        CloudflaredConfig,
+        CloudflaredSidecar,
+    )
+
+    log = logging.getLogger("qr_sampler.cloudflared")
+    log.info(
+        "Starting QRNG cloudflared sidecar for %s container",
+        served_model_name,
+        extra={"event": "cloudflared.container_start", "model": served_model_name},
+    )
+    sidecar = CloudflaredSidecar(CloudflaredConfig.from_env())
+    sidecar.start()
+    return sidecar
+
+
+def _stop_qrng_tunnel(sidecar: Any) -> None:
+    """Tear down the cloudflared sidecar, tolerating an unset attribute.
+
+    The attribute is ``None`` when ``start_tunnel`` raised before assigning —
+    in that case there is nothing to stop. We log either branch so an
+    operator reading ``modal app logs`` sees the container shutdown sequence.
+    """
+    import logging
+
+    log = logging.getLogger("qr_sampler.cloudflared")
+    if sidecar is None:
+        log.info(
+            "QRNG cloudflared sidecar was not running; nothing to stop",
+            extra={"event": "cloudflared.stop_skipped"},
+        )
+        return
+    sidecar.stop()
 
 
 # ----- Open WebUI container ------------------------------------------------
@@ -335,6 +422,14 @@ _OWUI_IMAGE = (
             "OLLAMA_BASE_URLS": "",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            # Disable OWUI's RAG embedding model loader. OWUI 0.9.5 defaults
+            # to ``sentence-transformers/all-MiniLM-L6-v2`` and tries to
+            # snapshot_download() it at startup -- which fails noisily under
+            # ``HF_HUB_OFFLINE=1`` with a multi-page traceback. We do not
+            # use RAG/document retrieval in this deploy, so an empty model
+            # name takes the falsy short-circuit in
+            # ``open_webui.routers.retrieval.get_ef`` and skips the loader.
+            "RAG_EMBEDDING_MODEL": "",
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -396,8 +491,20 @@ owui_data_volume = modal.Volume.from_name(
     scaledown_window=1800,  # 30 min idle — see qr-llm-chat spec §3.5 cost note.
     timeout=60 * 60,
     min_containers=0,  # NEVER set ≥1 — keep-warm cost is unacceptable (Q10).
+    # Hard cap at 1 replica. OWUI keeps in-memory state (PersistentConfig
+    # cache, session cookies, lazy admin-user check) that must be
+    # authoritative; fan-out would create N caches racing against each
+    # other and waste snapshot-restore cycles on every replica. The SPA
+    # cold-load burst (~15-25 parallel requests) is absorbed by raising
+    # ``max_inputs`` below, not by horizontal scaling.
+    max_containers=1,
 )
-@modal.concurrent(max_inputs=10)
+# ``max_inputs`` is the per-container in-flight request budget. Set high
+# enough that a SvelteKit SPA cold-load (manifest + OAuth probes + model
+# list + config + prompts + knowledge + tools, fired in parallel) fits
+# inside one container's queue. Anything below ~32 will trigger
+# autoscaling pressure even though we cap at one replica.
+@modal.concurrent(max_inputs=64)
 class OWUIService:
     """Open WebUI ASGI surface for the qr-llm-chat split.
 
