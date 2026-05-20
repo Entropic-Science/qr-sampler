@@ -273,14 +273,14 @@ _CLS_KWARGS: dict[str, Any] = {
     # native bf16 with max_model_len=65536 + gpu_memory_utilization=0.90,
     # and has a wider schedulable pool than B200.
     "gpu": "H200",
-    # Region pool: widened to the full US triple after the QRNG-adjacent
-    # pair ("us-central", "us-east") still produced capacity-pending
-    # warnings on H200 (2026-05-19). Operational priority is scheduling
-    # success first — Modal's H200 supply across a single region group
-    # is bursty enough that even us-central + us-east left both Gemma
-    # and Qwen queued, surfacing as HTTP 303 + ``__modal_function_call_id``
-    # + hang on the curl-side probe. Modal does NOT accept a wildcard
-    # "us" string; only the explicit region-cluster list is valid.
+    # Region pool: ``"us"`` (the broad-region option per Modal's docs at
+    # docs/guide/region-selection). Broad regions widen the schedulable
+    # pool to ALL US-resident clusters (us-east + us-central + us-south +
+    # us-west) which is what we need to survive the bursty H200 supply
+    # that left earlier narrow combinations capacity-queued (2026-05-19),
+    # AND the broad multiplier is the cheaper of the two tiers (1.5x
+    # vs 1.75x narrow). Cheaper + wider pool + simpler config — no
+    # downside vs the explicit triple it replaces.
     #
     # QRNG-LATENCY CAVEAT (documented honestly so the next operator
     # decides knowingly)
@@ -297,13 +297,14 @@ _CLS_KWARGS: dict[str, Any] = {
     # 50 tok/s that is 1.5–2.5 s of added wall-clock per second of
     # generated output, plainly visible in OWUI's streaming UI.
     #
-    # We accept that penalty for the workloads that land on us-west
-    # because the alternative is workloads that do not land at all.
-    # If steady-state QRNG latency becomes the dominant pain point and
-    # H200 capacity in us-central + us-east stabilises, narrow this
-    # back to ``["us-central", "us-east"]`` — the prior comment block
-    # in git history explains the latency math in detail.
-    "region": ["us-east", "us-central", "us-west"],
+    # We accept that penalty for the workloads that land on us-west / us-
+    # south under ``"us"`` because the alternative is workloads that do
+    # not land at all. If steady-state QRNG latency becomes the dominant
+    # pain point and H200 capacity in us-central + us-east stabilises,
+    # narrow this back to ``["us-central", "us-east"]`` (paying the 1.75x
+    # narrow multiplier) — the prior comment block in git history
+    # explains the latency math in detail.
+    "region": "us",
     "volumes": {"/root/.cache/huggingface": weights_volume},
     "secrets": [qr_sampler_prod_secret, hf_token_secret],
     "enable_memory_snapshot": True,
