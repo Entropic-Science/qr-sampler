@@ -94,6 +94,9 @@ fallback_version = "0.1.0.dev0"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "modal: tests that require a real Modal deploy + GPU container — skipped unless --run-modal is passed (Phase 2 R15(b))",
+]
 
 [tool.ruff]
 target-version = "py310"

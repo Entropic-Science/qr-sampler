@@ -8,6 +8,32 @@ import pytest
 from qr_sampler.config import QRSamplerConfig
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register ``--run-modal`` for Phase 2 R15(b) marked tests.
+
+    Default behaviour: tests marked ``@pytest.mark.modal`` are skipped.
+    The skip is honoured by ``pytest_collection_modifyitems`` below.
+    Pass ``--run-modal`` to opt in (requires a real Modal deploy +
+    qr-sampler-prod secret).
+    """
+    parser.addoption(
+        "--run-modal",
+        action="store_true",
+        default=False,
+        help="Run @pytest.mark.modal tests against a real Modal deploy.",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip ``@pytest.mark.modal`` tests unless ``--run-modal`` is passed."""
+    if config.getoption("--run-modal"):
+        return
+    skip_marker = pytest.mark.skip(reason="@pytest.mark.modal — needs --run-modal")
+    for item in items:
+        if "modal" in item.keywords:
+            item.add_marker(skip_marker)
+
+
 @pytest.fixture()
 def default_config() -> QRSamplerConfig:
     """Return a QRSamplerConfig with all default values.
