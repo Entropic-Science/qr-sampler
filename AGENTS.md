@@ -33,7 +33,8 @@ The primary use case is consciousness-research: studying whether conscious inten
 | Codebase structure, invariants, conventions, how to add new components | This file (sections below) |
 | Non-obvious lessons / gotchas / failure signatures (snapshot, layering, model-arch, deploy) | `LEARNINGS.md` |
 | End-user documentation, quickstart, CLI reference, configuration reference | `README.md` |
-| Combined cleanup record (both repos) + active bug snapshot + Phase 2/3 follow-ups | `../Entropic-Science/qr-llm-chat/CLEANUP_REPORT.md` |
+| Combined cleanup record (both repos) + Phase 3 iteration record (closed) | `../Entropic-Science/qr-llm-chat/CLEANUP_REPORT.md` |
+| The `modal deploy` debug-loop protocol (dormant; use when a deploy regresses) | `../Entropic-Science/qr-llm-chat/DEPLOY_ITERATE_LOOP.md` |
 | Sibling-repo specifics (deploy/rotate/upgrade runbook, OWUI bootstrap) | `../Entropic-Science/qr-llm-chat/AGENTS.md` + `LEARNINGS.md` there |
 | Modal Secret catalogue + env-var reference for the production deploy | `../Entropic-Science/qr-llm-chat/infra/modal_secrets.md` |
 
