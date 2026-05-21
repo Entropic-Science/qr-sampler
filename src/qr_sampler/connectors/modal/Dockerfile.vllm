@@ -48,12 +48,14 @@
 ARG VLLM_BASE_TAG=v0.17.0
 FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 
-# Phase 2 R12: VLLM_LOGGING_LEVEL=DEBUG is a *Phase 3 diagnostic* setting,
-# not a steady-state one. DEBUG emits per-token internal logs; at ~50 tok/s
-# x 64 max_inputs that's a 10-100x log-volume blow-up over INFO. Revert to
-# INFO once the EngineCore 500 cascade is closed and Phase 2 §15.1-15.5
-# success criteria are green. Tracked in
-# qr-llm-chat/CLEANUP_REPORT.md "Phase 2 follow-up reservations".
+# iter-09 (2026-05-21): VLLM_LOGGING_LEVEL reverted from DEBUG to INFO
+# now that iter-08 closed the EngineCore 500 cascade by fixing
+# --host 0.0.0.0 (see qr-llm-chat/LEARNINGS.md iter-08). DEBUG was a
+# Phase 3 diagnostic — emits per-token internal logs at ~50 tok/s x
+# 64 max_inputs, a 10-100x log-volume blow-up over INFO. With the
+# chat path green, the diagnostic budget is no longer worth the
+# storage + grep cost. Flip back to DEBUG for one cold-start whenever
+# investigating a future engine-internal issue.
 #
 # Phase 3 iter-05 (2026-05-21): TORCH_NCCL_ENABLE_MONITORING=0 silences
 # the NCCL HeartbeatMonitor::runLoop thread that flooded iter-04 logs
@@ -64,9 +66,12 @@ FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 # tensor_parallel=1 it has no collectives to watch anyway. Set via image
 # env so it takes effect BEFORE libtorch_cuda.so reads the env at NCCL
 # init time (subprocess env would be too late for the static init).
+# Note (iter-08): this env var silences the dump-on-timeout path but
+# NOT all HeartbeatMonitor retries — residual TCPStore broken-pipe
+# spam survives post-snapshot. Cosmetic; engine keeps serving.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    VLLM_LOGGING_LEVEL=DEBUG \
+    VLLM_LOGGING_LEVEL=INFO \
     VLLM_SERVER_DEV_MODE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TORCH_NCCL_ENABLE_MONITORING=0

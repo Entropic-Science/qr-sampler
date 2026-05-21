@@ -549,16 +549,20 @@ class VllmQrQwen:
         # forgot the env var.
         env.setdefault("PYTHONUNBUFFERED", "1")
 
-        # Phase 3 iter-02 (2026-05-21): isolate the snapshot wake_up 500
-        # failure by removing the QRNG/cloudflared variable. Iter-01 saw
-        # /wake_up 500 after Modal GPU snapshot restore; we don't yet
-        # know whether the cloudflared sidecar's open socket or the
-        # qr_sampler gRPC client's loopback dial interferes with the
-        # snapshot lifecycle. Force system entropy here so the
-        # subprocess does not try to reach the QRNG endpoint at all.
-        # Restore once snapshot wake is green.
-        env["QR_ENTROPY_SOURCE_TYPE"] = "system"
-        env["QR_PREINIT_ENTROPY_SOURCES"] = "system"
+        # iter-09 (2026-05-21): iter-02's QR_ENTROPY_SOURCE_TYPE=system /
+        # QR_PREINIT_ENTROPY_SOURCES=system overrides REMOVED. They were an
+        # isolation workaround for the snapshot /wake_up 500, which iter-08
+        # candidate E proved was actually Modal's edge proxy hanging on
+        # vllm serve's --host 127.0.0.1 binding (see LEARNINGS.md iter-08).
+        # With the binding fixed, the snapshot wake is reliable, so the
+        # subprocess now inherits QR_* defaults from Dockerfile.vllm
+        # (QR_ENTROPY_SOURCE_TYPE=quantum_grpc, QR_FALLBACK_MODE=system) and
+        # the request path consults the QRNG via the cloudflared sidecar
+        # started in _wake. The qr_sampler client's QuantumGrpcSource opens
+        # the loopback gRPC channel lazily on first get_random_bytes() call
+        # (see auto-memory qrng_tcp_preprobe), so there is no live socket
+        # for the snapshot to capture — the lazy-init is the load-bearing
+        # protection against a snapshot-captured-dead-channel.
 
         cmd = [
             "vllm",
@@ -944,14 +948,20 @@ class VllmQrQwen:
 
         log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
 
-        # Phase 3 iter-02 (2026-05-21): cloudflared sidecar is suppressed
-        # to isolate the snapshot /wake_up 500 from the QRNG variable.
-        # The vllm serve subprocess is running with QR_ENTROPY_SOURCE_TYPE=
-        # system (set in _start_and_sleep), so the qr_sampler logits
-        # processor will source entropy from os.urandom instead of dialing
-        # the loopback gRPC channel. Restore the tunnel call once snapshot
-        # wake is reliable.
-        self._cloudflared = None
+        # iter-09 (2026-05-21): cloudflared sidecar RESTORED. iter-02
+        # suppressed it to isolate the snapshot /wake_up 500, which
+        # iter-08 candidate E proved was actually a --host 127.0.0.1
+        # binding issue (see LEARNINGS.md iter-08). The sidecar starts
+        # here in @modal.enter(snap=False) — POST-snapshot — so no live
+        # cloudflared socket is captured into the snapshot (auto-memory
+        # modal_vllm_303_hang). _start_qrng_tunnel is soft-fail: on any
+        # failure (missing CF Access service token, binary unavailable,
+        # tunnel unreachable) it logs a structured event and returns
+        # None, and the request path falls back to system entropy via
+        # FallbackEntropySource. The per-request entropy.degraded events
+        # surface a QRNG outage to operators without taking the engine
+        # down. See _start_qrng_tunnel docstring for the full design.
+        self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
 
         # Phase 3 iter-06 (2026-05-21): POST /wake_up RESTORED, paired
         # with sleep mode restore in _start_and_sleep (see iter-05
