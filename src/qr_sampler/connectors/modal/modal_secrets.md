@@ -31,10 +31,6 @@ modal secret create qr-sampler-prod \
   QRNG_TUNNEL_HOSTNAME=qbert-grpc.cipherstone.co \
   CF_ACCESS_CLIENT_ID=<Cloudflare Access Service Token client id> \
   CF_ACCESS_CLIENT_SECRET=<Cloudflare Access Service Token client secret> \
-  VLLM_MODELS=gemma-4-31b-reasoning,qwen3.5-9b-reasoning \
-  VLLM_DEFAULT_MODEL=gemma-4-31b-reasoning \
-  VLLM_MAX_MODEL_LEN=65536 \
-  VLLM_GPU_MEMORY_UTILIZATION_PER_ENGINE=0.45 \
   SERVICE_TOKEN_SECRETS=<random 32-byte base64>
 ```
 
@@ -197,25 +193,20 @@ modal secret create qr-sampler-prod --force \
   QR_GRPC_API_KEY=<QRNG api-key> \
   QR_GRPC_API_KEY_HEADER=api-key \
   QR_GRPC_TIMEOUT_MS=5000 \
-  QR_MAX_MODEL_LEN=65536 \
-  QR_GPU_MEMORY_UTILIZATION=0.90 \
   QRNG_TUNNEL_HOSTNAME=qbert-grpc.cipherstone.co \
   QRNG_API_KEY=<QRNG api-key, same as QR_GRPC_API_KEY> \
   CF_ACCESS_CLIENT_ID=<Cloudflare Access Service Token client id> \
   CF_ACCESS_CLIENT_SECRET=<Cloudflare Access Service Token client secret>
 ```
 
-Two-name window: `QR_MAX_MODEL_LEN` / `QR_GPU_MEMORY_UTILIZATION` are the
-canonical names. The legacy `VLLM_*` spellings are still read defensively
-by `build_dispatcher_for`, but they trigger an `Unknown vLLM environment
-variable` warning from vLLM's own envs.py scan, so the `vllm_serve.py`
-loader pops them from `os.environ` before any vLLM import. Use the
-`QR_*` names in new deployments.
-
-Verification on the next cold-start: grep `modal app logs` for
-`modal.secret_diag.summary` — the JSON line shows the resolved value of
-every non-secret env var (e.g. `"QR_ENTROPY_SOURCE_TYPE": "set: quantum_grpc"`),
-so the K-2 / K-3 misconfigurations no longer hide behind `set (N chars)`.
+The vLLM tunables (`--max-model-len`, `--max-num-seqs`, `--gpu-memory-utilization`,
+…) are NOT in the Secret. They are passed as `vllm serve` cmd args in
+`qr_sampler.connectors.modal.app.VllmQrQwen._start_and_sleep`. Edit
+`app.py` to change them; redeploy to pick up. Previous incarnations of
+this doc described a `VLLM_MAX_MODEL_LEN` / `QR_MAX_MODEL_LEN`
+two-name secret window that was read by `build_dispatcher_for`; that
+function was removed in iter-10 along with its env-promotion + secret-
+diag sidecars, so those env vars are no longer load-bearing.
 
 ### Operator diagnostic events worth grepping
 
@@ -223,19 +214,12 @@ After a deploy, grep `modal app logs` for:
 
 | Event | What it tells you |
 |---|---|
-| `modal.secret_diag.summary` | Every group's missing keys + (for allow-listed names) the resolved value |
-| `modal.env.promoted` | One emit per legacy `VLLM_*` → `QR_*` rename; verifies the sweep ran |
-| `modal.vllm.tunables_resolved` | Which env spelling supplied `max_model_len` / `gpu_memory_utilization` |
-| `modal.grpc_address.non_loopback` | WARNING — `QR_GRPC_SERVER_ADDRESS` is not loopback; the cloudflared sidecar binds to 127.0.0.1 only so gRPC fetches will silently fall back to system entropy |
-| `qrng.tcp_preprobe.failed` | The 500 ms TCP pre-probe rejected — sidecar is not listening at `127.0.0.1:50051` |
-| `entropy.request.routed` | Per-request: what the client asked for vs the pipeline that actually answered |
-| `entropy.request.completed` | Per-request boundary with token count + dominant entropy source |
-
-The last two land the K-5 investigation: if `entropy.request.completed`
-shows `tokens_generated=0` with `dominant_source=quantum_grpc`, the
-gRPC backend dropped every fetch; if `dominant_source=system` for a
-request that asked for `quantum_grpc`, the fallback wrapper engaged
-(check `entropy.degraded` for the per-fallback record).
+| `vllm.argv.validated` | Phase 3 (iter-08+) argv-help-probe asserted every `--xxx` in the spawn argv is in vLLM's argparse action list. Exactly one per cold-start; absence means the helper hit `vllm.argv.help_probe_failed` (probe import broken) or `vllm.argv.unrecognized` (real flag rename — fix `app.py` and redeploy). |
+| `vllm.coldstart.complete` | Container is ready to serve; `total_elapsed_ms` is end-to-end from container start through `/wake_up`. |
+| `cloudflared.ready` | QRNG sidecar listener up at `127.0.0.1:50051`; gRPC fetches will reach Cipherstone via Cloudflare Access. Absence → look for `cloudflared.config.missing` / `cloudflared.sidecar.failed` / `cloudflared.sidecar.skipped` and the request path will fall back to system entropy. |
+| `qrng.tcp_preprobe.failed` | The 500 ms TCP pre-probe rejected — sidecar is not listening at `127.0.0.1:50051`. |
+| `entropy.request.routed` | Per-request: what the client asked for vs the pipeline that actually answered. |
+| `entropy.request.completed` | Per-request boundary with token count + dominant entropy source. If `dominant_source=system` for a request that asked for `quantum_grpc`, the fallback wrapper engaged (check `entropy.degraded` for the per-fallback record). |
 
 ## Unauthenticated-inference opt-in (`ALLOW_UNAUTHENTICATED_INFERENCE`)
 

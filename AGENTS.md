@@ -17,7 +17,7 @@ The primary use case is consciousness-research: studying whether conscious inten
 | Owned by `qr-sampler` (this repo) | Owned by `qr-llm-chat` |
 |---|---|
 | The Modal App object (`qr_sampler.connectors.modal.app:App`) and all `@app.cls` definitions (`OWUIService`, `VllmQrGemma`, `VllmQrQwen`). | OWUI bootstrap (`admin_bootstrap.py`, `bootstrap_connections.py`, `bootstrap_static_assets.py`). |
-| vLLM image (`connectors/modal/Dockerfile.vllm`), vLLM serve entry-point + cloudflared sidecar (`connectors/modal/vllm_serve.py`). | Lifecycle hooks (`lifespan_hooks.py`: `pre_snapshot` / `post_restore`). |
+| vLLM image (`connectors/modal/Dockerfile.vllm`), vLLM lifecycle (`connectors/modal/app.py:VllmQrQwen._start_and_sleep` / `_wake` — spawns the `vllm serve` subprocess + cloudflared sidecar). MM-probe monkey-patch + bearer-auth helpers in `connectors/modal/vllm_serve.py`. | Lifecycle hooks (`lifespan_hooks.py`: `pre_snapshot` / `post_restore`). |
 | The qr_sampler V1 logits-processor entry-point (`vllm.logits_processors` -> `qr_sampler.engines.vllm:VLLMAdapter`, re-exported as `QRSamplerLogitsProcessor` from `qr_sampler.processor` for backward-compat). | Setup orchestrator (`setup_orchestrator.py`) + the deploy-guard chat probe. |
 | Cipherstone gRPC client + entropy fallback wrapper + `cloudflared access tcp` sidecar. | OWUI Function envelopes (`functions/qr_comparison_pipe.py`, `functions/qr_sampler_filter.py`). |
 | `qr-sampler-prod` Modal Secret (QRNG / Cipherstone vars). | `qr-llm-chat-prod` Modal Secret (OWUI / OAuth / VllmQr* dispatch). |

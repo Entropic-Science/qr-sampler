@@ -48,33 +48,36 @@
 ARG VLLM_BASE_TAG=v0.17.0
 FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 
-# iter-09 (2026-05-21): VLLM_LOGGING_LEVEL reverted from DEBUG to INFO
-# now that iter-08 closed the EngineCore 500 cascade by fixing
-# --host 0.0.0.0 (see qr-llm-chat/LEARNINGS.md iter-08). DEBUG was a
-# Phase 3 diagnostic — emits per-token internal logs at ~50 tok/s x
-# 64 max_inputs, a 10-100x log-volume blow-up over INFO. With the
-# chat path green, the diagnostic budget is no longer worth the
-# storage + grep cost. Flip back to DEBUG for one cold-start whenever
-# investigating a future engine-internal issue.
+# iter-09 (2026-05-21): VLLM_LOGGING_LEVEL = INFO now that iter-08 closed
+# the EngineCore 500 cascade by fixing --host 0.0.0.0 (see
+# qr-llm-chat/LEARNINGS.md iter-08). Flip to DEBUG for one cold-start
+# whenever investigating a future engine-internal issue; DEBUG is a
+# 10-100x log-volume blow-up over INFO at production traffic.
 #
-# Phase 3 iter-05 (2026-05-21): TORCH_NCCL_ENABLE_MONITORING=0 silences
-# the NCCL HeartbeatMonitor::runLoop thread that flooded iter-04 logs
-# with "Broken pipe" stack traces from TCPStore::check after Modal's
-# GPU-snapshot restore (the watchdog probes a socket that snapshot
-# captured pre-restore, so the FD doesn't survive). The monitor is a
-# debugging aid for multi-GPU collectives; on single-GPU H100 vLLM with
-# tensor_parallel=1 it has no collectives to watch anyway. Set via image
-# env so it takes effect BEFORE libtorch_cuda.so reads the env at NCCL
-# init time (subprocess env would be too late for the static init).
-# Note (iter-08): this env var silences the dump-on-timeout path but
-# NOT all HeartbeatMonitor retries — residual TCPStore broken-pipe
-# spam survives post-snapshot. Cosmetic; engine keeps serving.
+# Phase 3 iter-05 / iter-10: TORCH_NCCL_ENABLE_MONITORING=0 stops the
+# NCCL HeartbeatMonitor from emitting dump-on-timeout payloads after a
+# Modal GPU snapshot/restore (the watchdog probes a TCPStore socket
+# whose FD didn't survive the snapshot). iter-10 adds two further
+# silencers to suppress the residual broken-pipe warnings the env var
+# alone could not stop:
+#   * TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=86400 — pushes the heartbeat
+#     check interval out to 24h so the runLoop effectively never fires
+#     in a container's lifetime; combined with the monitoring flag
+#     above this neutralises the broken-pipe spam at its source.
+#   * TORCH_CPP_LOG_LEVEL=ERROR — the broken-pipe messages we still
+#     saw on iter-09 (``[W521 ProcessGroupNCCL.cpp:1802] ... Broken
+#     pipe``) are PyTorch C++ WARNINGs. Bumping the C++ log level to
+#     ERROR suppresses them without affecting Python-level vLLM logs.
+# Single-GPU tensor_parallel=1 means NCCL has no collectives to watch
+# anyway, so the monitor + heartbeat were pure noise post-snapshot.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     VLLM_LOGGING_LEVEL=INFO \
     VLLM_SERVER_DEV_MODE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
-    TORCH_NCCL_ENABLE_MONITORING=0
+    TORCH_NCCL_ENABLE_MONITORING=0 \
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=86400 \
+    TORCH_CPP_LOG_LEVEL=ERROR
 
 # The vllm/vllm-openai base ships only `python3.12` + `pip` on PATH (pip's
 # shebang hardcodes /usr/local/bin/python3.12). Modal's image-attach step

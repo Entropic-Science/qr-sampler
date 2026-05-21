@@ -57,26 +57,20 @@ modal run deployments/modal/app.py::download_weights
 
 Takes 10–20 min on a fast HF mirror. Re-run only on model-version bump.
 
-#### At-deploy-time model fallbacks
+#### Model-substitution procedure
 
-If either FP8 weight set is unavailable at deploy time, fall back to the
-next-newest FP8 reasoning model in the same family and document the
-substitution. Edit `_HF_REPO_FOR_MODEL` in `vllm_serve.py` and the matching
-constants in `app.py`:
+To change the served model, edit `VllmQrQwen.HF_REPO_ID` +
+`VllmQrQwen.SERVED_MODEL_NAME` in `app.py`. The downloader (`download_weights`)
+reads `HF_REPO_ID` directly; vLLM serve consumes it as the positional
+`model_tag` argument. Older revisions of this README documented a
+multi-model `_HF_REPO_FOR_MODEL` table that lived in `vllm_serve.py`
+alongside `build_engine`; the per-model `@app.cls` rewrite + iter-10
+cleanup removed both. Gemma is paused (see `app.py` module docstring)
+until vLLM ships a release with both Gemma4 GDN support AND a workable
+text-only MM-probe knob; restoring it is a code-only change.
 
-| Default | Fallback |
-|---|---|
-| `google/gemma-4-31b-reasoning` | `google/gemma-3-27b-reasoning-fp8` (or community FP8 conversion) |
-| `Qwen/Qwen-3.6-27B-Reasoning` | `Qwen/Qwen-3-27B-Reasoning-FP8` |
-
-`VLLM_BASE_TAG` is pinned to `v0.17.0` (V1 engine release with
-`AdapterLogitsProcessor`). The Dockerfile layers
-`transformers @ git+...@main` and bumps `huggingface_hub>=0.30.0` on
-top because v0.17.0 ships `transformers<5`, but the `google/gemma-4-31B`
-(gemma-4 GDN) and `Qwen/Qwen3.5-9B` (qwen3_5 GDN) model architectures
-only land in transformers `main` (v5.x). The recipe mirrors
-`createmp-evalsuite/modal_app.py` lines 46-67, which has empirically
-loaded both model families on Modal A100 GPUs.
+`VLLM_BASE_TAG` is pinned to `v0.17.0` (V1 engine release with the
+LP ABI the qr-sampler `VLLMAdapter` is built against).
 
 If you need to roll the pin forward, prefer pinning to a vLLM tag whose
 bundled transformers already knows the model architectures (which removes
