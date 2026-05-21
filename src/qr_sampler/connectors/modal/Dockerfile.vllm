@@ -219,7 +219,7 @@ ENV QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
     QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes \
     QR_GRPC_STREAM_METHOD_PATH= \
     QR_GRPC_API_KEY_HEADER=api-key \
-    QR_SAMPLER_BYPASS=0
+    QR_PRESET=creative_sampling
 
 # 2026-05-21: VLLM_ENABLE_V1_MULTIPROCESSING=0 was previously set here to
 # avoid signal-propagation issues with EngineCore subprocess during

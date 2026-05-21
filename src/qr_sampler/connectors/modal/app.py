@@ -670,6 +670,20 @@ class VllmQrQwen:
             # regardless of plugin discovery state.
             "--logits-processors",
             "qr_sampler.engines.vllm:VLLMAdapter",
+            # iter-11 (2026-05-21): emit Qwen3-family ``<think>...</think>``
+            # blocks as a separate ``reasoning_content`` field in the
+            # OpenAI-compatible response. vLLM 0.17+ ships the ``qwen3``
+            # reasoning parser that extracts the block into the dedicated
+            # field; Open WebUI 0.9.5 then renders it as a collapsible
+            # "Thought for N seconds" panel above the assistant text.
+            # Without this flag, the model still emits the tags but they
+            # land inline in ``content`` and OWUI shows them as raw
+            # markdown. The qr-sampler comparison Pipe mirrors the same
+            # surface (see qr_comparison_pipe.py _extract_delta_text).
+            # Sources: https://docs.vllm.ai/en/latest/features/reasoning_outputs/
+            # + https://docs.openwebui.com/features/chat-conversations/chat-features/reasoning-models/
+            "--reasoning-parser",
+            "qwen3",
         ]
 
         # Iter-08 / iter-10: vLLM's CLI churns between minor releases
