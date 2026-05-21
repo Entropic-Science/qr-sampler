@@ -624,3 +624,114 @@ class TestReadComparisonFlag:
 
     def test_default_false(self) -> None:
         assert filter_mod._read_comparison_flag({}) is False
+
+
+# ---------------------------------------------------------------------------
+# UserValves (per-user preset dropdown) -- restored after the dc00f95 ->
+# 52d66e7 revert chain dropped it. The preset default is now
+# `creative_sampling` (the V6_HVD_R01_01 winner from createmp-evalsuite).
+# ---------------------------------------------------------------------------
+
+
+class TestUserValves:
+    def test_default_is_creative_sampling(self) -> None:
+        uv = Filter.UserValves()
+        assert uv.preset == "creative_sampling"
+
+    def test_rejects_unknown_preset(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            Filter.UserValves(preset="banana")  # type: ignore[arg-type]
+
+
+class TestInletPresetInjection:
+    """The per-user preset selection must land on body['qr_preset'] AND
+    suppress the admin _QR_FIELDS injection so qr-sampler's resolve_preset()
+    expansion stays coherent (caller's qr_* keys win over preset overrides,
+    per qr_sampler.presets FR-10).
+    """
+
+    def _ok_preflight_handler(self) -> _RecordingHandler:
+        return _RecordingHandler(
+            {
+                "/api/allowance/preflight": [
+                    (
+                        200,
+                        {
+                            "ok": True,
+                            "balance": 100_000,
+                            "nextRefillAt": "2026-05-17T00:00:00Z",
+                        },
+                    )
+                ]
+            }
+        )
+
+    def test_preset_normal_t1_injected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+
+        flt = _patched_filter(monkeypatch, self._ok_preflight_handler())
+        uv = Filter.UserValves(preset="normal_t1")
+
+        result = asyncio.run(
+            flt.inlet(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                __user__={"email": "u@example.com", "valves": uv},
+            )
+        )
+
+        assert result["qr_preset"] == "normal_t1"
+
+    def test_preset_selection_skips_qr_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        flt = _patched_filter(monkeypatch, self._ok_preflight_handler())
+        uv = Filter.UserValves(preset="creative_sampling")
+
+        result = asyncio.run(
+            flt.inlet(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                __user__={"email": "u@example.com", "valves": uv},
+            )
+        )
+
+        assert result["qr_preset"] == "creative_sampling"
+        for key in ("qr_temperature_strategy", "qr_fixed_temperature", "qr_top_k"):
+            assert key not in result, f"{key} leaked through preset path"
+
+    def test_dict_shaped_user_valves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OWUI sometimes passes a JSON-decoded dict instead of a pydantic model."""
+        import asyncio
+
+        flt = _patched_filter(monkeypatch, self._ok_preflight_handler())
+
+        result = asyncio.run(
+            flt.inlet(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                __user__={"email": "u@example.com", "valves": {"preset": "normal_t1"}},
+            )
+        )
+
+        assert result["qr_preset"] == "normal_t1"
+
+    def test_no_user_valves_uses_admin_qr_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Legacy admin-driven path: no preset selected -> admin Valves project to qr_*."""
+        import asyncio
+
+        flt = _patched_filter(monkeypatch, self._ok_preflight_handler())
+
+        result = asyncio.run(
+            flt.inlet(
+                {"messages": [{"role": "user", "content": "hi"}]},
+                __user__={"email": "u@example.com"},
+            )
+        )
+
+        assert "qr_preset" not in result
+        assert result["qr_temperature_strategy"] == flt.valves.temperature_strategy
+        assert result["qr_fixed_temperature"] == flt.valves.fixed_temperature

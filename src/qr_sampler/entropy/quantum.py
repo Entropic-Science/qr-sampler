@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 import threading
 import time
 from collections import deque
@@ -38,6 +40,23 @@ if TYPE_CHECKING:
     from qr_sampler.config import QRSamplerConfig
 
 logger = logging.getLogger("qr_sampler")
+
+# TCP-connect pre-probe tunables. The pre-probe fronts every fetch with a
+# bounded-time connect() to the gRPC server address; if the kernel does not
+# return a listening socket within ``_PREPROBE_TIMEOUT_S``, we raise
+# ``EntropyUnavailableError`` immediately and back off for
+# ``_PREPROBE_BACKOFF_S`` before probing again. This converts a ~15 s
+# (3 retries × ~5 s timeout) "QRNG unreachable" event into a ~500 ms one,
+# which keeps the OWUI / httpx streaming client well inside its read budget
+# and lets the FallbackEntropySource take over before the user-facing
+# request times out.
+#
+# Operators can opt out by setting ``QR_GRPC_PREPROBE_ENABLED=0`` in the
+# environment (default is enabled — failing fast is strictly better than
+# the old behaviour for the in-tree deployment).
+_PREPROBE_TIMEOUT_S = 0.5
+_PREPROBE_BACKOFF_S = 5.0
+_PREPROBE_ENABLED_ENV_VAR = "QR_GRPC_PREPROBE_ENABLED"
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +265,14 @@ class QuantumGrpcSource(EntropySource):
         # Streaming state (lazily initialized).
         self._bidi_call: Any | None = None
 
+        # TCP pre-probe state. Tracks the monotonic timestamp of the most
+        # recent failed pre-probe so we can short-circuit subsequent calls
+        # within the backoff window without re-touching the socket.
+        self._last_preprobe_fail_monotonic: float = 0.0
+        self._preprobe_enabled: bool = (
+            os.environ.get(_PREPROBE_ENABLED_ENV_VAR, "1") != "0"
+        )
+
     def _run_loop(self) -> None:
         """Run the asyncio event loop in a background thread."""
         asyncio.set_event_loop(self._loop)
@@ -359,7 +386,17 @@ class QuantumGrpcSource(EntropySource):
         ) from last_error
 
     def _fetch_sync(self, n: int) -> bytes:
-        """Dispatch an async fetch to the background loop and block."""
+        """Dispatch an async fetch to the background loop and block.
+
+        Fronts the dispatch with a bounded-time TCP-connect pre-probe so
+        an unreachable sidecar fails the request in ~500 ms rather than
+        consuming the full multi-second gRPC retry budget. See the module-
+        level pre-probe constants for tunables; ``QR_GRPC_PREPROBE_ENABLED=0``
+        disables the pre-probe entirely if a downstream consumer needs the
+        legacy long-retry behaviour.
+        """
+        self._tcp_preprobe()
+
         timeout_s = self._get_timeout() / 1000.0
         coro = self._fetch_async(n)
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -371,6 +408,61 @@ class QuantumGrpcSource(EntropySource):
             ) from exc
         except Exception as exc:
             raise EntropyUnavailableError(f"gRPC entropy fetch failed: {exc}") from exc
+
+    def _tcp_preprobe(self) -> None:
+        """One-shot TCP-connect probe of the gRPC endpoint.
+
+        Skips entirely when ``QR_GRPC_PREPROBE_ENABLED=0`` is set so a
+        downstream consumer that knows the gRPC server is slow-to-listen
+        (e.g. starting alongside the client) can opt back into the legacy
+        retry-driven behaviour.
+
+        Within ``_PREPROBE_BACKOFF_S`` of a previous failure, short-circuits
+        to ``EntropyUnavailableError`` without re-touching the socket. This
+        bounds the SYN rate to ~12/minute even when vLLM is sampling at 50
+        tokens/sec, which matters because the kernel may otherwise rate-
+        limit unrelated connections to the same port.
+        """
+        if not self._preprobe_enabled:
+            return
+
+        now = time.monotonic()
+        if (now - self._last_preprobe_fail_monotonic) < _PREPROBE_BACKOFF_S:
+            raise EntropyUnavailableError(
+                "QRNG host unreachable (TCP pre-probe failed within last "
+                f"{_PREPROBE_BACKOFF_S:.0f}s; backoff in effect)"
+            )
+
+        host, _, port_s = self._address.partition(":")
+        try:
+            port = int(port_s)
+        except ValueError as exc:
+            raise EntropyUnavailableError(
+                f"Malformed gRPC server address {self._address!r}"
+            ) from exc
+
+        try:
+            with socket.create_connection((host, port), timeout=_PREPROBE_TIMEOUT_S):
+                pass
+        except OSError as exc:
+            self._last_preprobe_fail_monotonic = now
+            logger.warning(
+                "QRNG TCP pre-probe failed: %s:%s -- %s: %s",
+                host,
+                port,
+                type(exc).__name__,
+                exc,
+                extra={
+                    "event": "qrng.tcp_preprobe.failed",
+                    "host": host,
+                    "port": port,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise EntropyUnavailableError(
+                f"QRNG host {host}:{port} unreachable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     async def _fetch_async(self, n: int) -> bytes:
         """Route to the appropriate transport mode."""

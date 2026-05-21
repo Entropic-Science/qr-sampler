@@ -2,9 +2,9 @@
 title: QR-Sampler Parameters
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.3.0
+version: 0.4.0
 license: MIT
-description: qr-sampler params + entropic.science allowance metering + cold-start indicator.
+description: qr-sampler params + entropic.science allowance metering + cold-start indicator + per-user creative-vs-T=1 sampling preset toggle.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
@@ -438,6 +438,30 @@ class Filter:
             description="Store all token records in memory for analysis.",
         )
 
+    class UserValves(BaseModel):
+        """Per-user qr-sampler preset selector.
+
+        Open WebUI renders this as a dropdown in each user's per-filter
+        settings (it introspects pydantic ``Literal`` fields). Distinct
+        from ``Valves``: ``UserValves`` is editable by every user, while
+        ``Valves`` is admin-only.
+
+        Default is ``creative_sampling`` -- the V6_HVD_R01_01 winner from
+        createmp-evalsuite (UC=8.668 in the V6 explore phase). Users can
+        opt back to the vanilla T=1 baseline.
+        """
+
+        preset: Literal["creative_sampling", "normal_t1"] = Field(
+            default="creative_sampling",
+            description=(
+                "Token sampling preset. 'creative_sampling' (DEFAULT, "
+                "EXPERIMENTAL) uses HVH-Drift dynamic temperature -- the "
+                "V6_HVD_R01_01 winner from createmp-evalsuite (per-sequence "
+                "EMA state + dynamic min-p). 'normal_t1' is the vanilla T=1 "
+                "baseline (quantum entropy still drives selection)."
+            ),
+        )
+
     def __init__(self) -> None:
         self.valves = self.Valves()
         # Per-request cold-start state, keyed by chat_id (or a sentinel).
@@ -513,9 +537,47 @@ class Filter:
                 raise FilterError(_render_out_of_allowance_markdown(resp))
             raise FilterError(f"Unable to start generation: {reason}.")
 
-        valve_dict = self.valves.model_dump()
-        for field_name in self._QR_FIELDS:
-            body[f"qr_{field_name}"] = valve_dict[field_name]
+        # Read the per-user preset selection. OWUI may pass ``__user__`` as a
+        # dict (production) or as a pydantic-like object (tests); the nested
+        # ``valves`` may itself be a ``UserValves`` instance, a plain dict,
+        # or absent. Handle all three shapes defensively.
+        user_valves = None
+        if __user__ is not None:
+            user_valves = (
+                __user__.get("valves")
+                if isinstance(__user__, dict)
+                else getattr(__user__, "valves", None)
+            )
+        if user_valves is not None:
+            preset_name = getattr(user_valves, "preset", None)
+            if preset_name is None and isinstance(user_valves, dict):
+                preset_name = user_valves.get("preset")
+            if isinstance(preset_name, str) and preset_name:
+                # vLLM 0.17.0's ChatCompletionRequest model logs a warning
+                # for any top-level field outside its schema and DROPS it
+                # before SamplingParams is built. qr-sampler reads
+                # ``qr_preset`` from ``SamplingParams.extra_args``, which is
+                # populated from vLLM's ``vllm_xargs`` request field. So we
+                # must nest qr_* kwargs under ``vllm_xargs`` here rather
+                # than setting them at the top level — otherwise the
+                # logits-processor never sees them and falls back to
+                # default sampling.
+                xargs = body.setdefault("vllm_xargs", {})
+                if isinstance(xargs, dict):
+                    xargs["qr_preset"] = preset_name
+
+        # When the user has selected a preset, qr-sampler's resolve_preset()
+        # bundles the full hyperparameter set, and the caller's qr_* keys
+        # WIN over preset overrides (presets.py FR-10). Skipping the admin
+        # _QR_FIELDS injection keeps preset semantics coherent -- otherwise
+        # admin defaults like fixed_temperature=0.7 would clobber the
+        # preset's temperature_strategy=hvh_drift.
+        xargs = body.setdefault("vllm_xargs", {})
+        has_preset = isinstance(xargs, dict) and bool(xargs.get("qr_preset"))
+        if not has_preset and isinstance(xargs, dict):
+            valve_dict = self.valves.model_dump()
+            for field_name in self._QR_FIELDS:
+                xargs[f"qr_{field_name}"] = valve_dict[field_name]
 
         if self.valves.cold_start_enabled:
             await self._maybe_emit_cold_start(body, __event_emitter__)

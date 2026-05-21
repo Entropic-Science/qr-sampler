@@ -154,6 +154,89 @@ Procedure when rotating:
 No automated rotation in v1. Re-run this procedure once per quarter or
 after any suspected leak.
 
+## Full secret install (single command)
+
+Use this when re-provisioning `qr-sampler-prod` from scratch or when an
+investigation has surfaced multiple drifted keys at once. `--force`
+replaces the secret atomically, so a partial run cannot leave stale keys
+alongside the new ones.
+
+> ⚠️ **Fetch `SERVICE_TOKEN_SECRETS` first.** `--force` replaces every
+> key. Losing the rolling-secret vector breaks OWUI → vLLM bearer auth
+> instantly.
+>
+> Modal's CLI has no `secret get` subcommand — secret values are not
+> CLI-surfacable for security. To retrieve `SERVICE_TOKEN_SECRETS`,
+> use the helper in the qr-llm-chat repo:
+>
+> ```powershell
+> $env:PYTHONIOENCODING="utf-8"; $env:PYTHONUTF8="1"
+> modal run scripts/dump_modal_secret.py::dump --key SERVICE_TOKEN_SECRETS
+> ```
+>
+> (Run from `C:\Code\Entropic-Science\qr-llm-chat`. The helper mounts
+> the `qr-sampler-prod` Secret in a tiny throwaway Modal function and
+> prints the value once. Close the terminal afterwards so the value
+> does not stay in scrollback.)
+>
+> Equivalent alternative: read `VLLM_API_KEY` from the
+> `qr-llm-chat-prod` Modal Secret (same value as the first entry of
+> `SERVICE_TOKEN_SECRETS`, see qr-llm-chat/infra/modal_secrets.md §6).
+
+```bash
+modal secret create qr-sampler-prod --force \
+  SERVICE_TOKEN_SECRETS=<paste current value from `modal secret get`> \
+  QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
+  QR_PREINIT_ENTROPY_SOURCES=quantum_grpc,system \
+  QR_FALLBACK_MODE=system \
+  QR_SAMPLE_COUNT=12800 \
+  QR_GRPC_SERVER_ADDRESS=127.0.0.1:50051 \
+  QR_GRPC_MODE=unary \
+  QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes \
+  QR_GRPC_STREAM_METHOD_PATH= \
+  QR_GRPC_API_KEY=<QRNG api-key> \
+  QR_GRPC_API_KEY_HEADER=api-key \
+  QR_GRPC_TIMEOUT_MS=5000 \
+  QR_MAX_MODEL_LEN=65536 \
+  QR_GPU_MEMORY_UTILIZATION=0.90 \
+  QRNG_TUNNEL_HOSTNAME=qbert-grpc.cipherstone.co \
+  QRNG_API_KEY=<QRNG api-key, same as QR_GRPC_API_KEY> \
+  CF_ACCESS_CLIENT_ID=<Cloudflare Access Service Token client id> \
+  CF_ACCESS_CLIENT_SECRET=<Cloudflare Access Service Token client secret>
+```
+
+Two-name window: `QR_MAX_MODEL_LEN` / `QR_GPU_MEMORY_UTILIZATION` are the
+canonical names. The legacy `VLLM_*` spellings are still read defensively
+by `build_dispatcher_for`, but they trigger an `Unknown vLLM environment
+variable` warning from vLLM's own envs.py scan, so the `vllm_serve.py`
+loader pops them from `os.environ` before any vLLM import. Use the
+`QR_*` names in new deployments.
+
+Verification on the next cold-start: grep `modal app logs` for
+`modal.secret_diag.summary` — the JSON line shows the resolved value of
+every non-secret env var (e.g. `"QR_ENTROPY_SOURCE_TYPE": "set: quantum_grpc"`),
+so the K-2 / K-3 misconfigurations no longer hide behind `set (N chars)`.
+
+### Operator diagnostic events worth grepping
+
+After a deploy, grep `modal app logs` for:
+
+| Event | What it tells you |
+|---|---|
+| `modal.secret_diag.summary` | Every group's missing keys + (for allow-listed names) the resolved value |
+| `modal.env.promoted` | One emit per legacy `VLLM_*` → `QR_*` rename; verifies the sweep ran |
+| `modal.vllm.tunables_resolved` | Which env spelling supplied `max_model_len` / `gpu_memory_utilization` |
+| `modal.grpc_address.non_loopback` | WARNING — `QR_GRPC_SERVER_ADDRESS` is not loopback; the cloudflared sidecar binds to 127.0.0.1 only so gRPC fetches will silently fall back to system entropy |
+| `qrng.tcp_preprobe.failed` | The 500 ms TCP pre-probe rejected — sidecar is not listening at `127.0.0.1:50051` |
+| `entropy.request.routed` | Per-request: what the client asked for vs the pipeline that actually answered |
+| `entropy.request.completed` | Per-request boundary with token count + dominant entropy source |
+
+The last two land the K-5 investigation: if `entropy.request.completed`
+shows `tokens_generated=0` with `dominant_source=quantum_grpc`, the
+gRPC backend dropped every fetch; if `dominant_source=system` for a
+request that asked for `quantum_grpc`, the fallback wrapper engaged
+(check `entropy.degraded` for the per-fallback record).
+
 ## Unauthenticated-inference opt-in (`ALLOW_UNAUTHENTICATED_INFERENCE`)
 
 By default the inference container **fails closed** when

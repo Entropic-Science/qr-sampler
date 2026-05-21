@@ -94,27 +94,58 @@ def _inline_helpers(plugin_src: str, helpers: dict[str, str]) -> str:
     return replaced
 
 
-def _bundle(plugin_filename: str, function_id: str, function_name: str) -> dict:
+def _bundle(
+    plugin_filename: str,
+    function_id: str,
+    function_name: str,
+    extra_meta: dict | None = None,
+) -> dict:
     plugin_src = (_HERE / plugin_filename).read_text(encoding="utf-8")
     meta = _read_meta_from_docstring(plugin_src)
 
     helpers = {name: (_HERE / name).read_text(encoding="utf-8") for name in _HELPER_FILES}
     bundled_src = _inline_helpers(plugin_src, helpers)
 
+    envelope_meta: dict = {
+        "description": meta["description"],
+        "manifest": {
+            "title": meta["title"],
+            "author": meta["author"],
+            "version": meta["version"],
+            "license": meta["license"],
+        },
+    }
+    if extra_meta:
+        envelope_meta.update(extra_meta)
+
     return {
         "id": function_id,
         "name": function_name,
-        "meta": {
-            "description": meta["description"],
-            "manifest": {
-                "title": meta["title"],
-                "author": meta["author"],
-                "version": meta["version"],
-                "license": meta["license"],
-            },
-        },
+        "meta": envelope_meta,
         "content": bundled_src,
     }
+
+
+# Machine-readable mirror of `Filter.UserValves.preset`. Redundant with the
+# embedded pydantic class but exposes the enum to filter-registry browsers
+# that do not introspect the bundled `content` string. Kept here (not in
+# qr_sampler_filter.py) so the .py file stays pure pydantic and the bundle
+# script owns the JSON-side schema.
+_FILTER_USER_VALVES_META: dict = {
+    "user_valves": {
+        "preset": {
+            "type": "string",
+            "enum": ["creative_sampling", "normal_t1"],
+            "default": "creative_sampling",
+            "description": (
+                "Token sampling preset. 'creative_sampling' (default, "
+                "experimental) uses HVH-Drift dynamic temperature "
+                "(V6_HVD_R01_01 winner). 'normal_t1' is the vanilla T=1 "
+                "baseline."
+            ),
+        },
+    },
+}
 
 
 def _render_bundles() -> dict[str, str]:
@@ -123,6 +154,7 @@ def _render_bundles() -> dict[str, str]:
         "qr_sampler_filter.py",
         "qr_sampler_parameters",
         "QR-Sampler Parameters",
+        extra_meta=_FILTER_USER_VALVES_META,
     )
     pipe_envelope = _bundle(
         "qr_comparison_pipe.py",

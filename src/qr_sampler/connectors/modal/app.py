@@ -4,17 +4,37 @@ Layout (matches spec.md §5.5 / §4.1, with the labs-cutover per-model split):
 
     weights_volume     — Volume "llm-weights", mounted at /root/.cache/huggingface
     download_weights   — one-shot @app.function to populate weights_volume
-    VllmQrGemma        — @app.cls (H200) running google/gemma-4-31B alone
     VllmQrQwen         — @app.cls (H200) running Qwen/Qwen3.6-27B alone
 
 Each model is its own scale-to-zero @app.cls so OWUI's model picker wakes
-only the requested container. The two classes share `vllm_image` (same
-Dockerfile, same qr-sampler install) — the split is purely runtime, not
-build-time. Open WebUI itself is provided by the `OWUIService` class
-defined below; the OWUI-specific lifecycle code (admin bootstrap,
-SvelteKit base-path patch, Function bundle import) lives in the
-downstream `qr-llm-chat` package, imported lazily inside the @modal.enter
-hooks so this module stays usable without that dependency installed.
+only the requested container. Open WebUI itself is provided by the
+`OWUIService` class defined below; the OWUI-specific lifecycle code
+(admin bootstrap, SvelteKit base-path patch, Function bundle import)
+lives in the downstream `qr-llm-chat` package, imported lazily inside
+the @modal.enter hooks so this module stays usable without that
+dependency installed.
+
+Gemma 4 31B pause + Qwen 3.6 27B MM-probe monkey-patch (2026-05-20)
+-------------------------------------------------------------------
+1. ``VllmQrGemma`` (google/gemma-4-31B) is paused while the vLLM/
+   transformers ecosystem stabilises around the gemma-4 GDN architecture.
+   vLLM 0.17.0 does not register ``Gemma4ForConditionalGeneration``.
+   Restore Gemma when a vLLM release ships gemma-4 GDN support.
+
+2. ``VllmQrQwen`` serves Qwen/Qwen3.6-27B. The 27B variant has a populated
+   HF ``vision_config`` so vLLM V1's ``profile_run`` would otherwise run
+   an unconditional MM dummy probe that crashes in
+   ``transformers.processing_utils.get_text_with_replacements`` with
+   ``StopIteration``. The load-bearing fix is in
+   ``qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch``,
+   which monkey-patches ``GPUModelRunner.profile_run`` to set
+   ``mm_config.skip_mm_profiling=True`` at entry — vLLM's own supported
+   short-circuit at gpu_model_runner.py:5226 in v0.17.0. The patch fires
+   ONE event (``vllm.mm.probe_skipped``) on every cold-start; absence of
+   that event on a future cold-start means the patch lost its hook.
+
+Both prior model directories remain on the ``llm-weights`` volume; the
+restore path is a code-only change.
 
 Deploy:
     modal deploy -m qr_sampler.connectors.modal.app
@@ -124,10 +144,21 @@ def _qr_llm_chat_functions_dir() -> Path:
 
 # --- Volumes ---------------------------------------------------------------
 
-# Both Gemma 4 31B and Qwen 3.6 27B directories live in this volume.
+# Currently only Qwen 3.6 27B is actively served; the volume also retains
+# prior model directories (Qwen 3.5 9B, Gemma 4 31B) for warm-cache
+# resume if those classes return.
 # Populated by `download_weights`; each class mounts it read-only and reads
 # only its own subdirectory at engine init.
 weights_volume = modal.Volume.from_name("llm-weights", create_if_missing=True)
+
+# vLLM torch.compile / AOT compile artefact cache. Without this volume the
+# 2-min Dynamo bytecode transform + 35s AOT compile re-runs on every cold-
+# start because /root/.cache/vllm/ is ephemeral container storage. With the
+# volume mounted, the second cold-start sees ``Reusing cached graph...`` and
+# the dispatcher-ready latency drops by ~130s. Per-VLLM-version cache key
+# (``torch_compile_cache/<10-char-hash>/...``) means a vLLM upgrade
+# automatically invalidates the cache without manual cleanup.
+vllm_cache_volume = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 # --- Secrets ---------------------------------------------------------------
 
@@ -140,7 +171,17 @@ hf_token_secret = modal.Secret.from_name("huggingface-secret")
 # Lightweight image for the one-shot weights downloader.
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("huggingface_hub>=0.24")
+    # pydantic + pydantic-settings are needed because Modal's harness imports
+    # this entire module (``qr_sampler.connectors.modal.app``) to introspect
+    # ``download_weights`` before launching it, and the import transitively
+    # hits ``qr_sampler.__init__:19`` → ``qr_sampler.config`` which imports
+    # pydantic. Without these deps the function fails to start with
+    # ``ModuleNotFoundError: No module named 'pydantic'``.
+    .pip_install(
+        "huggingface_hub>=0.24",
+        "pydantic>=2,<3",
+        "pydantic-settings>=2,<3",
+    )
     .env(
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -188,14 +229,26 @@ download_image = (
 # This step is a file-level copy (it does not invoke Python in the image)
 # so it is unaffected by the `python` alias absence.
 #
-# This image is shared by both VllmQrGemma and VllmQrQwen — the per-model
-# split is at the class/container level, not the image level.
+# Currently shared by VllmQrQwen only (Gemma class paused — see module
+# docstring); the image is still parameterised across classes because the
+# per-model split is purely runtime, not build-time.
+#
+# ``obs`` is shipped alongside ``qr_sampler`` because the structured
+# logger in ``qr_sampler.connectors.modal.vllm_serve`` calls
+# ``obs.logging.get_logger`` to emit the ``vllm.*`` events
+# (engine-args / model-load / built / build_failed / dispatcher_ready).
+# Without this layer the container would crash at import time with
+# ``ModuleNotFoundError: No module named 'obs'`` before the engine ever
+# tried to load. The package lives at qr-llm-chat's repo root (not under
+# src/) — Modal resolves it via Python's normal import machinery, so the
+# deploy host must have qr-llm-chat editable-installed.
 vllm_image = (
     modal.Image.from_dockerfile(
         str(Path(__file__).parent / "Dockerfile.vllm"),
         context_dir=str(_REPO_ROOT),
     )
     .add_local_python_source("qr_sampler", copy=True)
+    .add_local_python_source("obs", copy=True)
 )
 
 # --- App -------------------------------------------------------------------
@@ -206,11 +259,18 @@ app = modal.App(APP_NAME)
 # ----- One-shot weights download -------------------------------------------
 
 
-_GEMMA_REPO = "google/gemma-4-31B"
+# Restored 2026-05-20 to Qwen/Qwen3.6-27B (was briefly Qwen/Qwen3.5-9B).
+# Both 27B and 9B variants have a populated HF ``vision_config`` and route
+# through ``*ForConditionalGeneration`` — so the 9B swap did not actually
+# dodge vLLM's V1 ``profile_run`` MM dummy probe (it crashed the same way,
+# just on a smaller model). The load-bearing fix is in
+# ``qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch``:
+# we monkey-patch ``GPUModelRunner.profile_run`` to flip
+# ``mm_config.skip_mm_profiling=True`` at entry, taking the vendor-
+# supported short-circuit at gpu_model_runner.py:5226.
 _QWEN_REPO = "Qwen/Qwen3.6-27B"
 # Pinned revisions are recorded here at deploy time. Empty string means
 # "latest at download time" — pin once you know the SHA you want to lock to.
-_GEMMA_REVISION = os.environ.get("GEMMA_REVISION", "")
 _QWEN_REVISION = os.environ.get("QWEN_REVISION", "")
 
 
@@ -218,33 +278,32 @@ _QWEN_REVISION = os.environ.get("QWEN_REVISION", "")
     image=download_image,
     volumes={"/root/.cache/huggingface": weights_volume},
     secrets=[hf_token_secret],
-    timeout=60 * 60,  # 1 hour — both downloads typically finish in 10-20 min
+    timeout=60 * 60,  # 1 hour — download typically finishes in 10-20 min
 )
 def download_weights() -> dict[str, str]:
-    """Populate the ``llm-weights`` Volume with both model directories.
+    """Populate the ``llm-weights`` Volume with the Qwen model directory.
 
-    Run once per model-version bump:
-        modal run deployments/modal/app.py::download_weights
+    Run once per model switch / version bump:
+        modal run -m qr_sampler.connectors.modal.app::download_weights
 
-    Idempotent — re-running just re-validates the cache.
+    Idempotent — re-running just re-validates the cache. As of 2026-05-20
+    this targets Qwen/Qwen3.6-27B; the MM-probe monkey-patch in
+    ``vllm_serve._install_mm_probe_skip_patch`` makes this variant
+    cold-startable. Prior weight directories (Qwen3.5-9B, google/gemma-4-31B)
+    remain on the volume so resuming either is a code-only change with a
+    warm cache hit.
     """
     from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
 
-    gemma_kwargs: dict[str, Any] = {"repo_id": _GEMMA_REPO}
-    if _GEMMA_REVISION:
-        gemma_kwargs["revision"] = _GEMMA_REVISION
     qwen_kwargs: dict[str, Any] = {"repo_id": _QWEN_REPO}
     if _QWEN_REVISION:
         qwen_kwargs["revision"] = _QWEN_REVISION
 
-    gemma_path = snapshot_download(**gemma_kwargs)
     qwen_path = snapshot_download(**qwen_kwargs)
     weights_volume.commit()  # type: ignore[attr-defined]
 
     return {
-        "gemma_path": gemma_path,
         "qwen_path": qwen_path,
-        "gemma_revision": _GEMMA_REVISION or "(latest)",
         "qwen_revision": _QWEN_REVISION or "(latest)",
     }
 
@@ -252,7 +311,7 @@ def download_weights() -> dict[str, str]:
 # ----- Per-model GPU classes -----------------------------------------------
 #
 # Each class:
-#   * Loads ONE model into ONE B200 container.
+#   * Loads ONE model into ONE H200 container.
 #   * Scales to zero independently via `scaledown_window=180` (3 min idle).
 #   * Exposes its own public Modal URL via `@modal.asgi_app()`.
 #
@@ -261,17 +320,17 @@ def download_weights() -> dict[str, str]:
 # `qr_llm_chat.bootstrap_connections`); the model the user picks in the
 # OWUI dropdown determines which container wakes.
 #
-# Sharing the @app.cls config: the two classes only differ in their
-# class-level `SERVED_MODEL_NAME` and `HF_REPO_ID`. Everything else
-# (image, secrets, volume mount, GPU type, scale-to-zero window, max
-# concurrent inputs) is identical.
+# Only ``VllmQrQwen`` is currently registered (the Gemma class is paused
+# — see module docstring). The shared ``_CLS_KWARGS`` below is sized for
+# both, so re-introducing a sibling Gemma class is a copy-paste away.
 
 
 _CLS_KWARGS: dict[str, Any] = {
     "image": vllm_image,
-    # H200 (141 GB HBM3e) fits both Gemma 4 31B and Qwen 3.6 27B at
-    # native bf16 with max_model_len=65536 + gpu_memory_utilization=0.90,
-    # and has a wider schedulable pool than B200.
+    # H200 (141 GB HBM3e) sized for Qwen 3.6 27B at bf16 (~54 GB weights
+    # plus KV cache for max_model_len=65536). H200 also keeps a wider
+    # schedulable pool than B200 / A100, which mattered for the
+    # 2026-05-19 capacity crunch.
     "gpu": "H200",
     # Region pool: ``"us"`` (the broad-region option per Modal's docs at
     # docs/guide/region-selection). Broad regions widen the schedulable
@@ -305,29 +364,72 @@ _CLS_KWARGS: dict[str, Any] = {
     # narrow multiplier) — the prior comment block in git history
     # explains the latency math in detail.
     "region": "us",
-    "volumes": {"/root/.cache/huggingface": weights_volume},
+    "volumes": {
+        "/root/.cache/huggingface": weights_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+    },
     "secrets": [qr_sampler_prod_secret, hf_token_secret],
     "enable_memory_snapshot": True,
-    "scaledown_window": 180,  # 3 min idle -> shutdown
+    # 30 min idle -> shutdown. Modal's GPU memory snapshot CANNOT capture
+    # CUDA state (see ``_VLLM_CLS_KWARGS`` comment), so every cold-start
+    # rebuilds the engine from scratch (~3 min with torch.compile cache,
+    # ~5 min cold). The realistic latency win comes from keeping the
+    # container warm long enough that a user's next message arrives while
+    # the engine is still resident — at 180 s any "let me think" pause
+    # past 3 min meant a full reload. 1800 s gives a much better UX for
+    # interactive chat while still scaling to zero on real idle.
+    "scaledown_window": 1800,
     "max_containers": 1,  # Pre-flight §11.8 cost ceiling, per model
     "timeout": 60 * 60,
 }
 
 
-@app.cls(**_CLS_KWARGS)
+# ``enable_memory_snapshot=False`` on the vLLM class (only): the @modal.enter
+# methods on VllmQrQwen are all ``snap=False`` anyway (the vLLM ModelConfig
+# import chain needs a CUDA-attached GPU; snap=True's CUDA_VISIBLE_DEVICES=
+# "none" crashes ``device_id_to_physical_device_id``), so the snapshot path
+# never actually engages. Carrying ``enable_memory_snapshot=True`` from the
+# shared ``_CLS_KWARGS`` is therefore inert AND creates a confusing
+# failure mode: if Modal ever restores a STALE snapshot from a previous
+# image's pre-restore state, the container boots against the old
+# transformers/vLLM versions and produces traceback lines that cannot exist
+# in the new image (e.g. the 2026-05-20 "configuration_auto.py:1040" crash,
+# which referenced a file that only has 438 lines in transformers @ main).
+# Disabling per-class removes that surface entirely. ``OWUIService`` keeps
+# its snapshot (different image, no GPU requirement, fast cold-start win).
+_VLLM_CLS_KWARGS: dict[str, Any] = {
+    **_CLS_KWARGS,
+    "enable_memory_snapshot": False,
+}
+
+
+@app.cls(**_VLLM_CLS_KWARGS)
 @modal.concurrent(max_inputs=8)
-class VllmQrGemma:
-    """One ``AsyncLLMEngine`` serving ``google/gemma-4-31B`` at full precision.
+class VllmQrQwen:
+    """One ``AsyncLLMEngine`` serving ``Qwen/Qwen3.6-27B`` at full precision.
+
+    The 27B's HF config carries a populated ``vision_config`` which would
+    otherwise crash vLLM V1's MM dummy probe. The load-bearing fix is the
+    ``_install_mm_probe_skip_patch`` monkey-patch in
+    ``qr_sampler.connectors.modal.vllm_serve`` — see that helper's
+    docstring for the patch's risk surface.
 
     Lifecycle:
 
-    * ``@modal.enter(snap=True) load`` — builds the engine and pre-initialises
-      both entropy pipelines (per ``QR_PREINIT_ENTROPY_SOURCES``). Modal
-      captures the post-init state; cold starts restore from the snapshot.
+    * ``@modal.enter(snap=False) load`` — builds the engine and pre-initialises
+      both entropy pipelines (per ``QR_PREINIT_ENTROPY_SOURCES``). Runs in
+      the snap=False phase because vLLM's ``ModelConfig`` validation spawns
+      a subprocess that imports the model's quantization stack, which
+      transitively calls ``current_platform.get_device_capability()`` —
+      requires a CUDA-attached GPU. Modal's snap=True phase has no GPU
+      (``CUDA_VISIBLE_DEVICES=none``), so the import chain crashes with
+      ``ValueError: invalid literal for int() with base 10: 'none'`` inside
+      ``vllm/platforms/interface.py::device_id_to_physical_device_id``.
+      Running at snap=False means the engine is rebuilt on every cold-start
+      (no snapshot benefit) but it actually works.
     * ``@modal.enter(snap=False) start_tunnel`` — spawns the per-container
       ``cloudflared access tcp`` sidecar that fronts the QRNG gRPC service.
-      Runs in the snap=False phase so no live socket is frozen into the
-      snapshot.
+      Already snap=False so no live socket is frozen into the snapshot.
     * ``@modal.exit() stop_tunnel`` — terminates the sidecar on container
       shutdown.
     """
@@ -335,59 +437,117 @@ class VllmQrGemma:
     # Machine-friendly ID echoed by vLLM's /v1/models endpoint and used as
     # the routing key throughout OWUI + the comparison Pipe. No spaces or
     # parens here -- the human-readable display label
-    # ("gemma-4-31b (quantum-random)") is set via an OWUI ``model`` table
-    # row override seeded by ``qr_llm_chat.bootstrap_connections``.
-    SERVED_MODEL_NAME = "gemma-4-31b"
-    HF_REPO_ID = "google/gemma-4-31B"
-
-    @modal.enter(snap=True)
-    def load(self) -> None:
-        import asyncio
-
-        from qr_sampler.connectors.modal.vllm_serve import build_dispatcher_for
-
-        self._asgi_app = asyncio.run(
-            build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
-        )
-
-    @modal.enter(snap=False)
-    def start_tunnel(self) -> None:
-        self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
-
-    @modal.exit()
-    def stop_tunnel(self) -> None:
-        _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
-
-    @modal.asgi_app()
-    def serve(self) -> Any:
-        return self._asgi_app
-
-
-@app.cls(**_CLS_KWARGS)
-@modal.concurrent(max_inputs=8)
-class VllmQrQwen:
-    """One ``AsyncLLMEngine`` serving ``Qwen/Qwen3.6-27B`` at full precision.
-
-    See ``VllmQrGemma`` for the lifecycle design — identical here, only the
-    model identity differs.
-    """
-
-    # See VllmQrGemma.SERVED_MODEL_NAME for the naming contract.
+    # ("qwen-3.6-27b (quantum-random)") is set via an OWUI ``model`` table
+    # row override seeded by ``qr_llm_chat.bootstrap_connections``. The id
+    # MUST stay in lockstep with ``_QWEN_ID`` in
+    # ``qr_llm_chat/bootstrap_connections.py`` and the Pipe's
+    # ``base_models`` default.
     SERVED_MODEL_NAME = "qwen-3.6-27b"
-    HF_REPO_ID = "Qwen/Qwen3.6-27B"
+    # 2026-05-21: switched to Qwen/Qwen3.5-9B as a smaller, faster
+    # cold-start variant (createmp-evalsuite uses this model
+    # successfully). 9B has the same Qwen3_5ForConditionalGeneration
+    # architecture as the 27B but ~3x smaller (17 GiB vs 51 GiB) so
+    # cold-start drops to ~90 s (vs ~115 s). The OWUI-facing
+    # SERVED_MODEL_NAME stays "qwen-3.6-27b" so bootstrap_connections
+    # doesn't need updating to swap the displayed model.
+    # Note: a pending EngineCore-500 issue (see scripts/dump_modal_secret.py
+    # and Phase K notes) is independent of model choice — switching
+    # back to "Qwen/Qwen3.6-27B" did not fix or worsen the symptom.
+    HF_REPO_ID = "Qwen/Qwen3.5-9B"
 
-    @modal.enter(snap=True)
+    @modal.enter(snap=False)
     def load(self) -> None:
         import asyncio
 
         from qr_sampler.connectors.modal.vllm_serve import build_dispatcher_for
 
-        self._asgi_app = asyncio.run(
-            build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
-        )
+        # Wrap the dispatcher build so any unhandled failure surfaces as
+        # a structured ``vllm.engine.build_failed`` event BEFORE Modal's
+        # runtime traceback printing kicks in. Without this wrap the
+        # event from ``build_engine`` itself still fires (we emit before
+        # ``raise``), but a failure *outside* ``build_engine`` (e.g. in
+        # ``build_app`` or in the event-loop scaffolding itself) would
+        # be lost to Modal's generic exit-1 path. Emitting one more
+        # JSON-per-line event with the served_model_name tag means
+        # ``modal app logs | grep vllm.engine.build_failed`` always
+        # turns up the failed container even when stacks interleave.
+        #
+        # NOTE on asyncio + vLLM V1 engine cold-start flakiness (2026-05-20):
+        #
+        # Some cold-starts on Modal end with ``Engine core proc EngineCore_DP0
+        # died unexpectedly`` + exit code 0 + PyTorch NCCL atexit warning
+        # ``destroy_process_group() was not called before program exit``.
+        # The hypothesis was that ``asyncio.run()`` installs SIGINT/SIGTERM
+        # handlers on the loop (via ``asyncio.Runner._install_signal_handler``)
+        # which the forked EngineCore inherits, then dies on signal during
+        # the multi-minute model load.
+        #
+        # Iteration 6 tried ``asyncio.new_event_loop()`` + ``run_until_complete``
+        # to bypass the signal-handler install — but ``close()`` on exit then
+        # killed vLLM's background output_handler task with ``Event loop is
+        # closed`` errors. And the EngineCore subprocess STILL died with
+        # exit code 0 on a separate cold-start, ruling out signal propagation
+        # as the sole cause. The crashes appear intermittent (Modal container
+        # resource pressure + multiple concurrent cold-start attempts
+        # triggered by OWUI's deploy_guard probes).
+        #
+        # Canonical fix would be Modal's ``@modal.web_server`` pattern running
+        # ``vllm serve`` as a subprocess (see modal-examples/06_gpu_and_ml/
+        # llm-serving/vllm_inference.py) — that sidesteps the asyncio +
+        # multiprocessing signal interaction entirely. Significant rewrite,
+        # tracked as a follow-up.
+        try:
+            self._asgi_app = asyncio.run(
+                build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
+            )
+        except BaseException as err:  # noqa: BLE001 -- must surface every failure
+            import traceback as _tb
+
+            from obs.events import VLLM_ENGINE_BUILD_FAILED
+            from obs.logging import get_logger
+
+            tb_text = "".join(
+                _tb.format_exception(type(err), err, err.__traceback__)
+            )
+            tb_tail = "\n".join(tb_text.splitlines()[-30:])
+            log = get_logger(
+                f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}"
+            )
+            log.error(
+                "VllmQrQwen.load FAILED for %s: %s: %s",
+                self.SERVED_MODEL_NAME,
+                type(err).__name__,
+                err,
+                extra={
+                    "event": VLLM_ENGINE_BUILD_FAILED,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "hf_repo_id": self.HF_REPO_ID,
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                    "traceback_tail": tb_tail,
+                    "phase": "VllmQrQwen.load",
+                },
+            )
+            raise
 
     @modal.enter(snap=False)
     def start_tunnel(self) -> None:
+        # Soft-fail: when the cloudflared sidecar cannot start (missing CF
+        # Access creds, cloudflared binary not on PATH, tunnel unreachable),
+        # log a structured event and continue. ``self._cloudflared = None``
+        # marks the sidecar as not running; the container still serves the
+        # model. qr-sampler's ``QuantumGrpcSource`` will fail to dial
+        # 127.0.0.1:50051, then ``FallbackEntropySource`` (configured via
+        # ``QR_FALLBACK_MODE=system`` in Dockerfile.vllm) transparently
+        # degrades to ``SystemEntropySource``. The per-request
+        # ``entropy.degraded`` events surface the QRNG outage to operators.
+        #
+        # Prior design hard-failed here, which killed the container AFTER
+        # the engine had successfully built (~5 min of GPU time wasted per
+        # cold-start) AND produced a misleading
+        # ``Engine core proc EngineCore_DP0 died unexpectedly`` shutdown
+        # cascade (atexit join → KeyboardInterrupt → subprocess exit 0).
+        # See ``obs.events.CLOUDFLARED_*`` for the post-mortem.
         self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
 
     @modal.exit()
@@ -408,33 +568,130 @@ class VllmQrQwen:
 
 
 def _start_qrng_tunnel(served_model_name: str) -> Any:
-    """Spawn the cloudflared sidecar for one VllmQr* container.
+    """Spawn the cloudflared sidecar for one VllmQr* container — soft-fail.
 
     The sidecar listens on 127.0.0.1:50051 and forwards through Cloudflare
     Access to ``QRNG_TUNNEL_HOSTNAME``. The qr-sampler ``QuantumGrpcSource``
     dials the loopback address (set via ``QR_GRPC_SERVER_ADDRESS`` in the
     Dockerfile, overridable via the qr-sampler-prod Modal Secret).
 
-    Failure is hard: if the Cloudflare Access service token is missing,
-    revoked, or the tunnel hostname is wrong, the container fails to enter
-    with a structured error rather than silently degrading to urandom.
-    Operators see the cloudflared stderr tail in ``modal app logs``.
-    """
-    import logging
+    Failure is SOFT: when the Cloudflare Access service token env vars are
+    missing/revoked, when cloudflared cannot reach the tunnel hostname, or
+    when the binary is otherwise unavailable, we log a structured event
+    and return ``None``. The caller stores ``None`` as ``self._cloudflared``;
+    request-time entropy then falls back through
+    ``qr_sampler.entropy.FallbackEntropySource`` (configured via the
+    ``QR_FALLBACK_MODE=system`` env var baked into Dockerfile.vllm) to
+    ``SystemEntropySource`` (``os.urandom``). The per-request
+    ``entropy.degraded`` events surface the QRNG outage to operators.
 
+    Prior design hard-failed here, which killed the container AFTER the
+    engine had successfully built — wasting ~5 min of GPU per attempted
+    cold-start AND producing a misleading
+    ``Engine core proc EngineCore_DP0 died unexpectedly`` shutdown
+    cascade (atexit join on the EngineCore subprocess receives
+    KeyboardInterrupt during Python interpreter shutdown).
+
+    Returns:
+        ``CloudflaredSidecar`` on success.
+        ``None`` when the sidecar could not start (any reason).
+    """
+    from obs.events import (
+        CLOUDFLARED_CONFIG_MISSING,
+        CLOUDFLARED_SIDECAR_FAILED,
+        CLOUDFLARED_SIDECAR_SKIPPED,
+    )
+    from obs.logging import get_logger
     from qr_sampler.connectors.modal.cloudflared_sidecar import (
         CloudflaredConfig,
+        CloudflaredConfigError,
         CloudflaredSidecar,
     )
 
-    log = logging.getLogger("qr_sampler.cloudflared")
+    log = get_logger("qr_sampler.cloudflared")
     log.info(
         "Starting QRNG cloudflared sidecar for %s container",
         served_model_name,
         extra={"event": "cloudflared.container_start", "model": served_model_name},
     )
-    sidecar = CloudflaredSidecar(CloudflaredConfig.from_env())
-    sidecar.start()
+
+    try:
+        config = CloudflaredConfig.from_env()
+    except CloudflaredConfigError as err:
+        # Parse the "unset or empty: A, B, C" tail from the error message
+        # so the structured event surfaces actionable missing-var names.
+        msg = str(err)
+        missing: list[str] = []
+        marker = "unset or empty: "
+        if marker in msg:
+            tail = msg.split(marker, 1)[1].split(".", 1)[0]
+            missing = [v.strip() for v in tail.split(",") if v.strip()]
+        log.warning(
+            "QRNG cloudflared sidecar config missing for %s; "
+            "container will serve with system-entropy fallback (%s)",
+            served_model_name,
+            ", ".join(missing) if missing else str(err),
+            extra={
+                "event": CLOUDFLARED_CONFIG_MISSING,
+                "served_model_name": served_model_name,
+                "missing_vars": missing,
+                "error_msg": str(err),
+            },
+        )
+        log.info(
+            "QRNG cloudflared sidecar skipped for %s "
+            "(falling back to system entropy via FallbackEntropySource)",
+            served_model_name,
+            extra={
+                "event": CLOUDFLARED_SIDECAR_SKIPPED,
+                "served_model_name": served_model_name,
+                "reason": "config_missing",
+            },
+        )
+        return None
+
+    sidecar = CloudflaredSidecar(config)
+    try:
+        sidecar.start()
+    except Exception as err:  # noqa: BLE001 -- sidecar failure must NOT kill the container
+        # Cloudflared binary missing from PATH, tunnel unreachable,
+        # service-token revoked, etc. Same soft-fail policy.
+        stderr_tail = None
+        try:
+            stderr_tail = "\n".join(list(sidecar._stderr_tail)[-30:])
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning(
+            "QRNG cloudflared sidecar failed to start for %s: %s: %s; "
+            "container will serve with system-entropy fallback",
+            served_model_name,
+            type(err).__name__,
+            err,
+            extra={
+                "event": CLOUDFLARED_SIDECAR_FAILED,
+                "served_model_name": served_model_name,
+                "error_type": type(err).__name__,
+                "error_msg": str(err),
+                "stderr_tail": stderr_tail,
+            },
+        )
+        log.info(
+            "QRNG cloudflared sidecar skipped for %s "
+            "(falling back to system entropy)",
+            served_model_name,
+            extra={
+                "event": CLOUDFLARED_SIDECAR_SKIPPED,
+                "served_model_name": served_model_name,
+                "reason": "startup_failed",
+            },
+        )
+        # Best-effort cleanup of any partially-started sidecar process.
+        try:
+            sidecar.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
     return sidecar
 
 
@@ -618,7 +875,8 @@ class OWUIService:
       user exists (idempotent), imports the bundled Function envelopes
       (Filter + Pipe) via OWUI's Python API, and writes the comparison
       Pipe's valves so its ``vllm_base_url`` / ``model_base_urls`` point
-      at the two ``VllmQrGemma`` / ``VllmQrQwen`` web URLs above.
+      at the ``VllmQrQwen`` web URL above (the sibling ``VllmQrGemma``
+      class is paused — see module docstring).
     * ``@modal.asgi_app() serve`` — returns the OWUI FastAPI app.
 
     All heavy lifting is in the ``qr_llm_chat`` package; this class is

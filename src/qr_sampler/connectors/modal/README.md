@@ -69,9 +69,19 @@ constants in `app.py`:
 | `google/gemma-4-31b-reasoning` | `google/gemma-3-27b-reasoning-fp8` (or community FP8 conversion) |
 | `Qwen/Qwen-3.6-27B-Reasoning` | `Qwen/Qwen-3-27B-Reasoning-FP8` |
 
-If vLLM lacks a stable tag with B200 + FP8 KV + dual-engine support, pin
-`VLLM_BASE_TAG` in `Dockerfile.vllm` to a nightly known-good commit and
-record the SHA in this section.
+`VLLM_BASE_TAG` is pinned to `v0.17.0` (V1 engine release with
+`AdapterLogitsProcessor`). The Dockerfile layers
+`transformers @ git+...@main` and bumps `huggingface_hub>=0.30.0` on
+top because v0.17.0 ships `transformers<5`, but the `google/gemma-4-31B`
+(gemma-4 GDN) and `Qwen/Qwen3.6-27B` (qwen3_5 GDN) model architectures
+only land in transformers `main` (v5.x). The recipe mirrors
+`createmp-evalsuite/modal_app.py` lines 46-67, which has empirically
+loaded both model families on Modal A100 GPUs.
+
+If you need to roll the pin forward, prefer pinning to a vLLM tag whose
+bundled transformers already knows the model architectures (which removes
+the `--no-deps` override). Until then, bump the SHA pinned at the end of
+the `transformers @ git+...@main` URL when a regression is suspected.
 
 ### 3. First deploy
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from qr_sampler.exceptions import ConfigValidationError
@@ -118,6 +118,22 @@ class QRSamplerConfig(BaseSettings):
         default="system",
         description="Fallback entropy source: 'error', 'system', 'mock_uniform'",
     )
+
+    @field_validator("fallback_mode")
+    @classmethod
+    def _coerce_fallback_mode(cls, v: str) -> str:
+        # Coerce unknown values (typos in QR_FALLBACK_MODE secret, etc.) to
+        # 'system' and emit ONE warning at config-load time. Without this,
+        # build_entropy_source warns per-pipeline at every preinit (the
+        # QR_PREINIT_ENTROPY_SOURCES expansion builds N pipelines).
+        if v not in {"error", "system", "mock_uniform"}:
+            import warnings
+            warnings.warn(
+                f"Unknown fallback_mode {v!r}; coerced to 'system'",
+                stacklevel=2,
+            )
+            return "system"
+        return v
     entropy_source_type: str = Field(
         default="system",
         description="Primary entropy source identifier",

@@ -1,23 +1,50 @@
 # Dockerfile for the Modal-hosted vLLM container that serves
-# Gemma 4 31B Reasoning (FP8) + Qwen 3.6 27B Reasoning (FP8) on one B200.
+# Qwen 3.6 27B on H200 (was B200 pre-2026-05-19 cutover; Gemma 4 31B
+# paused 2026-05-20 — see app.py module docstring).
 #
-# Built once and pushed by `modal deploy deployments/modal/app.py`.
+# Built once and pushed by `modal deploy -m qr_sampler.connectors.modal.app`.
 #
 # Base image notes
 # ----------------
 # The base tag MUST satisfy all of the following:
-#   * Blackwell / B200 CUDA support (CUDA 12.4+ with sm_100 kernels).
-#   * FP8 weight + FP8 KV cache support (vLLM >= 0.6.x with Transformer Engine v2).
-#   * Two `AsyncLLMEngine` siblings in one process (no single-engine assumptions
-#     in the OpenAI-compatible router code path).
-#
-# Pin a concrete tag at deploy time. If no stable tag yet satisfies all three,
-# pin to a nightly known-good commit (see deployments/modal/README.md).
+#   * Hopper / H200 CUDA support (vLLM v0.17.0 ships matching CUDA wheels).
+#   * V1 engine (`AdapterLogitsProcessor`) -- ours plugs in via the
+#     `vllm.logits_processors` entry point.
+#   * Loads Qwen/Qwen3.6-27B (qwen3_5 GDN). The architecture entry only
+#     exists in transformers `main`, which the layer below installs over
+#     the base.
 #
 # Build (Modal does this automatically from `Image.from_dockerfile`):
-#   modal deploy deployments/modal/app.py
+#   modal deploy -m qr_sampler.connectors.modal.app
 
-ARG VLLM_BASE_TAG=v0.6.6
+# vLLM v0.17.0 is the V1 engine release whose bundled transformers still
+# pins <5. The Qwen3.6-27B architecture we need to load (qwen3_5 GDN /
+# Qwen3_5ForConditionalGeneration) requires transformers>=5 (the
+# registration lives on `main`, not in any tagged release yet). We
+# override transformers below with --no-deps so vLLM's other pinned
+# siblings (tokenizers, safetensors, ...) keep their vLLM-validated
+# versions. Recipe mirrors C:/Code/createmp-evalsuite/modal_app.py
+# lines 46-67 which has already proven this combination loads Qwen3.5-9B
+# on Modal (the 27B variant we use has the same model_type=qwen3_5 but
+# adds a vision encoder; if vLLM's V1 ``profile_run`` MM dummy probe
+# proves unsuppressable on the 27B at this version, see the
+# ``vllm.hf.config_probe`` event in modal logs -- it records the HF
+# ``architectures`` + ``has_vision_config`` fields used to triage).
+#
+# Why we reverted v0.21.0 -> v0.17.0 (2026-05-20)
+# -----------------------------------------------
+# The 2026-05-20 bump to v0.21.0 was attempted to pull in Gemma4 support
+# but produced two consecutive cold-start failures: (1) Gemma4 hit
+# ``max_tokens_per_mm_item (2496) > max_num_batched_tokens (2048)``
+# because vLLM's MM auto-config silently dropped our 4096 override; (2)
+# Qwen3.6-27B hit a ``StopIteration`` inside transformers ``Qwen3VLProcessor.
+# get_text_with_replacements`` from V1's unconditional MM dummy probe.
+# Neither knob (``limit_mm_per_prompt`` / ``max_num_batched_tokens``)
+# suppressed the probe. Reverting to v0.17.0 mirrors the
+# createmp-evalsuite-validated recipe; Gemma is paused (see app.py
+# module docstring) until vLLM ships a release with both Gemma4 GDN
+# support AND a workable text-only MM-probe knob.
+ARG VLLM_BASE_TAG=v0.17.0
 FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -48,10 +75,76 @@ COPY src/ ./src/
 # the QRNG gRPC client.
 RUN pip install --no-cache-dir . \
     && pip install --no-cache-dir \
-        "huggingface_hub>=0.24" \
+        "huggingface_hub>=0.30" \
         "fastapi>=0.110" \
         "httpx>=0.27" \
         "grpcio>=1.62"
+
+# --- apt deps for transformers@main + cloudflared sidecar ------------------
+#
+# Single apt layer to keep image size down. `git` is required by the
+# transformers @ main install below — pip's `git+https` schema invokes
+# `git clone` inside the container, and the vllm/vllm-openai base does
+# not ship git. `curl` + `ca-certificates` are needed by the cloudflared
+# .deb download in the next block. Mirrors
+# createmp-evalsuite/modal_app.py line 47 (.apt_install("git")) which is
+# the empirically-proven baseline for the transformers@main layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- transformers main override (qwen3_5 GDN architecture) -----------------
+#
+# vLLM 0.17.0 pins transformers<5 in its wheel, but the qwen3_5 GDN
+# architecture (Qwen3.6-27B) only lands in transformers main (v5.x) --
+# it is not in any tagged release at the time of writing. We install
+# transformers@<pinned-commit> with --no-deps so vLLM's other pinned
+# siblings (tokenizers, safetensors, ...) keep their vLLM-validated
+# versions. Mirrors createmp-evalsuite/modal_app.py lines 64-67 (the
+# empirically proven recipe for the 9B sibling; we use it here for the
+# 27B variant which shares the same model_type).
+#
+# transformers pin: tagged release v5.5.4 (was commit 52b82b2 from main,
+# replaced 2026-05-20 after iteration 1's StopIteration crash).
+# ----------------------------------------------------------------------------
+# Why v5.5.4 over a main commit:
+#   (1) Iteration 1 with commit 52b82b2 crashed inside
+#       ``Qwen3VLProcessor`` at engine init time:
+#         ValueError: Failed to apply Qwen3VLProcessor on
+#         data={'text': '<|vision_start|><|image_pad|><|vision_end|>'}
+#       The dummy generator emitted text-only data (no paired images)
+#       to a processor that requires both. A known transformers
+#       regression on certain main commits; v5.5.x is past it.
+#   (2) Reproducible builds. ``@main`` is a moving target; tagged
+#       releases never drift.
+#   (3) v5.5.4 is the version currently installed in the local dev
+#       venv; using it in the container too keeps deploy and local
+#       smoke-test behaviour aligned.
+#   (4) Per the vLLM Qwen3.6-27B recipe (recipes.vllm.ai/Qwen/
+#       Qwen3.6-27B), the model "works out of the box" with default
+#       MM enabled. With v5.5.4 transformers, that recipe applies to
+#       our deploy too.
+#
+# mistral_common upgrade (>= 1.10):
+#   ``ReasoningEffort`` lands in mistral_common's
+#   ``protocol.instruct.request`` around 1.6+; pinning >=1.10 gives a
+#   comfortable margin without risking incompatibility with vLLM
+#   0.17.0's other consumers. transformers v5.5.4 lazily imports
+#   ``tokenization_mistral_common`` from inside
+#   ``processing_utils.get_possibly_dynamic_module`` while resolving
+#   the ``Qwen3VLProcessor`` class registry -- a code path we cannot
+#   avoid from a vLLM-side knob.
+#
+# huggingface_hub upgrade (>= 0.30):
+#   transformers v5.5.4 requires it.
+RUN pip install --no-cache-dir --no-deps \
+        "transformers==5.5.4" \
+    && pip install --no-cache-dir --upgrade \
+        "huggingface_hub>=0.30.0" \
+        "mistral_common>=1.10"
 
 # --- cloudflared sidecar for QRNG reachability -----------------------------
 #
@@ -70,14 +163,11 @@ RUN pip install --no-cache-dir . \
 # NET_ADMIN capability. Installing from the official .deb (rather than `apt
 # install cloudflared`, which is not in Debian's default repos) keeps us on a
 # pinned-by-URL recent build.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL \
+RUN curl -fsSL \
         https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
         -o /tmp/cloudflared.deb \
     && dpkg -i /tmp/cloudflared.deb \
-    && rm /tmp/cloudflared.deb \
-    && rm -rf /var/lib/apt/lists/*
+    && rm /tmp/cloudflared.deb
 
 # Default qr-sampler configuration. Overridden by the Modal Secret at runtime.
 # The defaults below match the QRNG service (cf. artifacts/qrng.proto):
@@ -99,7 +189,21 @@ ENV QR_ENTROPY_SOURCE_TYPE=quantum_grpc \
     QR_GRPC_MODE=unary \
     QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes \
     QR_GRPC_STREAM_METHOD_PATH= \
-    QR_GRPC_API_KEY_HEADER=api-key
+    QR_GRPC_API_KEY_HEADER=api-key \
+    QR_SAMPLER_BYPASS=0
+
+# 2026-05-21: VLLM_ENABLE_V1_MULTIPROCESSING=0 was previously set here to
+# avoid signal-propagation issues with EngineCore subprocess during
+# Modal's snapshot lifecycle. But empirically this caused every chat
+# completion to fail with "EngineCore encountered an issue. See stack
+# trace (above) for the root cause." — vLLM 0.17.0's V1 engine still
+# spawns EngineCore_DP0 even with this flag set, and the resulting
+# main-process scheduler ends up in a broken sync path that aborts
+# every generation request with no traceback in modal logs. The
+# original signal-propagation issue was already fixed by other Phase H
+# changes (post_restore sequencing in vllm_serve.py). Default value is
+# fine; restore the env var only if "Engine core proc died unexpectedly"
+# resurfaces during cold-start.
 
 # Reset ENTRYPOINT set by vllm/vllm-openai base image so Modal's @modal.enter
 # method controls process start (not `vllm serve`).

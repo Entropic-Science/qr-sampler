@@ -66,9 +66,28 @@ class _RequestState:
         source: The entropy source this request resolved to. Exposed for
             test introspection; production code should treat the pipeline
             as opaque.
+        tokens_generated: Counter incremented once per ``apply()`` call
+            that processed this request. Used to populate the
+            ``entropy.request.completed`` event so an operator can spot
+            "Modal Succeeded but 0 tokens" failure modes (K-5) from the
+            log stream alone.
+        dominant_source_name: Snapshot of ``pipeline.entropy_source.name``
+            at routing time. For the always-primary case this is the
+            actual source used; if a future change switches sources
+            mid-request, this becomes the routing-time hint and the
+            completion event should record the observed dominant.
     """
 
-    __slots__ = ("amplifier", "config", "config_hash_str", "pipeline", "source", "strategy")
+    __slots__ = (
+        "amplifier",
+        "config",
+        "config_hash_str",
+        "dominant_source_name",
+        "pipeline",
+        "source",
+        "strategy",
+        "tokens_generated",
+    )
 
     def __init__(
         self,
@@ -84,6 +103,8 @@ class _RequestState:
         self.strategy = strategy
         self.config_hash_str = config_hash_str
         self.source = pipeline.entropy_source
+        self.tokens_generated = 0
+        self.dominant_source_name = pipeline.entropy_source.name
 
 
 @EngineAdapterRegistry.register("vllm")
@@ -270,22 +291,47 @@ class VLLMAdapter(EngineAdapter):
         """
         return False
 
+    # Process-wide marker so ``[QR-SAMPLER DIAG] validate_params FIRST
+    # CALL`` only fires once per Python process instead of once per
+    # request. The marker is a class attribute (not instance) because
+    # ``validate_params`` is a classmethod.
+    _qr_diag_validate_params_seen: bool = False
+
     @classmethod
     def validate_params(cls, params: Any) -> None:
         """Validate ``qr_*`` keys in ``params.extra_args``.
 
-        Called by vLLM at request creation time to reject bad keys early.
-
-        Args:
-            params: vLLM ``SamplingParams`` object with ``extra_args`` dict.
-
-        Raises:
-            ConfigValidationError: If any ``qr_*`` key is unknown or
-                non-overridable.
+        Wrapped in try/except so that any exception bubbling up to vLLM's
+        request-creation path lands a tagged traceback in the container's
+        stderr. The wrapper is load-bearing for ongoing investigation of
+        the EngineCore 500 cascade documented in
+        ``qr-llm-chat/docs/PHASE_K_STATUS.md`` — without it, the
+        traceback is silently swallowed somewhere between vLLM and
+        Modal's log aggregator.
         """
-        extra_args = getattr(params, "extra_args", None) or {}
-        if extra_args:
-            validate_extra_args(extra_args)
+        import sys as _sys
+        try:
+            extra_args = getattr(params, "extra_args", None) or {}
+            if not cls._qr_diag_validate_params_seen:
+                cls._qr_diag_validate_params_seen = True
+                print(
+                    f"[QR-SAMPLER DIAG] validate_params FIRST CALL: "
+                    f"extra_args_keys="
+                    f"{sorted(extra_args.keys()) if isinstance(extra_args, dict) else type(extra_args).__name__}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+            if extra_args:
+                validate_extra_args(extra_args)
+        except BaseException:
+            import traceback as _tb
+            print(
+                "[QR-SAMPLER DIAG] validate_params RAISED:\n"
+                + "".join(_tb.format_exc()),
+                file=_sys.stderr,
+                flush=True,
+            )
+            raise
 
     def update_state(self, batch_update: Any | None) -> None:
         """Process batch composition changes.
@@ -297,6 +343,28 @@ class VLLMAdapter(EngineAdapter):
             batch_update: A ``BatchUpdate`` with ``removed``, ``moved``,
                 and ``added`` sequences, or ``None`` if no changes.
         """
+        try:
+            self._update_state_impl(batch_update)
+        except BaseException:
+            import sys as _sys
+            import traceback as _tb
+            print(
+                "[QR-SAMPLER DIAG] update_state RAISED:\n"
+                + "".join(_tb.format_exc()),
+                file=_sys.stderr,
+                flush=True,
+            )
+            raise
+
+    def _update_state_impl(self, batch_update: Any | None) -> None:
+        import sys as _sys
+        if not getattr(self, "_qr_diag_update_state_seen", False):
+            self._qr_diag_update_state_seen = True
+            print(
+                f"[QR-SAMPLER DIAG] update_state FIRST CALL: batch_update_type={type(batch_update).__name__}",
+                file=_sys.stderr,
+                flush=True,
+            )
         if batch_update is None:
             return
 
@@ -304,7 +372,23 @@ class VLLMAdapter(EngineAdapter):
         for removed in getattr(batch_update, "removed", []):
             req_idx = removed if isinstance(removed, int) else getattr(removed, "req_index", None)
             if req_idx is not None:
-                self._request_states.pop(req_idx, None)
+                state = self._request_states.pop(req_idx, None)
+                if state is not None:
+                    # Emit a request-boundary event so an operator can spot
+                    # the K-5 failure mode (Modal-reported success with zero
+                    # output) directly from the log stream.
+                    logger.info(
+                        "request %d completed: tokens=%d source=%s",
+                        req_idx,
+                        state.tokens_generated,
+                        state.dominant_source_name,
+                        extra={
+                            "event": "entropy.request.completed",
+                            "req_idx": req_idx,
+                            "tokens_generated": state.tokens_generated,
+                            "dominant_source": state.dominant_source_name,
+                        },
+                    )
 
         # 2. Process moves (index reassignments).
         for moved in getattr(batch_update, "moved", []):
@@ -374,6 +458,29 @@ class VLLMAdapter(EngineAdapter):
                 config_hash_str=hash_str,
             )
 
+            # Emit a single per-request routing event so an operator can
+            # confirm the comparison pipe's per-column extra_args
+            # ("qr_entropy_source_type": "quantum_grpc" vs "system")
+            # actually landed on the matching pipeline. Without this,
+            # K-2-style misconfigurations (Modal Secret silently
+            # overriding the default to "system") silently route every
+            # request to the wrong source.
+            logger.info(
+                "request %d routed: requested=%s resolved=%s preset=%s",
+                req_idx,
+                extra_args.get("qr_entropy_source_type"),
+                target_pipeline.entropy_source.name,
+                extra_args.get("qr_preset"),
+                extra={
+                    "event": "entropy.request.routed",
+                    "req_idx": req_idx,
+                    "requested_source_type": extra_args.get("qr_entropy_source_type"),
+                    "resolved_pipeline_source": target_pipeline.entropy_source.name,
+                    "extra_args_keys": sorted(extra_args.keys()),
+                    "qr_preset": extra_args.get("qr_preset"),
+                },
+            )
+
     def apply(self, logits: Any) -> Any:
         """Run the full sampling pipeline on each row of the logit tensor.
 
@@ -389,6 +496,51 @@ class VLLMAdapter(EngineAdapter):
         Returns:
             The modified logits tensor (in-place).
         """
+        import sys as _sys
+
+        # DIAG: print on first call so we KNOW apply is invoked.
+        if not getattr(self, "_qr_diag_apply_seen", False):
+            self._qr_diag_apply_seen = True
+            try:
+                _shape = getattr(logits, "shape", None)
+                _type = type(logits).__name__
+                _dtype = getattr(logits, "dtype", None)
+            except Exception:
+                _shape = "<err>"; _type = "<err>"; _dtype = "<err>"
+            print(
+                f"[QR-SAMPLER DIAG] apply FIRST CALL: type={_type} shape={_shape} dtype={_dtype}",
+                file=_sys.stderr,
+                flush=True,
+            )
+
+        # BYPASS escape hatch: set QR_SAMPLER_BYPASS=1 in the env to make
+        # apply() a no-op (returns logits unchanged) — useful for isolating
+        # whether our processor or vLLM itself is the cause of an
+        # EngineCore crash. Single-line revert: set the env to 0 or remove
+        # it from the Modal Secret.
+        if os.environ.get("QR_SAMPLER_BYPASS") == "1":
+            if not getattr(self, "_qr_diag_bypass_logged", False):
+                self._qr_diag_bypass_logged = True
+                print(
+                    "[QR-SAMPLER DIAG] QR_SAMPLER_BYPASS=1 -> apply() is a no-op",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+            return logits
+
+        try:
+            return self._apply_impl(logits)
+        except BaseException:
+            import traceback as _tb
+            print(
+                "[QR-SAMPLER DIAG] apply RAISED:\n"
+                + "".join(_tb.format_exc()),
+                file=_sys.stderr,
+                flush=True,
+            )
+            raise
+
+    def _apply_impl(self, logits: Any) -> Any:
         # Determine batch size.
         if hasattr(logits, "shape"):
             num_requests = logits.shape[0] if len(logits.shape) > 1 else 1
@@ -410,6 +562,7 @@ class VLLMAdapter(EngineAdapter):
                 amplifier: SignalAmplifier | None = state.amplifier
                 strategy: TemperatureStrategy | None = state.strategy
                 hash_str: str | None = state.config_hash_str
+                state.tokens_generated += 1
             else:
                 pipeline = self._pipeline
                 req_config = None
