@@ -85,18 +85,12 @@ class TestHVHDriftEMAUpdate:
 class TestHVHDriftFormulas:
     """Formula correctness against V6 reference math."""
 
-    def test_temperature_formula_matches_v6_reference(
-        self, config: QRSamplerConfig
-    ) -> None:
+    def test_temperature_formula_matches_v6_reference(self, config: QRSamplerConfig) -> None:
         # First call: dH = dVH = 0, so the drift terms drop out.
         strategy = HVHDriftStrategy(vocab_size=10)
         logits = np.array([2.0, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5, -2.0])
         h, vh = _entropy_varentropy(logits)
-        expected_raw = (
-            config.hvh_t_base
-            + config.hvh_alpha_h * h
-            + config.hvh_alpha_vh * vh
-        )
+        expected_raw = config.hvh_t_base + config.hvh_alpha_h * h + config.hvh_alpha_vh * vh
         expected_temp = float(np.clip(expected_raw, *_TEMP_CLAMP))
 
         result = strategy.compute_temperature(logits, config)
@@ -113,9 +107,7 @@ class TestHVHDriftFormulas:
         result = strategy.compute_temperature(logits, config)
         assert abs(result.diagnostics["min_p"] - expected_min_p) < 1e-8
 
-    def test_temperature_uses_drift_after_first_call(
-        self, config: QRSamplerConfig
-    ) -> None:
+    def test_temperature_uses_drift_after_first_call(self, config: QRSamplerConfig) -> None:
         strategy = HVHDriftStrategy(vocab_size=10)
         logits_a = np.array([5.0, 0.0, 0.0, 0.0, 0.0])  # peaked
         logits_b = np.zeros(5)  # uniform — high H
@@ -236,9 +228,7 @@ class TestHVHDriftRegistry:
         assert isinstance(strategy, HVHDriftStrategy)
         assert strategy._vocab_size == 4096
 
-    def test_built_instance_computes_temperature(
-        self, config: QRSamplerConfig
-    ) -> None:
+    def test_built_instance_computes_temperature(self, config: QRSamplerConfig) -> None:
         cfg = QRSamplerConfig(
             _env_file=None,  # type: ignore[call-arg]
             temperature_strategy="hvh_drift",
@@ -253,9 +243,7 @@ class TestHVHDriftRegistry:
 class TestHVHDriftIsolation:
     """Per-request state isolation (precondition for adapter lifecycle)."""
 
-    def test_two_instances_have_independent_state(
-        self, config: QRSamplerConfig
-    ) -> None:
+    def test_two_instances_have_independent_state(self, config: QRSamplerConfig) -> None:
         a = HVHDriftStrategy(vocab_size=10)
         b = HVHDriftStrategy(vocab_size=10)
         # Drive instance A with 10 different distributions.
@@ -272,9 +260,7 @@ class TestHVHDriftIsolation:
         assert a._first_call is False
         assert b._first_call is False  # b called once
 
-    def test_result_is_frozen(
-        self, strategy: HVHDriftStrategy, config: QRSamplerConfig
-    ) -> None:
+    def test_result_is_frozen(self, strategy: HVHDriftStrategy, config: QRSamplerConfig) -> None:
         logits = np.array([1.0, 0.0])
         result = strategy.compute_temperature(logits, config)
         with pytest.raises(AttributeError):

@@ -66,9 +66,7 @@ class HVHDriftStrategy(TemperatureStrategy):
         self.VH_ema: float = 0.0
         self._first_call: bool = True
 
-    def compute_temperature(
-        self, logits: np.ndarray, config: QRSamplerConfig
-    ) -> TemperatureResult:
+    def compute_temperature(self, logits: np.ndarray, config: QRSamplerConfig) -> TemperatureResult:
         """Compute temperature and min-p from current logits + EMA state.
 
         Args:

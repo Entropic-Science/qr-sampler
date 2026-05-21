@@ -34,6 +34,20 @@ from qr_sampler.engines.registry import EngineAdapterRegistry
 from qr_sampler.exceptions import ConfigValidationError
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
+# Formal V1 LogitsProcessor base.
+# vLLM 0.17.0 entry-point discovery validates plugins via issubclass against
+# vllm.v1.sample.logits_processor.LogitsProcessor. Duck-typing alone passes
+# attribute checks but fails the isinstance/issubclass gate. In dev / test
+# environments vLLM is not installed, so we fall back to ``object`` — the
+# module must still import cleanly there because EngineAdapterRegistry pulls
+# it in unconditionally.
+try:
+    from vllm.v1.sample.logits_processor import (
+        LogitsProcessor as _VLLMLogitsProcessorBase,
+    )
+except ImportError:  # pragma: no cover - exercised only outside Modal
+    _VLLMLogitsProcessorBase = object  # type: ignore[assignment,misc]
+
 if TYPE_CHECKING:
     from qr_sampler.amplification.base import SignalAmplifier
     from qr_sampler.logging.logger import SamplingLogger
@@ -108,9 +122,15 @@ class _RequestState:
 
 
 @EngineAdapterRegistry.register("vllm")
-class VLLMAdapter(EngineAdapter):
+class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
     """vLLM V1 LogitsProcessor that replaces token sampling with
     external-entropy-driven selection.
+
+    Formally subclasses ``vllm.v1.sample.logits_processor.LogitsProcessor``
+    when vLLM is importable (the Modal runtime path); falls back to a
+    plain object base in dev/test environments where vLLM is unavailable.
+    The dual base list keeps ``EngineAdapter``'s ABC contract first so
+    its abstractmethod checks still apply.
 
     The adapter manages vLLM-specific concerns (batch state, tensor
     conversion, one-hot forcing) and delegates all sampling logic to
@@ -310,14 +330,18 @@ class VLLMAdapter(EngineAdapter):
         Modal's log aggregator.
         """
         import sys as _sys
+
         try:
             extra_args = getattr(params, "extra_args", None) or {}
             if not cls._qr_diag_validate_params_seen:
                 cls._qr_diag_validate_params_seen = True
+                _keys = (
+                    sorted(extra_args.keys())
+                    if isinstance(extra_args, dict)
+                    else type(extra_args).__name__
+                )
                 print(
-                    f"[QR-SAMPLER DIAG] validate_params FIRST CALL: "
-                    f"extra_args_keys="
-                    f"{sorted(extra_args.keys()) if isinstance(extra_args, dict) else type(extra_args).__name__}",
+                    f"[QR-SAMPLER DIAG] validate_params FIRST CALL: extra_args_keys={_keys}",
                     file=_sys.stderr,
                     flush=True,
                 )
@@ -325,9 +349,9 @@ class VLLMAdapter(EngineAdapter):
                 validate_extra_args(extra_args)
         except BaseException:
             import traceback as _tb
+
             print(
-                "[QR-SAMPLER DIAG] validate_params RAISED:\n"
-                + "".join(_tb.format_exc()),
+                "[QR-SAMPLER DIAG] validate_params RAISED:\n" + "".join(_tb.format_exc()),
                 file=_sys.stderr,
                 flush=True,
             )
@@ -348,9 +372,9 @@ class VLLMAdapter(EngineAdapter):
         except BaseException:
             import sys as _sys
             import traceback as _tb
+
             print(
-                "[QR-SAMPLER DIAG] update_state RAISED:\n"
-                + "".join(_tb.format_exc()),
+                "[QR-SAMPLER DIAG] update_state RAISED:\n" + "".join(_tb.format_exc()),
                 file=_sys.stderr,
                 flush=True,
             )
@@ -358,10 +382,12 @@ class VLLMAdapter(EngineAdapter):
 
     def _update_state_impl(self, batch_update: Any | None) -> None:
         import sys as _sys
+
         if not getattr(self, "_qr_diag_update_state_seen", False):
             self._qr_diag_update_state_seen = True
+            _bu_type = type(batch_update).__name__
             print(
-                f"[QR-SAMPLER DIAG] update_state FIRST CALL: batch_update_type={type(batch_update).__name__}",
+                f"[QR-SAMPLER DIAG] update_state FIRST CALL: batch_update_type={_bu_type}",
                 file=_sys.stderr,
                 flush=True,
             )
@@ -506,7 +532,9 @@ class VLLMAdapter(EngineAdapter):
                 _type = type(logits).__name__
                 _dtype = getattr(logits, "dtype", None)
             except Exception:
-                _shape = "<err>"; _type = "<err>"; _dtype = "<err>"
+                _shape = "<err>"
+                _type = "<err>"
+                _dtype = "<err>"
             print(
                 f"[QR-SAMPLER DIAG] apply FIRST CALL: type={_type} shape={_shape} dtype={_dtype}",
                 file=_sys.stderr,
@@ -532,9 +560,9 @@ class VLLMAdapter(EngineAdapter):
             return self._apply_impl(logits)
         except BaseException:
             import traceback as _tb
+
             print(
-                "[QR-SAMPLER DIAG] apply RAISED:\n"
-                + "".join(_tb.format_exc()),
+                "[QR-SAMPLER DIAG] apply RAISED:\n" + "".join(_tb.format_exc()),
                 file=_sys.stderr,
                 flush=True,
             )
@@ -678,3 +706,38 @@ class VLLMAdapter(EngineAdapter):
                 continue
             seen.add(id(pipeline))
             pipeline.close()
+
+
+# Phase 2 R3: hoist the MM-probe monkey-patch to module-import side effect.
+#
+# vLLM 0.17.0 V1's profile_run runs a multimodal dummy probe unconditionally
+# for HF models with a populated vision_config (Qwen3.5-9B + Qwen3.6-27B),
+# crashing in transformers.get_text_with_replacements with StopIteration. The
+# patch lives in qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch
+# but Phase 2's _start_and_sleep launches ``vllm serve`` as a subprocess that
+# does NOT execute that module — it would only fire if someone ran
+# ``python -m qr_sampler.connectors.modal.vllm_serve`` (the legacy entrypoint).
+#
+# The subprocess DOES, however, discover this LogitsProcessor via the
+# ``vllm.logits_processors`` entry-point, which causes vLLM to import
+# qr_sampler.processor → qr_sampler.engines.vllm (this module). Calling
+# ``_install_mm_probe_skip_patch()`` here makes the patch a guaranteed side
+# effect of plugin discovery — exactly when we need it, before profile_run.
+#
+# Guarded by try/except so non-Modal contexts (dev/test where vllm and/or
+# obs.* are unavailable) still import this module cleanly. The helper itself
+# is idempotent and gracefully no-ops if vllm.v1.worker.gpu_model_runner is
+# not importable.
+try:
+    from qr_sampler.connectors.modal.vllm_serve import (
+        _install_mm_probe_skip_patch as _qr_install_mm_probe_skip_patch,
+    )
+
+    _qr_install_mm_probe_skip_patch()
+except Exception:
+    # Any failure here (missing obs.*, missing vllm, missing connectors.modal,
+    # syntax error in a transitively-imported module) MUST NOT break LP
+    # discovery. The patch is defence-in-depth; the absence of a
+    # ``vllm.mm.probe_skipped`` event in cold-start logs is the canary the
+    # operator should watch.
+    pass

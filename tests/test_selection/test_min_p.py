@@ -69,18 +69,14 @@ class TestZeroMinPIsNoop:
 class TestThreshold:
     """The min-p threshold removes tokens with prob < min_p * top_prob."""
 
-    def test_threshold_removes_mass_below_min_p_times_top(
-        self, selector: TokenSelector
-    ) -> None:
+    def test_threshold_removes_mass_below_min_p_times_top(self, selector: TokenSelector) -> None:
         """probs=[0.5, 0.25, 0.15, 0.1], min_p=0.5 -> threshold 0.25 keeps first two."""
         probs = np.array([0.5, 0.25, 0.15, 0.1])
         logits = _logits_from_probs(probs)
 
         # u=0.999 should select the LAST surviving token (rank 1 after masking,
         # since only 2 tokens survive: 0.5 and 0.25 -> renormalized to ~0.667/0.333).
-        result = selector.select(
-            logits, temperature=1.0, top_k=0, top_p=1.0, u=0.999, min_p=0.5
-        )
+        result = selector.select(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.999, min_p=0.5)
 
         assert result.diagnostics["effective_min_p_candidates"] == 2
         assert result.diagnostics["min_p_used"] == 0.5
@@ -107,9 +103,7 @@ class TestThreshold:
         assert result_probs[4] == 0.0
 
         # End-to-end: diagnostics report the correct count for the selector call.
-        e2e = selector.select(
-            logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5, min_p=0.4
-        )
+        e2e = selector.select(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5, min_p=0.4)
         assert e2e.diagnostics["effective_min_p_candidates"] == 2
 
     def test_all_masked_fallback_keeps_argmax(self, selector: TokenSelector) -> None:
@@ -119,9 +113,7 @@ class TestThreshold:
         logits = _logits_from_probs(probs)
 
         # min_p=1.0 means threshold = 0.5 (max). Only token 0 exactly meets it.
-        result = selector.select(
-            logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5, min_p=1.0
-        )
+        result = selector.select(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5, min_p=1.0)
         assert result.token_id == 0
         assert result.diagnostics["effective_min_p_candidates"] == 1
         assert result.num_candidates == 1
@@ -166,18 +158,14 @@ class TestPipelineOrder:
         #   step 5 (top-p=0.5): cumulative >= 0.5 hits at idx 0 (0.6) -> single
         #     survivor with renormalized prob 1.0
         #   any u in (0,1) selects token 0.
-        result = selector.select(
-            logits, temperature=1.0, top_k=0, top_p=0.5, u=0.7, min_p=0.5
-        )
+        result = selector.select(logits, temperature=1.0, top_k=0, top_p=0.5, u=0.7, min_p=0.5)
         assert result.token_id == 0
         assert result.num_candidates == 1
 
         # Without min-p (top-p only): probs [0.45, 0.30, 0.15, 0.10], top_p=0.5
         # cumulative >= 0.5 hits at idx 1 (0.75) -> survivors [0.45, 0.30] renormalized
         # to [0.6, 0.4]. u=0.7 lands past the first CDF bin (0.6) so token 1 wins.
-        result_no_minp = selector.select(
-            logits, temperature=1.0, top_k=0, top_p=0.5, u=0.7
-        )
+        result_no_minp = selector.select(logits, temperature=1.0, top_k=0, top_p=0.5, u=0.7)
         assert result_no_minp.token_id == 1
         assert result_no_minp.num_candidates == 2
 
@@ -190,9 +178,7 @@ class TestDiagnostics:
 
     def test_diagnostics_include_min_p_keys(self, selector: TokenSelector) -> None:
         logits = np.array([5.0, 4.0, 3.0, 2.0, 1.0])
-        result = selector.select(
-            logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5, min_p=0.0
-        )
+        result = selector.select(logits, temperature=1.0, top_k=0, top_p=1.0, u=0.5, min_p=0.0)
         assert "effective_min_p_candidates" in result.diagnostics
         assert "min_p_used" in result.diagnostics
         assert result.diagnostics["min_p_used"] == 0.0

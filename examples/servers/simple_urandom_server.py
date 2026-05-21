@@ -48,8 +48,8 @@ _SRC_DIR = os.path.join(_REPO_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from qr_sampler.proto.entropy_service_pb2 import EntropyResponse
-from qr_sampler.proto.entropy_service_pb2_grpc import (
+from qr_sampler.proto.entropy_service_pb2 import EntropyResponse  # noqa: E402
+from qr_sampler.proto.entropy_service_pb2_grpc import (  # noqa: E402
     EntropyServiceServicer,
     add_EntropyServiceServicer_to_server,
 )
@@ -159,8 +159,7 @@ def serve(address: str, max_workers: int, reflection: bool) -> None:
             logger.info("gRPC reflection enabled")
         except ImportError:
             logger.warning(
-                "grpc-reflection not installed. "
-                "Install with: pip install grpcio-reflection"
+                "grpc-reflection not installed. Install with: pip install grpcio-reflection"
             )
 
     server.add_insecure_port(address)
@@ -217,7 +216,8 @@ Examples:
         help="Enable gRPC server reflection for debugging.",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable debug logging.",
     )

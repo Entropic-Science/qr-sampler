@@ -329,9 +329,7 @@ class _StaticTempStrategy(TemperatureStrategy):
         self._temperature = temperature
         self._diagnostics = diagnostics
 
-    def compute_temperature(
-        self, logits: np.ndarray, config: QRSamplerConfig
-    ) -> TemperatureResult:
+    def compute_temperature(self, logits: np.ndarray, config: QRSamplerConfig) -> TemperatureResult:
         return TemperatureResult(
             temperature=self._temperature,
             shannon_entropy=1.0,

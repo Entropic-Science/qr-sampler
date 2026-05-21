@@ -144,8 +144,7 @@ class FallbackEntropySource(EntropySource):
         self._currently_degraded = True
 
         logger.warning(
-            "entropy.degraded: primary source %r unavailable (n=%d, err=%r); "
-            "falling back to %r",
+            "entropy.degraded: primary source %r unavailable (n=%d, err=%r); falling back to %r",
             self._primary.name,
             n,
             str(exc),

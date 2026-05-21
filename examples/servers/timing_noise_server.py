@@ -41,8 +41,8 @@ _SRC_DIR = os.path.join(_REPO_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from qr_sampler.proto.entropy_service_pb2 import EntropyResponse
-from qr_sampler.proto.entropy_service_pb2_grpc import (
+from qr_sampler.proto.entropy_service_pb2 import EntropyResponse  # noqa: E402
+from qr_sampler.proto.entropy_service_pb2_grpc import (  # noqa: E402
     EntropyServiceServicer,
     add_EntropyServiceServicer_to_server,
 )
@@ -165,9 +165,7 @@ def serve(address: str, max_workers: int, hash_iterations: int) -> None:
     logger.info("Timing-noise entropy server listening on %s", address)
     logger.info("Device ID: %s", _DEVICE_ID)
     logger.info("Hash iterations per measurement: %d", hash_iterations)
-    logger.warning(
-        "This source is EXPERIMENTAL. Timing jitter is not quantum-random!"
-    )
+    logger.warning("This source is EXPERIMENTAL. Timing jitter is not quantum-random!")
     logger.info("Press Ctrl+C to stop")
 
     def _shutdown(signum, frame):
@@ -196,23 +194,33 @@ Examples:
 """,
     )
     parser.add_argument(
-        "--port", type=int, default=50051,
+        "--port",
+        type=int,
+        default=50051,
         help="Port to listen on (default: 50051).",
     )
     parser.add_argument(
-        "--address", type=str, default=None,
+        "--address",
+        type=str,
+        default=None,
         help="Full bind address (overrides --port).",
     )
     parser.add_argument(
-        "--max-workers", type=int, default=4,
+        "--max-workers",
+        type=int,
+        default=4,
         help="Thread pool size (default: 4).",
     )
     parser.add_argument(
-        "--hash-iterations", type=int, default=64,
+        "--hash-iterations",
+        type=int,
+        default=64,
         help="SHA-256 iterations per timing measurement (default: 64).",
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true",
+        "--verbose",
+        "-v",
+        action="store_true",
         help="Enable debug logging.",
     )
     args = parser.parse_args()

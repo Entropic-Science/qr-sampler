@@ -40,6 +40,5 @@ def test_every_yaml_preset_has_builtin_entry(loader: ProfileLoader) -> None:
     yaml_ids = {p.id for p in loader.list_presets()}
     builtin_ids = set(BUILTIN_PRESETS.keys())
     assert yaml_ids == builtin_ids, (
-        f"YAML preset ids {yaml_ids} do not match BUILTIN_PRESETS "
-        f"ids {builtin_ids}"
+        f"YAML preset ids {yaml_ids} do not match BUILTIN_PRESETS ids {builtin_ids}"
     )

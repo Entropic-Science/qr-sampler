@@ -102,7 +102,7 @@ class CloudflaredConfig:
     startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S
 
     @classmethod
-    def from_env(cls) -> "CloudflaredConfig":
+    def from_env(cls) -> CloudflaredConfig:
         """Build a config from QRNG_TUNNEL_HOSTNAME / CF_ACCESS_CLIENT_*.
 
         Reads:
@@ -164,9 +164,7 @@ class CloudflaredSidecar:
     def __init__(self, config: CloudflaredConfig) -> None:
         self._config = config
         self._proc: subprocess.Popen[str] | None = None
-        self._stderr_tail: collections.deque[str] = collections.deque(
-            maxlen=_STDERR_TAIL_LINES
-        )
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=_STDERR_TAIL_LINES)
         self._stderr_thread: threading.Thread | None = None
 
     @property
@@ -302,8 +300,7 @@ class CloudflaredSidecar:
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 logger.error(
-                    "cloudflared.stop: process refused to die after SIGKILL "
-                    "(pid=%s); leaking",
+                    "cloudflared.stop: process refused to die after SIGKILL (pid=%s); leaking",
                     proc.pid,
                 )
 
@@ -317,9 +314,7 @@ class CloudflaredSidecar:
             # Surface that immediately rather than waiting out the timeout.
             if self._proc.poll() is not None:
                 raise CloudflaredStartupError(
-                    self._exit_diagnostic(
-                        prefix="cloudflared exited before its listener came up"
-                    )
+                    self._exit_diagnostic(prefix="cloudflared exited before its listener came up")
                 )
             try:
                 with socket.create_connection(
@@ -371,9 +366,7 @@ class CloudflaredSidecar:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    def _exit_diagnostic(
-        self, *, prefix: str, tail_exc: OSError | None = None
-    ) -> str:
+    def _exit_diagnostic(self, *, prefix: str, tail_exc: OSError | None = None) -> str:
         """Build the operator-facing error message for startup failures."""
         proc = self._proc
         rc = proc.returncode if proc is not None else "<unknown>"

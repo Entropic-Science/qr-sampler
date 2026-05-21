@@ -1,3 +1,4 @@
+# ruff: noqa: E501  -- OWUI metadata header (line 7 `description:`) must be a single line per OWUI's manifest parser
 """
 title: QR-Sampler Parameters
 author: qr-sampler
@@ -753,9 +754,7 @@ class Filter:
 
         metadata = body.get("metadata") or {}
         chat_id = metadata.get("chat_id")
-        dedup_key = (
-            chat_id if isinstance(chat_id, str) and chat_id else _DEFAULT_REQUEST_KEY
-        )
+        dedup_key = chat_id if isinstance(chat_id, str) and chat_id else _DEFAULT_REQUEST_KEY
         if dedup_key in self._fallback_warned:
             return
 

@@ -9,14 +9,14 @@ from qr_sampler.cli.main import cli
 
 # V6_HVD_R01_01 hyperparameters that must appear in info output.
 V6_HYPERPARAM_VALUES = [
-    "1.35",   # hvh_t_base
-    "0.3",    # hvh_alpha_h
-    "-0.2",   # hvh_alpha_vh
-    "1.0",    # hvh_gamma_dh
-    "0.5",    # hvh_delta_dvh
-    "0.02",   # hvh_lambda_ema (also hvh_nu_dh)
+    "1.35",  # hvh_t_base
+    "0.3",  # hvh_alpha_h
+    "-0.2",  # hvh_alpha_vh
+    "1.0",  # hvh_gamma_dh
+    "0.5",  # hvh_delta_dvh
+    "0.02",  # hvh_lambda_ema (also hvh_nu_dh)
     "0.025",  # hvh_min_p_base
-    "0.03",   # hvh_kappa_h
+    "0.03",  # hvh_kappa_h
 ]
 
 

@@ -128,12 +128,14 @@ class QRSamplerConfig(BaseSettings):
         # QR_PREINIT_ENTROPY_SOURCES expansion builds N pipelines).
         if v not in {"error", "system", "mock_uniform"}:
             import warnings
+
             warnings.warn(
                 f"Unknown fallback_mode {v!r}; coerced to 'system'",
                 stacklevel=2,
             )
             return "system"
         return v
+
     entropy_source_type: str = Field(
         default="system",
         description="Primary entropy source identifier",

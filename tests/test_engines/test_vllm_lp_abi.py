@@ -37,6 +37,33 @@ def test_processor_alias_matches_adapter() -> None:
     assert QRSamplerLogitsProcessor is VLLMAdapter
 
 
+def test_formal_inheritance_from_vllm_lp_base_when_available() -> None:
+    """``VLLMAdapter`` formally inherits from vLLM's V1 LogitsProcessor.
+
+    Phase 2 R1: vLLM 0.17.0 entry-point discovery validates plugins via
+    ``issubclass`` checks, not duck-typing. The ``try/except ImportError``
+    shim in ``qr_sampler.engines.vllm`` makes the formal base available
+    inside Modal containers (where vLLM IS installed) while falling back
+    to ``object`` in dev/test environments (where vLLM is NOT installed).
+
+    This test asserts the formal-inheritance pathway in BOTH branches:
+    - If vLLM is importable, ``VLLMAdapter`` MUST subclass the real base.
+    - If vLLM is not importable, ``VLLMAdapter`` still loads (asserted
+      by the file-level ``from qr_sampler.engines.vllm import
+      VLLMAdapter``), proving the shim works.
+    """
+    try:
+        from vllm.v1.sample.logits_processor import LogitsProcessor
+
+        assert issubclass(VLLMAdapter, LogitsProcessor), (
+            "VLLMAdapter must subclass vllm.v1.sample.logits_processor."
+            "LogitsProcessor when vLLM is installed (entry-point discovery "
+            "uses issubclass, not duck-typing)."
+        )
+    except ImportError:
+        pytest.skip("vLLM not installed in this environment — shim path verified by import success")
+
+
 def test_required_methods_present() -> None:
     """Every method ``vllm serve`` calls on a V1 LP exists on the class."""
     required = ("apply", "update_state", "validate_params", "is_argmax_invariant")

@@ -688,9 +688,7 @@ class TestInletPresetInjection:
         # qr_* params land under vllm_xargs (vLLM 0.17.0 strict schema).
         assert result["vllm_xargs"]["qr_preset"] == "normal_t1"
 
-    def test_preset_selection_skips_qr_fields(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_preset_selection_skips_qr_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import asyncio
 
         flt = _patched_filter(monkeypatch, self._ok_preflight_handler())
@@ -723,9 +721,7 @@ class TestInletPresetInjection:
 
         assert result["vllm_xargs"]["qr_preset"] == "normal_t1"
 
-    def test_no_user_valves_uses_admin_qr_fields(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_user_valves_uses_admin_qr_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Legacy admin-driven path: no preset selected -> admin Valves project to qr_*."""
         import asyncio
 

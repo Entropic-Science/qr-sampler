@@ -46,7 +46,7 @@ logger = logging.getLogger("qr_sampler")
 # return a listening socket within ``_PREPROBE_TIMEOUT_S``, we raise
 # ``EntropyUnavailableError`` immediately and back off for
 # ``_PREPROBE_BACKOFF_S`` before probing again. This converts a ~15 s
-# (3 retries × ~5 s timeout) "QRNG unreachable" event into a ~500 ms one,
+# (3 retries x ~5 s timeout) "QRNG unreachable" event into a ~500 ms one,
 # which keeps the OWUI / httpx streaming client well inside its read budget
 # and lets the FallbackEntropySource take over before the user-facing
 # request times out.

@@ -43,15 +43,10 @@ from __future__ import annotations
 
 import hmac
 import os
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-
-if TYPE_CHECKING:
-    # vllm is only available inside the GPU container at runtime.
-    from vllm.engine.async_llm_engine import AsyncLLMEngine
-
 
 _DEFAULT_MAX_MODEL_LEN = 65536
 _DEFAULT_GPU_MEMORY_UTILIZATION = 0.90
@@ -69,22 +64,24 @@ _DEFAULT_GPU_MEMORY_UTILIZATION = 0.90
 # ``"system"`` (6 chars, matching the per-Dockerfile default of
 # ``"quantum_grpc"`` purely by coincidence on character count). Putting
 # the value inline turns a multi-hour investigation into a one-line read.
-_SECRET_DIAG_VALUE_DISCLOSURE_ALLOWLIST: frozenset[str] = frozenset({
-    "QR_ENTROPY_SOURCE_TYPE",
-    "QR_PREINIT_ENTROPY_SOURCES",
-    "QR_FALLBACK_MODE",
-    "QR_SAMPLE_COUNT",
-    "QR_GRPC_SERVER_ADDRESS",
-    "QR_GRPC_MODE",
-    "QR_GRPC_METHOD_PATH",
-    "QR_GRPC_API_KEY_HEADER",
-    "QR_MAX_MODEL_LEN",
-    "QR_GPU_MEMORY_UTILIZATION",
-    "VLLM_MAX_MODEL_LEN",
-    "VLLM_GPU_MEMORY_UTILIZATION",
-    "QRNG_TUNNEL_HOSTNAME",
-    "ALLOW_UNAUTHENTICATED_INFERENCE",
-})
+_SECRET_DIAG_VALUE_DISCLOSURE_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "QR_ENTROPY_SOURCE_TYPE",
+        "QR_PREINIT_ENTROPY_SOURCES",
+        "QR_FALLBACK_MODE",
+        "QR_SAMPLE_COUNT",
+        "QR_GRPC_SERVER_ADDRESS",
+        "QR_GRPC_MODE",
+        "QR_GRPC_METHOD_PATH",
+        "QR_GRPC_API_KEY_HEADER",
+        "QR_MAX_MODEL_LEN",
+        "QR_GPU_MEMORY_UTILIZATION",
+        "VLLM_MAX_MODEL_LEN",
+        "VLLM_GPU_MEMORY_UTILIZATION",
+        "QRNG_TUNNEL_HOSTNAME",
+        "ALLOW_UNAUTHENTICATED_INFERENCE",
+    }
+)
 
 # Env vars expected at vLLM-container runtime, grouped by purpose. The
 # diagnostic helper below logs presence/absence; values are disclosed for
@@ -231,14 +228,13 @@ def _install_mm_probe_skip_patch() -> None:
     """
     from obs.events import VLLM_MM_PROBE_ATTEMPTED, VLLM_MM_PROBE_SKIPPED
     from obs.logging import get_logger
+
     log = get_logger("qr_sampler.modal.vllm_serve.mm_probe_patch")
 
     try:
         import vllm.v1.worker.gpu_model_runner as _gmr
     except ImportError:
-        log.warning(
-            "vllm.v1.worker.gpu_model_runner not importable; MM-probe patch skipped"
-        )
+        log.warning("vllm.v1.worker.gpu_model_runner not importable; MM-probe patch skipped")
         return
 
     if getattr(_gmr.GPUModelRunner.profile_run, "_qr_patched", False):
@@ -315,8 +311,11 @@ async def build_engine(
         VLLM_MODEL_LOAD_START,
     )
     from obs.logging import get_logger
-
     from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.engine.async_llm_engine import (
+        AsyncLLMEngine,  # noqa: F401  -- kept for type-checking imports
+    )
+
     # vLLM 0.17.0 uses V1 by default. The V1 OpenAI server's
     # init_app_state expects an ``AsyncLLM`` (vllm.v1.engine.async_llm),
     # NOT the V0 ``AsyncLLMEngine``. Passing V0 here causes
@@ -327,7 +326,6 @@ async def build_engine(
     # serving layer raises ``EngineDeadError`` at request start
     # without ever invoking the engine. Use AsyncLLM for V1.
     from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.engine.async_llm_engine import AsyncLLMEngine  # noqa: F401  -- kept for type-checking imports
 
     log = get_logger(f"qr_sampler.modal.vllm_serve.{served_model_name}")
 
@@ -345,8 +343,7 @@ async def build_engine(
         vc = getattr(hf_cfg, "vision_config", None)
         has_vision = vc is not None
         log.info(
-            "HF AutoConfig probe for %s: model_type=%s architectures=%s "
-            "has_vision_config=%s",
+            "HF AutoConfig probe for %s: model_type=%s architectures=%s has_vision_config=%s",
             hf_repo_id,
             getattr(hf_cfg, "model_type", "?"),
             architectures,
@@ -357,13 +354,11 @@ async def build_engine(
                 "model_type": getattr(hf_cfg, "model_type", None),
                 "architectures": architectures,
                 "has_vision_config": has_vision,
-                "max_position_embeddings": getattr(
-                    hf_cfg, "max_position_embeddings", None
-                ),
+                "max_position_embeddings": getattr(hf_cfg, "max_position_embeddings", None),
                 "probe_error": None,
             },
         )
-    except Exception as err:  # noqa: BLE001 -- probe must never block build
+    except Exception as err:
         log.warning(
             "HF AutoConfig probe failed for %s: %s: %s",
             hf_repo_id,
@@ -445,7 +440,7 @@ async def build_engine(
         # reports True even with subprocess clearly alive); needs deeper
         # vLLM-level investigation. See goofy-cooking-badger.md.
         engine = AsyncLLM.from_engine_args(engine_args)
-    except BaseException as err:  # noqa: BLE001 -- any failure must surface
+    except BaseException as err:
         duration_ms = (time.perf_counter() - t0) * 1000.0
         tb_text = "".join(_tb.format_exception(type(err), err, err.__traceback__))
         tb_tail = "\n".join(tb_text.splitlines()[-30:])
@@ -475,7 +470,7 @@ async def build_engine(
         model_cfg = await engine.get_model_config()
         model_dtype = str(getattr(model_cfg, "dtype", "?"))
         model_max_len = int(getattr(model_cfg, "max_model_len", max_model_len))
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         model_dtype = f"<unavailable: {type(err).__name__}>"
         model_max_len = max_model_len
 
@@ -525,7 +520,7 @@ async def build_engine(
                 "served_model_name": served_model_name,
             },
         )
-    except Exception as exc:  # noqa: BLE001 -- commit is best-effort
+    except Exception as exc:
         log.warning(
             "vllm-cache volume commit failed: %s: %s",
             type(exc).__name__,
@@ -626,8 +621,11 @@ async def build_app(served_model_name: str, hf_repo_id: str, engine: Any) -> Fas
     vLLM releases.
     """
     from argparse import Namespace as _Namespace  # noqa: F401 -- typing only
+
     from vllm.entrypoints.openai.api_server import (
         build_app as _vllm_build_app,
+    )
+    from vllm.entrypoints.openai.api_server import (
         init_app_state as _vllm_init_app_state,
     )
     from vllm.entrypoints.openai.cli_args import make_arg_parser
@@ -637,8 +635,10 @@ async def build_app(served_model_name: str, hf_repo_id: str, engine: Any) -> Fas
     parser = make_arg_parser(parser)
     args = parser.parse_args(
         [
-            "--model", hf_repo_id,
-            "--served-model-name", served_model_name,
+            "--model",
+            hf_repo_id,
+            "--served-model-name",
+            served_model_name,
         ]
     )
 
@@ -663,7 +663,12 @@ async def build_app(served_model_name: str, hf_repo_id: str, engine: Any) -> Fas
     # (header check + pass-through OR short-circuit JSON) this is a
     # 15-line implementation with no streaming surface to break.
     from starlette.middleware import Middleware
-    from starlette.types import ASGIApp, Receive, Scope, Send
+    from starlette.types import (  # noqa: TC002 -- local-scope import beside runtime Middleware import
+        ASGIApp,
+        Receive,
+        Scope,
+        Send,
+    )
 
     class _QrBearerTokenGate:
         def __init__(self, app: ASGIApp) -> None:
@@ -815,7 +820,7 @@ async def build_app(served_model_name: str, hf_repo_id: str, engine: Any) -> Fas
                     rpc_error = f"short read: got {bytes_received} bytes, expected 16"
             finally:
                 src.close()
-        except Exception as err:  # noqa: BLE001 — probe must always return 200
+        except Exception as err:
             rpc_error = f"{type(err).__name__}: {err}"
 
         if rpc_ok:
@@ -842,9 +847,7 @@ async def build_app(served_model_name: str, hf_repo_id: str, engine: Any) -> Fas
     return app
 
 
-async def build_dispatcher_for(
-    served_model_name: str, hf_repo_id: str
-) -> FastAPI:
+async def build_dispatcher_for(served_model_name: str, hf_repo_id: str) -> FastAPI:
     """Build a single-model engine + ASGI app. Called by each per-model
     @app.cls's ``load()`` method inside ``@modal.enter(snap=True)``.
 
@@ -883,7 +886,7 @@ async def build_dispatcher_for(
     for legacy in ("VLLM_MAX_MODEL_LEN", "VLLM_GPU_MEMORY_UTILIZATION"):
         val = os.environ.pop(legacy, None)
         if val is not None:
-            qr_name = "QR_" + legacy[len("VLLM_"):]
+            qr_name = "QR_" + legacy[len("VLLM_") :]
             # Explicit `in` check — `os.environ.setdefault(...) is val` is
             # NOT a reliable "did we insert" signal because os._Environ
             # re-decodes the string on every read, so the returned object
@@ -941,17 +944,17 @@ async def build_dispatcher_for(
     vllm_mml_raw = os.environ.get("VLLM_MAX_MODEL_LEN")
     max_model_len = int(qr_mml_raw or vllm_mml_raw or _DEFAULT_MAX_MODEL_LEN)
     max_model_len_source = (
-        "QR_MAX_MODEL_LEN" if qr_mml_raw
-        else "VLLM_MAX_MODEL_LEN" if vllm_mml_raw
-        else "default"
+        "QR_MAX_MODEL_LEN" if qr_mml_raw else "VLLM_MAX_MODEL_LEN" if vllm_mml_raw else "default"
     )
 
     qr_gmu_raw = os.environ.get("QR_GPU_MEMORY_UTILIZATION")
     vllm_gmu_raw = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION")
     gpu_mem = float(qr_gmu_raw or vllm_gmu_raw or _DEFAULT_GPU_MEMORY_UTILIZATION)
     gpu_mem_source = (
-        "QR_GPU_MEMORY_UTILIZATION" if qr_gmu_raw
-        else "VLLM_GPU_MEMORY_UTILIZATION" if vllm_gmu_raw
+        "QR_GPU_MEMORY_UTILIZATION"
+        if qr_gmu_raw
+        else "VLLM_GPU_MEMORY_UTILIZATION"
+        if vllm_gmu_raw
         else "default"
     )
 

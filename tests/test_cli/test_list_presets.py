@@ -24,9 +24,7 @@ class TestListPresets:
         assert "creative_sampling" in result.output
         assert "normal_t1" in result.output
 
-    def test_experimental_flag_only_on_creative_sampling(
-        self, runner: CliRunner
-    ) -> None:
+    def test_experimental_flag_only_on_creative_sampling(self, runner: CliRunner) -> None:
         """The ``experimental`` marker appears only on the creative_sampling row."""
         result = runner.invoke(cli, ["list", "presets"])
         assert result.exit_code == 0, result.output

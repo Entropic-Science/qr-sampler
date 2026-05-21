@@ -60,14 +60,23 @@ that region pin (see comment in `_CLS_KWARGS`).
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 import modal
 
 APP_NAME = "qr-llm-chat"
+
+# Phase 2 R6: anchor for the cold-start budget event. Captured once at
+# module import (i.e. each Modal container's Python process boot). The
+# end-of-_wake event uses ``time.monotonic() - _CONTAINER_START_MONOTONIC``
+# to report total cold-start elapsed time independent of any external
+# clock — the metric §15.1-15.5 success-criteria check against.
+_CONTAINER_START_MONOTONIC: float = time.monotonic()
 
 # Repo root, computed relative to this file
 # (src/qr_sampler/connectors/modal/app.py — four parents up from here).
@@ -354,8 +363,8 @@ _CLS_KWARGS: dict[str, Any] = {
     # not the backbone hop between PoPs; that hop is fiber-bound by the
     # physical distance between the container and the QRNG origin. The
     # Cipherstone QRNG service is colocated in **central US**. A west-
-    # coast H200 would add ~30–50 ms RTT to every sampled token — at
-    # 50 tok/s that is 1.5–2.5 s of added wall-clock per second of
+    # coast H200 would add ~30-50 ms RTT to every sampled token - at
+    # 50 tok/s that is 1.5-2.5 s of added wall-clock per second of
     # generated output, plainly visible in OWUI's streaming UI.
     #
     # We accept that penalty for the workloads that land on us-west / us-
@@ -525,6 +534,26 @@ class VllmQrQwen:
             "fp8",
             "--kv-cache-dtype",
             "fp8",
+            # Phase 2 R2 (belt-and-braces LP registration): the
+            # ``vllm.logits_processors`` entry-point group in
+            # qr-sampler/pyproject.toml is the primary discovery path,
+            # but vLLM 0.17.0 has historically been finicky about
+            # entry-point loading order vs. engine init. Passing
+            # --logits-processors explicitly guarantees registration
+            # regardless of plugin discovery state.
+            "--logits-processors",
+            "qr_sampler.engines.vllm:VLLMAdapter",
+            # Phase 2 R7 (deterministic OOM avoidance): research
+            # Appendix A §"Concrete modal.Cls skeleton" pins both
+            # values. --max-model-len 8192 is the safe upper bound for
+            # Qwen3.5-9B served at FP8 on H100 80GB; without it vLLM
+            # auto-picks the model-config max which has been observed
+            # to OOM on warmup. --gpu-memory-utilization 0.92 is the
+            # research default; defaults to 0.9 if omitted.
+            "--max-model-len",
+            "8192",
+            "--gpu-memory-utilization",
+            "0.92",
         ]
 
         log.info(
@@ -639,10 +668,15 @@ class VllmQrQwen:
         ``modal_vllm_303_hang`` and the prior implementation's
         ``start_tunnel`` comment for the rationale.
         """
+        import threading
         import time
 
         import httpx
-        from obs.events import VLLM_WAKE_FAIL, VLLM_WAKE_OK
+        from obs.events import (
+            VLLM_COLDSTART_COMPLETE,
+            VLLM_WAKE_FAIL,
+            VLLM_WAKE_OK,
+        )
         from obs.logging import get_logger
 
         log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
@@ -684,10 +718,103 @@ class VllmQrQwen:
             },
         )
 
+        # Phase 2 R6: emit a cold-start budget event covering the full
+        # container-process lifetime (module import → engine awake). The
+        # research targets <30s snapshot-warmed cold start; this event
+        # is the one observable an operator can grep for to assess the
+        # success criteria after each Phase 3 iteration.
+        total_elapsed_ms = (time.monotonic() - _CONTAINER_START_MONOTONIC) * 1000.0
+        log.info(
+            "vllm cold-start complete for %s (total %.1f ms since container start)",
+            self.SERVED_MODEL_NAME,
+            total_elapsed_ms,
+            extra={
+                "event": VLLM_COLDSTART_COMPLETE,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "total_elapsed_ms": total_elapsed_ms,
+            },
+        )
+
+        # Phase 2 R5: subprocess health monitor. vLLM issue #19849 — the
+        # parent Modal container does not notice EngineCore_DP0 dying
+        # inside the ``vllm serve`` subprocess (it survives as a zombie
+        # of sorts: TCP listener up, /health 5xx, /v1/chat/completions
+        # hangs or 5xxs). Without this thread we have no log signal
+        # between requests, only "next user request 500s with no
+        # actionable trace". The thread polls /health every 30s and
+        # emits VLLM_HEALTH_DEGRADED on any non-2xx or connection error.
+        # daemon=True ensures container shutdown is not blocked.
+        self._health_stop_event = threading.Event()
+        self._health_thread = threading.Thread(
+            target=self._poll_vllm_health,
+            args=(self._health_stop_event,),
+            daemon=True,
+            name=f"vllm-health-{self.SERVED_MODEL_NAME}",
+        )
+        self._health_thread.start()
+
+    def _poll_vllm_health(self, stop_event: Any) -> None:
+        """Background poll of vllm serve /health (Phase 2 R5).
+
+        Runs every 30s until the stop_event is set (in ``_stop``).
+        Emits VLLM_HEALTH_DEGRADED on any non-2xx HTTP response or
+        connection error — the operator's only signal that the
+        subprocess died between requests.
+
+        Errors inside this thread are swallowed (a failing health-poll
+        thread MUST NOT crash the container); the absence of regular
+        health events in cold-start logs is itself the canary.
+        """
+        import httpx
+        from obs.events import VLLM_HEALTH_DEGRADED
+        from obs.logging import get_logger
+
+        log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}.health")
+        health_url = f"{self._VLLM_BASE_URL}/health"
+        poll_interval_s = 30.0
+
+        while not stop_event.is_set():
+            try:
+                r = httpx.get(health_url, timeout=5.0)
+                if r.status_code >= 300:
+                    log.warning(
+                        "vllm /health returned %s for %s",
+                        r.status_code,
+                        self.SERVED_MODEL_NAME,
+                        extra={
+                            "event": VLLM_HEALTH_DEGRADED,
+                            "served_model_name": self.SERVED_MODEL_NAME,
+                            "status_code": r.status_code,
+                            "error_type": "HTTPStatus",
+                            "error_msg": f"/health returned {r.status_code}",
+                        },
+                    )
+            except Exception as err:
+                log.warning(
+                    "vllm /health poll failed for %s: %s",
+                    self.SERVED_MODEL_NAME,
+                    err,
+                    extra={
+                        "event": VLLM_HEALTH_DEGRADED,
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "status_code": 0,
+                        "error_type": type(err).__name__,
+                        "error_msg": str(err),
+                    },
+                )
+            stop_event.wait(poll_interval_s)
+
     @modal.exit()
     def _stop(self) -> None:
         """Tear down the sidecar and the vllm serve subprocess."""
         import subprocess
+
+        # Phase 2 R5: stop the background /health poller before tearing
+        # down the subprocess so the thread doesn't log spurious
+        # connection-refused events during shutdown.
+        stop_event = getattr(self, "_health_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
 
         _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
         proc = getattr(self, "_vllm_proc", None)
@@ -810,10 +937,8 @@ def _start_qrng_tunnel(served_model_name: str) -> Any:
         # Cloudflared binary missing from PATH, tunnel unreachable,
         # service-token revoked, etc. Same soft-fail policy.
         stderr_tail = None
-        try:
+        with contextlib.suppress(Exception):
             stderr_tail = "\n".join(list(sidecar._stderr_tail)[-30:])
-        except Exception:
-            pass
         log.warning(
             "QRNG cloudflared sidecar failed to start for %s: %s: %s; "
             "container will serve with system-entropy fallback",
@@ -838,10 +963,8 @@ def _start_qrng_tunnel(served_model_name: str) -> Any:
             },
         )
         # Best-effort cleanup of any partially-started sidecar process.
-        try:
+        with contextlib.suppress(Exception):
             sidecar.stop()
-        except Exception:
-            pass
         return None
 
     return sidecar
@@ -868,7 +991,7 @@ def _stop_qrng_tunnel(sidecar: Any) -> None:
 
 # ----- Open WebUI container ------------------------------------------------
 #
-# qr-llm-chat split (plan R1–R6, requirements §10, spec §11): the Open WebUI
+# qr-llm-chat split (plan R1-R6, requirements §10, spec §11): the Open WebUI
 # surface is now declared *here* in the same Modal app as the two vLLM
 # classes, so `modal deploy -m qr_sampler.connectors.modal.app` brings up
 # all three services as one unit. The OWUI-specific bootstrap (admin user,

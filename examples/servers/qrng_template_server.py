@@ -61,8 +61,8 @@ _SRC_DIR = os.path.join(_REPO_ROOT, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from qr_sampler.proto.entropy_service_pb2 import EntropyResponse
-from qr_sampler.proto.entropy_service_pb2_grpc import (
+from qr_sampler.proto.entropy_service_pb2 import EntropyResponse  # noqa: E402
+from qr_sampler.proto.entropy_service_pb2_grpc import (  # noqa: E402
     EntropyServiceServicer,
     add_EntropyServiceServicer_to_server,
 )
@@ -88,6 +88,7 @@ logger = logging.getLogger("qrng_server")
 #   - generate(n_bytes): Return exactly n_bytes of fresh entropy
 #   - close(): Release the device handle
 #   - is_healthy(): Return True if the device is operational
+
 
 class QRNGHardware:
     """Interface to your QRNG hardware.
@@ -203,6 +204,7 @@ class QRNGHardware:
 # ===================================================================
 # gRPC SERVICE IMPLEMENTATION (usually no changes needed)
 # ===================================================================
+
 
 class QRNGEntropyServicer(EntropyServiceServicer):
     """gRPC service that delegates to QRNG hardware.
@@ -321,9 +323,7 @@ class QRNGEntropyServicer(EntropyServiceServicer):
                     device_id=self._hw.device_id,
                 )
         finally:
-            logger.info(
-                "Stream closed from %s after %d requests", peer, request_count
-            )
+            logger.info("Stream closed from %s after %d requests", peer, request_count)
 
     @property
     def stats(self) -> dict:
@@ -339,6 +339,7 @@ class QRNGEntropyServicer(EntropyServiceServicer):
 # ===================================================================
 # SERVER STARTUP (usually no changes needed)
 # ===================================================================
+
 
 def serve(
     address: str,
@@ -374,8 +375,7 @@ def serve(
             logger.info("gRPC reflection enabled")
         except ImportError:
             logger.warning(
-                "grpc-reflection not installed. "
-                "Install with: pip install grpcio-reflection"
+                "grpc-reflection not installed. Install with: pip install grpcio-reflection"
             )
 
     server.add_insecure_port(address)
@@ -426,27 +426,38 @@ Examples:
 """,
     )
     parser.add_argument(
-        "--port", type=int, default=50051,
+        "--port",
+        type=int,
+        default=50051,
         help="Port to listen on (default: 50051). Ignored if --address is set.",
     )
     parser.add_argument(
-        "--address", type=str, default=None,
+        "--address",
+        type=str,
+        default=None,
         help="Full bind address (e.g. 'localhost:50051' or 'unix:///path').",
     )
     parser.add_argument(
-        "--device", type=str, default="/dev/qrng0",
+        "--device",
+        type=str,
+        default="/dev/qrng0",
         help="Path to QRNG hardware device (default: /dev/qrng0).",
     )
     parser.add_argument(
-        "--max-workers", type=int, default=4,
+        "--max-workers",
+        type=int,
+        default=4,
         help="Thread pool size (default: 4).",
     )
     parser.add_argument(
-        "--reflection", action="store_true",
+        "--reflection",
+        action="store_true",
         help="Enable gRPC server reflection.",
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true",
+        "--verbose",
+        "-v",
+        action="store_true",
         help="Enable debug logging.",
     )
     args = parser.parse_args()

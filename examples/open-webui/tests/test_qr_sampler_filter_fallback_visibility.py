@@ -12,11 +12,12 @@ in (the OWUI-only deploy profile has no email gate).
 from __future__ import annotations
 
 import asyncio
-from typing import Any
-
-import pytest
+from typing import TYPE_CHECKING, Any
 
 from .conftest import load_filter
+
+if TYPE_CHECKING:
+    import pytest
 
 filter_mod = load_filter()
 Filter = filter_mod.Filter
@@ -61,9 +62,7 @@ def _outlet_body(
 
 
 class TestFallbackVisibility:
-    def test_warns_when_fallback_to_system(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_warns_when_fallback_to_system(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
         flt = _make_filter()
         emitter = _Emitter()
@@ -82,9 +81,7 @@ class TestFallbackVisibility:
         assert event["data"]["level"] == "warning"
         assert "pseudo-random" in event["data"]["description"]
 
-    def test_dedupes_within_same_chat(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_dedupes_within_same_chat(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
         flt = _make_filter()
         emitter = _Emitter()
@@ -106,9 +103,7 @@ class TestFallbackVisibility:
             "second outlet call in the same chat must not re-emit the warning"
         )
 
-    def test_distinct_chats_warn_independently(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_distinct_chats_warn_independently(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
         flt = _make_filter()
         emitter = _Emitter()
@@ -128,9 +123,7 @@ class TestFallbackVisibility:
         asyncio.run(_run())
         assert len(emitter.events) == 2
 
-    def test_silent_when_source_matches_primary(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_silent_when_source_matches_primary(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
         flt = _make_filter()
         emitter = _Emitter()
@@ -144,9 +137,7 @@ class TestFallbackVisibility:
         )
         assert emitter.events == []
 
-    def test_silent_when_metadata_absent(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_silent_when_metadata_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Legacy vLLM serve layer that does not attach qr_metadata must
         not trip the warning (forward compatibility, plan R2 backstop)."""
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
@@ -162,9 +153,7 @@ class TestFallbackVisibility:
         )
         assert emitter.events == []
 
-    def test_silent_when_env_var_unset(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_silent_when_env_var_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No configured primary -> nothing to compare against -> no warn."""
         monkeypatch.delenv("QR_ENTROPY_SOURCE_TYPE", raising=False)
         flt = _make_filter()
@@ -179,9 +168,7 @@ class TestFallbackVisibility:
         )
         assert emitter.events == []
 
-    def test_silent_when_emitter_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_silent_when_emitter_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No event channel from OWUI -> nowhere to send the warning."""
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
         flt = _make_filter()
@@ -196,9 +183,7 @@ class TestFallbackVisibility:
         # Body returned unmodified; no exception.
         assert result["metadata"]["chat_id"] == "chat-1"
 
-    def test_fires_without_signed_in_email(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_fires_without_signed_in_email(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The fallback warning runs *before* the email gate so OWUI-only
         deploys (no entropic.science integration) still see it."""
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
@@ -214,9 +199,7 @@ class TestFallbackVisibility:
         )
         assert len(emitter.events) == 1
 
-    def test_emitter_exception_does_not_propagate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_emitter_exception_does_not_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A flaky emitter must not break the response path."""
         monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "quantum_grpc")
         flt = _make_filter()
