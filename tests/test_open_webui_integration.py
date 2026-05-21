@@ -178,8 +178,12 @@ class TestInletPreflight:
         result = asyncio.run(flt.inlet(body, __user__={"email": "user@example.com"}))
 
         assert result["stream"] is True
-        assert result["qr_sample_count"] == flt.valves.sample_count
-        assert result["qr_fixed_temperature"] == flt.valves.fixed_temperature
+        # qr-* params are nested under vllm_xargs because vLLM 0.17.0's
+        # ChatCompletionRequest schema drops unknown top-level fields.
+        # See qr_sampler_filter.py inlet() comment block.
+        xargs = result["vllm_xargs"]
+        assert xargs["qr_sample_count"] == flt.valves.sample_count
+        assert xargs["qr_fixed_temperature"] == flt.valves.fixed_temperature
         # Preflight payload shape
         req = handler.calls[0]
         decoded = json.loads(req.content)
@@ -681,7 +685,8 @@ class TestInletPresetInjection:
             )
         )
 
-        assert result["qr_preset"] == "normal_t1"
+        # qr_* params land under vllm_xargs (vLLM 0.17.0 strict schema).
+        assert result["vllm_xargs"]["qr_preset"] == "normal_t1"
 
     def test_preset_selection_skips_qr_fields(
         self, monkeypatch: pytest.MonkeyPatch
@@ -698,9 +703,10 @@ class TestInletPresetInjection:
             )
         )
 
-        assert result["qr_preset"] == "creative_sampling"
+        xargs = result["vllm_xargs"]
+        assert xargs["qr_preset"] == "creative_sampling"
         for key in ("qr_temperature_strategy", "qr_fixed_temperature", "qr_top_k"):
-            assert key not in result, f"{key} leaked through preset path"
+            assert key not in xargs, f"{key} leaked through preset path"
 
     def test_dict_shaped_user_valves(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """OWUI sometimes passes a JSON-decoded dict instead of a pydantic model."""
@@ -715,7 +721,7 @@ class TestInletPresetInjection:
             )
         )
 
-        assert result["qr_preset"] == "normal_t1"
+        assert result["vllm_xargs"]["qr_preset"] == "normal_t1"
 
     def test_no_user_valves_uses_admin_qr_fields(
         self, monkeypatch: pytest.MonkeyPatch
@@ -732,6 +738,7 @@ class TestInletPresetInjection:
             )
         )
 
-        assert "qr_preset" not in result
-        assert result["qr_temperature_strategy"] == flt.valves.temperature_strategy
-        assert result["qr_fixed_temperature"] == flt.valves.fixed_temperature
+        xargs = result["vllm_xargs"]
+        assert "qr_preset" not in xargs
+        assert xargs["qr_temperature_strategy"] == flt.valves.temperature_strategy
+        assert xargs["qr_fixed_temperature"] == flt.valves.fixed_temperature

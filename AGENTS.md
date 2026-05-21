@@ -1,4 +1,6 @@
-# CLAUDE.md -- Codebase Guide for Coding Agents
+# AGENTS.md -- Codebase Guide for Coding Agents
+
+Companion to `LEARNINGS.md` (non-obvious lessons + failure signatures) and `README.md` (end-user documentation). See also the sibling repo `qr-llm-chat` (`../Entropic-Science/qr-llm-chat`) for the OWUI / Modal-deploy side of the production stack.
 
 ## What this project is
 
@@ -7,6 +9,33 @@
 The core sampling pipeline (`qr_sampler.core`) has **zero inference-engine dependencies** -- it operates on numpy arrays and knows nothing about torch, vLLM, or any specific engine. Engine-specific integration is handled by thin adapter classes (`qr_sampler.engines`). A vLLM V1 adapter ships out of the box; other engines (e.g., vLLM-Metal for Apple Silicon) are supported via the `EngineAdapter` plugin system and declarative YAML profiles.
 
 The primary use case is consciousness-research: studying whether conscious intent can influence quantum-random processes in LLM token selection.
+
+## Sibling repo
+
+`qr-llm-chat` is the OWUI + Modal-deploy side of the production stack -- at `../Entropic-Science/qr-llm-chat` on disk relative to this checkout. The two repos jointly own one Modal App; the seam runs along **who declares what**:
+
+| Owned by `qr-sampler` (this repo) | Owned by `qr-llm-chat` |
+|---|---|
+| The Modal App object (`qr_sampler.connectors.modal.app:App`) and all `@app.cls` definitions (`OWUIService`, `VllmQrGemma`, `VllmQrQwen`). | OWUI bootstrap (`admin_bootstrap.py`, `bootstrap_connections.py`, `bootstrap_static_assets.py`). |
+| vLLM image (`connectors/modal/Dockerfile.vllm`), vLLM serve entry-point + cloudflared sidecar (`connectors/modal/vllm_serve.py`). | Lifecycle hooks (`lifespan_hooks.py`: `pre_snapshot` / `post_restore`). |
+| The qr_sampler V1 logits-processor entry-point (`vllm.logits_processors` -> `qr_sampler.engines.vllm:VLLMAdapter`, re-exported as `QRSamplerLogitsProcessor` from `qr_sampler.processor` for backward-compat). | Setup orchestrator (`setup_orchestrator.py`) + the deploy-guard chat probe. |
+| Cipherstone gRPC client + entropy fallback wrapper + `cloudflared access tcp` sidecar. | OWUI Function envelopes (`functions/qr_comparison_pipe.py`, `functions/qr_sampler_filter.py`). |
+| `qr-sampler-prod` Modal Secret (QRNG / Cipherstone vars). | `qr-llm-chat-prod` Modal Secret (OWUI / OAuth / VllmQr* dispatch). |
+
+`qr-llm-chat` pulls this package in via the `qr-sampler @ file:../../qr-sampler` path-dep in its `pyproject.toml`. Deploy is run from the qr-llm-chat checkout so qr-sampler's `add_local_python_source("qr_llm_chat", copy=True)` on the OWUI image resolves.
+
+`examples/open-webui/qr_sampler_filter.py` also exists in qr-llm-chat (`src/qr_llm_chat/functions/`) for legacy reasons. Never auto-merge across the seam with `-X theirs`, always mirror edits manually (auto-memory `feedback_owui_filter_cross_repo_drift`). A future cleanup should consolidate into a single canonical source here under `qr-sampler`; until then, mirror.
+
+## Where to find what
+
+| Topic | Where |
+|---|---|
+| Codebase structure, invariants, conventions, how to add new components | This file (sections below) |
+| Non-obvious lessons / gotchas / failure signatures (snapshot, layering, model-arch, deploy) | `LEARNINGS.md` |
+| End-user documentation, quickstart, CLI reference, configuration reference | `README.md` |
+| Combined cleanup record (both repos) + active bug snapshot + Phase 2/3 follow-ups | `../Entropic-Science/qr-llm-chat/CLEANUP_REPORT.md` |
+| Sibling-repo specifics (deploy/rotate/upgrade runbook, OWUI bootstrap) | `../Entropic-Science/qr-llm-chat/AGENTS.md` + `LEARNINGS.md` there |
+| Modal Secret catalogue + env-var reference for the production deploy | `../Entropic-Science/qr-llm-chat/infra/modal_secrets.md` |
 
 ## Commands
 

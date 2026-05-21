@@ -16,6 +16,19 @@ from qr_sampler.entropy.quantum import (
 from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
 
 
+@pytest.fixture(autouse=True)
+def _disable_grpc_preprobe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Skip the live ``socket.create_connection`` pre-probe.
+
+    Phase 2 lazy init defers gRPC channel creation to first fetch.
+    The pre-probe still runs ahead of that fetch and would call
+    ``socket.create_connection(("localhost", 50051), ...)`` against
+    whatever the test host has bound there. Disabling it keeps the
+    tests pure unit-level against the mocked ``grpc.aio.insecure_channel``.
+    """
+    monkeypatch.setenv("QR_GRPC_PREPROBE_ENABLED", "0")
+
+
 def _make_config(**overrides: Any) -> Any:
     """Create a mock config object with gRPC defaults."""
     from qr_sampler.config import QRSamplerConfig
@@ -165,6 +178,9 @@ class TestQuantumGrpcSourceUnary:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            # Phase 2 lazy init: bring up the channel so `call_args`
+            # assertions remain valid for tests that don't fetch.
+            source._ensure_channel()
             source._mock_channel = mock_channel  # type: ignore[attr-defined]
             source._mock_unary_handle = mock_unary_handle  # type: ignore[attr-defined]
             yield source
@@ -234,6 +250,7 @@ class TestQuantumGrpcSourceCircuitBreaker:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             yield source
             source.close()
 
@@ -280,6 +297,7 @@ class TestQuantumGrpcSourceAddressParsing:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             mock_channel_fn.assert_called_once()
             call_args = mock_channel_fn.call_args
             assert call_args[0][0] == "myhost:9090"
@@ -302,6 +320,7 @@ class TestQuantumGrpcSourceAddressParsing:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             call_args = mock_channel_fn.call_args
             assert call_args[0][0] == "unix:///var/run/qrng.sock"
             source.close()
@@ -487,6 +506,7 @@ class TestQuantumGrpcSourceServerStreaming:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             source._mock_stream_handle = mock_stream_handle  # type: ignore[attr-defined]
             yield source
             source.close()
@@ -561,6 +581,7 @@ class TestQuantumGrpcSourceBidiStreaming:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             source._mock_stream_handle = mock_stream_handle  # type: ignore[attr-defined]
             yield source
             source.close()
@@ -749,6 +770,7 @@ class TestStreamingModeValidation:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             # Should not have created a stream method handle.
             assert source._stream_method is None
             source.close()
@@ -843,6 +865,7 @@ class TestCustomMethodPath:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             try:
                 # Verify the method path passed to channel.unary_unary.
                 call_args = mock_channel.unary_unary.call_args
@@ -871,6 +894,7 @@ class TestCustomMethodPath:
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
             try:
                 call_args = mock_channel.stream_stream.call_args
                 assert call_args[0][0] == "/custom.Service/StreamData"

@@ -249,18 +249,25 @@ class QuantumGrpcSource(EntropySource):
         self._circuit_open: bool = False
         self._circuit_open_until: float = 0.0
 
-        # Background event loop for async gRPC.
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            daemon=True,
-            name="qr-sampler-grpc-loop",
-        )
-        self._thread.start()
-
-        # Initialize channel and method handles on the background loop.
-        future = asyncio.run_coroutine_threadsafe(self._init_channel(), self._loop)
-        future.result(timeout=self._timeout_ms / 1000.0)
+        # Background event loop + gRPC channel are LAZILY initialized
+        # on the first ``get_random_bytes()`` call. Phase 2 (2026-05-21):
+        # the prior eager init in __init__ opened a thread + an HTTP/2
+        # channel object at import time of any module that constructed
+        # this source (e.g. ``qr_sampler.engines.vllm.VLLMAdapter``).
+        # Modal's snapshot lifecycle freezes that thread state, then
+        # restores it post-snapshot into a container where the
+        # cloudflared sidecar is freshly started at ``snap=False`` —
+        # not yet reachable, but the captured channel still routes to
+        # the stale internal state. Deferring to first use means the
+        # channel is created in the post-restore wall-clock, after the
+        # sidecar is up.
+        #
+        # See Phase K research (requirements.md Appendix A) §"qr_sampler
+        # import-time sockets" for the full rationale.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._channel_initialized: bool = False
+        self._channel_init_lock = threading.Lock()
 
         # Streaming state (lazily initialized).
         self._bidi_call: Any | None = None
@@ -269,14 +276,36 @@ class QuantumGrpcSource(EntropySource):
         # recent failed pre-probe so we can short-circuit subsequent calls
         # within the backoff window without re-touching the socket.
         self._last_preprobe_fail_monotonic: float = 0.0
-        self._preprobe_enabled: bool = (
-            os.environ.get(_PREPROBE_ENABLED_ENV_VAR, "1") != "0"
-        )
+        self._preprobe_enabled: bool = os.environ.get(_PREPROBE_ENABLED_ENV_VAR, "1") != "0"
 
     def _run_loop(self) -> None:
         """Run the asyncio event loop in a background thread."""
+        assert self._loop is not None  # set in _ensure_channel
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
+
+    def _ensure_channel(self) -> None:
+        """Start the background loop + open the gRPC channel on first call.
+
+        Idempotent. Thread-safe via a lock so concurrent first calls
+        from multiple sampling threads don't double-spawn the loop.
+        """
+        if self._channel_initialized:
+            return
+        with self._channel_init_lock:
+            if self._channel_initialized:
+                return
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                daemon=True,
+                name="qr-sampler-grpc-loop",
+            )
+            self._thread.start()
+
+            future = asyncio.run_coroutine_threadsafe(self._init_channel(), self._loop)
+            future.result(timeout=self._timeout_ms / 1000.0)
+            self._channel_initialized = True
 
     async def _init_channel(self) -> None:
         """Create the gRPC async channel and generic method handles."""
@@ -397,6 +426,12 @@ class QuantumGrpcSource(EntropySource):
         """
         self._tcp_preprobe()
 
+        # Lazy channel + background-loop bring-up (Phase 2). Runs only
+        # on the first call; subsequent calls short-circuit on the
+        # _channel_initialized flag.
+        self._ensure_channel()
+        assert self._loop is not None  # _ensure_channel just set it
+
         timeout_s = self._get_timeout() / 1000.0
         coro = self._fetch_async(n)
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -460,8 +495,7 @@ class QuantumGrpcSource(EntropySource):
                 },
             )
             raise EntropyUnavailableError(
-                f"QRNG host {host}:{port} unreachable: "
-                f"{type(exc).__name__}: {exc}"
+                f"QRNG host {host}:{port} unreachable: {type(exc).__name__}: {exc}"
             ) from exc
 
     async def _fetch_async(self, n: int) -> bytes:
@@ -564,10 +598,23 @@ class QuantumGrpcSource(EntropySource):
     # --- Lifecycle ---
 
     def close(self) -> None:
-        """Release the gRPC channel, event loop, and background thread."""
+        """Release the gRPC channel, event loop, and background thread.
+
+        No-op when the channel was never opened (the source was
+        constructed but never used). Phase 2's lazy init means
+        ``__init__`` no longer creates the loop or the channel; both
+        are optional state at shutdown time.
+        """
         if self._closed:
             return
         self._closed = True
+
+        if not self._channel_initialized:
+            return
+
+        loop = self._loop
+        thread = self._thread
+        assert loop is not None and thread is not None  # _ensure_channel set both
 
         async def _shutdown() -> None:
             if self._bidi_call is not None:
@@ -576,13 +623,13 @@ class QuantumGrpcSource(EntropySource):
             await self._channel.close()
 
         try:
-            future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
             future.result(timeout=5.0)
         except Exception:
             logger.warning("Error during QuantumGrpcSource cleanup", exc_info=True)
         finally:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join(timeout=5.0)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
 
     def health_check(self) -> dict[str, Any]:
         """Return detailed health status including circuit breaker state.

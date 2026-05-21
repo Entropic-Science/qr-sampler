@@ -142,6 +142,7 @@ def _qr_llm_chat_functions_dir() -> Path:
         )
     return functions_dir
 
+
 # --- Volumes ---------------------------------------------------------------
 
 # Currently only Qwen 3.6 27B is actively served; the volume also retains
@@ -327,11 +328,12 @@ def download_weights() -> dict[str, str]:
 
 _CLS_KWARGS: dict[str, Any] = {
     "image": vllm_image,
-    # H200 (141 GB HBM3e) sized for Qwen 3.6 27B at bf16 (~54 GB weights
-    # plus KV cache for max_model_len=65536). H200 also keeps a wider
-    # schedulable pool than B200 / A100, which mattered for the
-    # 2026-05-19 capacity crunch.
-    "gpu": "H200",
+    # H100:1 sized for Qwen at FP8 (~13 GB weights for 27B FP8, ~5 GB for
+    # 9B FP8) plus KV cache. Phase 2 cutover from H200 (bf16) to H100:1
+    # (FP8) shrinks the per-token memory footprint enough that one H100
+    # serves the model with room for snapshot+wake. Phase K research
+    # mandates FP8 over AWQ — see requirements.md Appendix A.
+    "gpu": "H100:1",
     # Region pool: ``"us"`` (the broad-region option per Modal's docs at
     # docs/guide/region-selection). Broad regions widen the schedulable
     # pool to ALL US-resident clusters (us-east + us-central + us-south +
@@ -370,68 +372,76 @@ _CLS_KWARGS: dict[str, Any] = {
     },
     "secrets": [qr_sampler_prod_secret, hf_token_secret],
     "enable_memory_snapshot": True,
-    # 30 min idle -> shutdown. Modal's GPU memory snapshot CANNOT capture
-    # CUDA state (see ``_VLLM_CLS_KWARGS`` comment), so every cold-start
-    # rebuilds the engine from scratch (~3 min with torch.compile cache,
-    # ~5 min cold). The realistic latency win comes from keeping the
-    # container warm long enough that a user's next message arrives while
-    # the engine is still resident — at 180 s any "let me think" pause
-    # past 3 min meant a full reload. 1800 s gives a much better UX for
-    # interactive chat while still scaling to zero on real idle.
+    # GPU snapshot: captures the warm-but-asleep vLLM engine so cold-starts
+    # restore in ~10-15 s instead of the ~3-5 min full engine rebuild.
+    # Phase 2 substep 4 (snapshot wiring). The engine is put to sleep at
+    # snap=True (POST /sleep?level=1, requires VLLM_SERVER_DEV_MODE=1) and
+    # woken at snap=False (POST /wake_up).
+    "experimental_options": {"enable_gpu_snapshot": True},
+    # 30 min idle -> shutdown. With GPU snapshot enabled, restore is
+    # cheap (~10-15 s) so scaling to zero is safe. We keep 1800 s for
+    # interactive chat UX (next message arrives while still warm) rather
+    # than relying purely on snapshot restore for every "let me think"
+    # pause.
     "scaledown_window": 1800,
     "max_containers": 1,  # Pre-flight §11.8 cost ceiling, per model
     "timeout": 60 * 60,
 }
 
 
-# ``enable_memory_snapshot=False`` on the vLLM class (only): the @modal.enter
-# methods on VllmQrQwen are all ``snap=False`` anyway (the vLLM ModelConfig
-# import chain needs a CUDA-attached GPU; snap=True's CUDA_VISIBLE_DEVICES=
-# "none" crashes ``device_id_to_physical_device_id``), so the snapshot path
-# never actually engages. Carrying ``enable_memory_snapshot=True`` from the
-# shared ``_CLS_KWARGS`` is therefore inert AND creates a confusing
-# failure mode: if Modal ever restores a STALE snapshot from a previous
-# image's pre-restore state, the container boots against the old
-# transformers/vLLM versions and produces traceback lines that cannot exist
-# in the new image (e.g. the 2026-05-20 "configuration_auto.py:1040" crash,
-# which referenced a file that only has 438 lines in transformers @ main).
-# Disabling per-class removes that surface entirely. ``OWUIService`` keeps
-# its snapshot (different image, no GPU requirement, fast cold-start win).
-_VLLM_CLS_KWARGS: dict[str, Any] = {
-    **_CLS_KWARGS,
-    "enable_memory_snapshot": False,
-}
-
-
-@app.cls(**_VLLM_CLS_KWARGS)
+# Phase 2 (2026-05-21): the vLLM class inherits the full snapshot config
+# from _CLS_KWARGS. The prior ``enable_memory_snapshot=False`` override is
+# removed because the new lifecycle starts ``vllm serve`` in
+# ``@modal.enter(snap=True)`` — with ``experimental_options={"enable_gpu_snapshot":
+# True}`` the GPU is attached during the snap=True phase, so the old
+# ``CUDA_VISIBLE_DEVICES=none`` crash in ``device_id_to_physical_device_id``
+# no longer applies.
+@app.cls(**_CLS_KWARGS)
 @modal.concurrent(max_inputs=8)
 class VllmQrQwen:
-    """One ``AsyncLLMEngine`` serving ``Qwen/Qwen3.6-27B`` at full precision.
+    """``vllm serve`` subprocess fronted by Modal's ``@modal.web_server``.
 
-    The 27B's HF config carries a populated ``vision_config`` which would
-    otherwise crash vLLM V1's MM dummy probe. The load-bearing fix is the
-    ``_install_mm_probe_skip_patch`` monkey-patch in
-    ``qr_sampler.connectors.modal.vllm_serve`` — see that helper's
-    docstring for the patch's risk surface.
+    Phase 2 (2026-05-21) rebuild: replaces the prior ``@modal.asgi_app() +
+    asyncio.run(build_dispatcher_for(...))`` pattern. Three structural
+    defects from Phase K research are fixed:
+
+    1. **Subprocess stdio buffering** — ``vllm serve`` runs as its own
+       process tree, so ``VLLM_LOGGING_LEVEL=DEBUG`` lands in the parent's
+       stdout without the asyncio multiplexing that previously swallowed
+       ``EngineCore_DP0`` tracebacks.
+    2. **Broken EngineClient lifecycle** — ``vllm serve`` owns the engine
+       process lifecycle end-to-end; we no longer have to thread
+       ``AsyncLLMEngine`` through a custom dispatcher.
+    3. **Homegrown snapshot/restore** — Modal's
+       ``experimental_options={"enable_gpu_snapshot": True}`` plus vLLM
+       sleep mode (``--enable-sleep-mode`` + ``POST /sleep?level=1``)
+       replace the prior ``enable_memory_snapshot=False`` workaround.
 
     Lifecycle:
 
-    * ``@modal.enter(snap=False) load`` — builds the engine and pre-initialises
-      both entropy pipelines (per ``QR_PREINIT_ENTROPY_SOURCES``). Runs in
-      the snap=False phase because vLLM's ``ModelConfig`` validation spawns
-      a subprocess that imports the model's quantization stack, which
-      transitively calls ``current_platform.get_device_capability()`` —
-      requires a CUDA-attached GPU. Modal's snap=True phase has no GPU
-      (``CUDA_VISIBLE_DEVICES=none``), so the import chain crashes with
-      ``ValueError: invalid literal for int() with base 10: 'none'`` inside
-      ``vllm/platforms/interface.py::device_id_to_physical_device_id``.
-      Running at snap=False means the engine is rebuilt on every cold-start
-      (no snapshot benefit) but it actually works.
-    * ``@modal.enter(snap=False) start_tunnel`` — spawns the per-container
-      ``cloudflared access tcp`` sidecar that fronts the QRNG gRPC service.
-      Already snap=False so no live socket is frozen into the snapshot.
-    * ``@modal.exit() stop_tunnel`` — terminates the sidecar on container
-      shutdown.
+    * ``@modal.enter(snap=True) _start_and_sleep`` — spawns ``vllm
+      serve``, polls ``/health`` until ready, then ``POST /sleep?level=1``
+      to free GPU memory before Modal takes the snapshot. Requires
+      ``VLLM_SERVER_DEV_MODE=1`` (set in Dockerfile.vllm) to expose the
+      sleep/wake endpoints.
+    * ``@modal.enter(snap=False) _wake`` — starts the cloudflared sidecar
+      (post-restore so no dead socket is captured), then ``POST
+      /wake_up`` to re-allocate the engine's GPU state.
+    * ``@modal.web_server(port=8000)`` — Modal proxies inbound traffic
+      to the running ``vllm serve`` subprocess on localhost:8000.
+    * ``@modal.exit() _stop`` — terminates the sidecar and the vLLM
+      subprocess on container shutdown.
+
+    The 27B's HF config carries a populated ``vision_config`` which would
+    otherwise crash vLLM V1's MM dummy probe. The load-bearing fix is
+    the ``_install_mm_probe_skip_patch`` monkey-patch in
+    ``qr_sampler.connectors.modal.vllm_serve`` — kept importable for the
+    ``--logits-processors``-discovery path (the entry point in
+    ``pyproject.toml`` registers ``VLLMAdapter`` as
+    ``vllm.logits_processors.qr_sampler``, which ``vllm serve`` picks up
+    automatically). FP8 quantization is requested via CLI flags; the
+    9B/27B's vision config is suppressed by the MM-probe patch loaded
+    at the same entry-point hook.
     """
 
     # Machine-friendly ID echoed by vLLM's /v1/models endpoint and used as
@@ -443,120 +453,262 @@ class VllmQrQwen:
     # ``qr_llm_chat/bootstrap_connections.py`` and the Pipe's
     # ``base_models`` default.
     SERVED_MODEL_NAME = "qwen-3.6-27b"
-    # 2026-05-21: switched to Qwen/Qwen3.5-9B as a smaller, faster
-    # cold-start variant (createmp-evalsuite uses this model
-    # successfully). 9B has the same Qwen3_5ForConditionalGeneration
-    # architecture as the 27B but ~3x smaller (17 GiB vs 51 GiB) so
-    # cold-start drops to ~90 s (vs ~115 s). The OWUI-facing
+    # 2026-05-21: Qwen/Qwen3.5-9B is the active build target — smaller and
+    # faster cold-start than the 27B variant (createmp-evalsuite uses
+    # this successfully). Same Qwen3_5ForConditionalGeneration arch as
+    # 27B, so the MM-probe patch logic is identical. The OWUI-facing
     # SERVED_MODEL_NAME stays "qwen-3.6-27b" so bootstrap_connections
     # doesn't need updating to swap the displayed model.
-    # Note: a pending EngineCore-500 issue (see scripts/dump_modal_secret.py
-    # and Phase K notes) is independent of model choice — switching
-    # back to "Qwen/Qwen3.6-27B" did not fix or worsen the symptom.
     HF_REPO_ID = "Qwen/Qwen3.5-9B"
 
-    @modal.enter(snap=False)
-    def load(self) -> None:
-        import asyncio
+    # vLLM serve HTTP endpoint inside the container. Modal's
+    # @modal.web_server proxies inbound traffic here.
+    _VLLM_PORT = 8000
+    _VLLM_HOST = "127.0.0.1"
+    _VLLM_BASE_URL = f"http://{_VLLM_HOST}:{_VLLM_PORT}"
+    # Bound the @modal.enter hook wall-clock so a stuck vllm serve fails
+    # fast instead of consuming the @app.cls timeout (1 hour).
+    _STARTUP_TIMEOUT_S = 600  # 10 min
+    _SLEEP_WAKE_TIMEOUT_S = 60
 
-        from qr_sampler.connectors.modal.vllm_serve import build_dispatcher_for
+    @modal.enter(snap=True)
+    def _start_and_sleep(self) -> None:
+        """Spawn ``vllm serve``, wait for /health, then put it to sleep.
 
-        # Wrap the dispatcher build so any unhandled failure surfaces as
-        # a structured ``vllm.engine.build_failed`` event BEFORE Modal's
-        # runtime traceback printing kicks in. Without this wrap the
-        # event from ``build_engine`` itself still fires (we emit before
-        # ``raise``), but a failure *outside* ``build_engine`` (e.g. in
-        # ``build_app`` or in the event-loop scaffolding itself) would
-        # be lost to Modal's generic exit-1 path. Emitting one more
-        # JSON-per-line event with the served_model_name tag means
-        # ``modal app logs | grep vllm.engine.build_failed`` always
-        # turns up the failed container even when stacks interleave.
-        #
-        # NOTE on asyncio + vLLM V1 engine cold-start flakiness (2026-05-20):
-        #
-        # Some cold-starts on Modal end with ``Engine core proc EngineCore_DP0
-        # died unexpectedly`` + exit code 0 + PyTorch NCCL atexit warning
-        # ``destroy_process_group() was not called before program exit``.
-        # The hypothesis was that ``asyncio.run()`` installs SIGINT/SIGTERM
-        # handlers on the loop (via ``asyncio.Runner._install_signal_handler``)
-        # which the forked EngineCore inherits, then dies on signal during
-        # the multi-minute model load.
-        #
-        # Iteration 6 tried ``asyncio.new_event_loop()`` + ``run_until_complete``
-        # to bypass the signal-handler install — but ``close()`` on exit then
-        # killed vLLM's background output_handler task with ``Event loop is
-        # closed`` errors. And the EngineCore subprocess STILL died with
-        # exit code 0 on a separate cold-start, ruling out signal propagation
-        # as the sole cause. The crashes appear intermittent (Modal container
-        # resource pressure + multiple concurrent cold-start attempts
-        # triggered by OWUI's deploy_guard probes).
-        #
-        # Canonical fix would be Modal's ``@modal.web_server`` pattern running
-        # ``vllm serve`` as a subprocess (see modal-examples/06_gpu_and_ml/
-        # llm-serving/vllm_inference.py) — that sidesteps the asyncio +
-        # multiprocessing signal interaction entirely. Significant rewrite,
-        # tracked as a follow-up.
-        try:
-            self._asgi_app = asyncio.run(
-                build_dispatcher_for(self.SERVED_MODEL_NAME, self.HF_REPO_ID)
-            )
-        except BaseException as err:  # noqa: BLE001 -- must surface every failure
-            import traceback as _tb
+        Runs PRE-snapshot. The snapshot captures the warm engine in its
+        sleeping (GPU-released) state so restore is cheap.
+        """
+        import subprocess
+        import time
 
-            from obs.events import VLLM_ENGINE_BUILD_FAILED
-            from obs.logging import get_logger
+        import httpx
+        from obs.events import (
+            VLLM_ENGINE_BUILD_FAILED,
+            VLLM_SLEEP_FAIL,
+            VLLM_SLEEP_OK,
+        )
+        from obs.logging import get_logger
 
-            tb_text = "".join(
-                _tb.format_exception(type(err), err, err.__traceback__)
-            )
-            tb_tail = "\n".join(tb_text.splitlines()[-30:])
-            log = get_logger(
-                f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}"
-            )
+        log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
+
+        # Forward the container's env into the subprocess so vllm serve
+        # inherits VLLM_LOGGING_LEVEL=DEBUG, VLLM_SERVER_DEV_MODE=1,
+        # HF_HUB_ENABLE_HF_TRANSFER=1 (set in Dockerfile.vllm) plus the
+        # QR_* entropy config (set in Dockerfile.vllm and overridable
+        # via the qr-sampler-prod Modal Secret).
+        env = os.environ.copy()
+        # Belt-and-braces: also set unbuffered I/O explicitly so vllm
+        # serve's Python stdout streams in real time even if the parent
+        # forgot the env var.
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+        cmd = [
+            "vllm",
+            "serve",
+            self.HF_REPO_ID,
+            "--served-model-name",
+            self.SERVED_MODEL_NAME,
+            "--host",
+            self._VLLM_HOST,
+            "--port",
+            str(self._VLLM_PORT),
+            # Sleep mode + dev mode together expose POST /sleep and
+            # POST /wake_up so the snap=True hook can free GPU memory
+            # before Modal's snapshot fires.
+            "--enable-sleep-mode",
+            # Phase 2 substep 5: FP8 quantization (weights + KV cache).
+            # H100:1 has enough VRAM headroom for either Qwen variant
+            # at FP8 with snapshot-restore turned on. Phase K research
+            # explicitly mandates FP8 over AWQ — see requirements.md
+            # Appendix A ("Why AWQ is wrong").
+            "--quantization",
+            "fp8",
+            "--kv-cache-dtype",
+            "fp8",
+        ]
+
+        log.info(
+            "Spawning vllm serve subprocess for %s",
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": "vllm.subprocess.spawn",
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "hf_repo_id": self.HF_REPO_ID,
+                "cmd": cmd,
+            },
+        )
+
+        # subprocess.Popen with no stdout/stderr capture: vllm serve's
+        # logs go directly to the container's stdout/stderr where
+        # ``modal app logs`` picks them up. This is the WHOLE POINT of
+        # the lifecycle restructure — see Phase K research §"Subprocess
+        # stdio buffering".
+        self._vllm_proc = subprocess.Popen(cmd, env=env)
+
+        # Poll /health every 2 s up to the startup budget.
+        deadline = time.monotonic() + self._STARTUP_TIMEOUT_S
+        health_url = f"{self._VLLM_BASE_URL}/health"
+        ready = False
+        while time.monotonic() < deadline:
+            # If the subprocess died, surface the build failure as a
+            # structured event before raising.
+            rc = self._vllm_proc.poll()
+            if rc is not None:
+                log.error(
+                    "vllm serve exited during startup (rc=%s)",
+                    rc,
+                    extra={
+                        "event": VLLM_ENGINE_BUILD_FAILED,
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "hf_repo_id": self.HF_REPO_ID,
+                        "error_type": "SubprocessExited",
+                        "error_msg": f"vllm serve exited with rc={rc}",
+                        "phase": "VllmQrQwen._start_and_sleep",
+                    },
+                )
+                raise RuntimeError(f"vllm serve exited rc={rc} during startup")
+            try:
+                r = httpx.get(health_url, timeout=5.0)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+        if not ready:
             log.error(
-                "VllmQrQwen.load FAILED for %s: %s: %s",
-                self.SERVED_MODEL_NAME,
-                type(err).__name__,
-                err,
+                "vllm serve did not become healthy within %ds",
+                self._STARTUP_TIMEOUT_S,
                 extra={
                     "event": VLLM_ENGINE_BUILD_FAILED,
                     "served_model_name": self.SERVED_MODEL_NAME,
                     "hf_repo_id": self.HF_REPO_ID,
+                    "error_type": "StartupTimeout",
+                    "error_msg": f"/health never returned 200 within {self._STARTUP_TIMEOUT_S}s",
+                    "phase": "VllmQrQwen._start_and_sleep",
+                },
+            )
+            raise RuntimeError(
+                f"vllm serve /health did not return 200 within {self._STARTUP_TIMEOUT_S}s"
+            )
+
+        # Engine is up. Put it to sleep so the snapshot captures it with
+        # GPU memory released. level=1 keeps weights pinned on CPU so
+        # wake_up is fast (~1-2 s); level=2 also discards weights and
+        # requires a full reload on wake — we want fast restore.
+        sleep_url = f"{self._VLLM_BASE_URL}/sleep?level=1"
+        t0 = time.monotonic()
+        try:
+            r = httpx.post(sleep_url, timeout=self._SLEEP_WAKE_TIMEOUT_S)
+            r.raise_for_status()
+        except Exception as err:
+            duration_ms = (time.monotonic() - t0) * 1000.0
+            log.error(
+                "vllm sleep failed for %s: %s",
+                self.SERVED_MODEL_NAME,
+                err,
+                extra={
+                    "event": VLLM_SLEEP_FAIL,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "duration_ms": duration_ms,
                     "error_type": type(err).__name__,
                     "error_msg": str(err),
-                    "traceback_tail": tb_tail,
-                    "phase": "VllmQrQwen.load",
                 },
             )
             raise
+        duration_ms = (time.monotonic() - t0) * 1000.0
+        log.info(
+            "vllm engine sleeping (snapshot-ready) for %s",
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": VLLM_SLEEP_OK,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "duration_ms": duration_ms,
+            },
+        )
 
     @modal.enter(snap=False)
-    def start_tunnel(self) -> None:
-        # Soft-fail: when the cloudflared sidecar cannot start (missing CF
-        # Access creds, cloudflared binary not on PATH, tunnel unreachable),
-        # log a structured event and continue. ``self._cloudflared = None``
-        # marks the sidecar as not running; the container still serves the
-        # model. qr-sampler's ``QuantumGrpcSource`` will fail to dial
-        # 127.0.0.1:50051, then ``FallbackEntropySource`` (configured via
-        # ``QR_FALLBACK_MODE=system`` in Dockerfile.vllm) transparently
-        # degrades to ``SystemEntropySource``. The per-request
-        # ``entropy.degraded`` events surface the QRNG outage to operators.
-        #
-        # Prior design hard-failed here, which killed the container AFTER
-        # the engine had successfully built (~5 min of GPU time wasted per
-        # cold-start) AND produced a misleading
-        # ``Engine core proc EngineCore_DP0 died unexpectedly`` shutdown
-        # cascade (atexit join → KeyboardInterrupt → subprocess exit 0).
-        # See ``obs.events.CLOUDFLARED_*`` for the post-mortem.
+    def _wake(self) -> None:
+        """Start cloudflared sidecar and wake the engine after snapshot restore.
+
+        Runs POST-snapshot on every cold-start (including the first
+        deploy after the snap=True branch). The cloudflared sidecar
+        intentionally starts here, not at snap=True, so no live socket
+        is frozen into the snapshot — see auto-memory
+        ``modal_vllm_303_hang`` and the prior implementation's
+        ``start_tunnel`` comment for the rationale.
+        """
+        import time
+
+        import httpx
+        from obs.events import VLLM_WAKE_FAIL, VLLM_WAKE_OK
+        from obs.logging import get_logger
+
+        log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
+
+        # Soft-fail tunnel startup: missing CF Access creds degrade us to
+        # system entropy via FallbackEntropySource (configured via
+        # QR_FALLBACK_MODE=system in Dockerfile.vllm). See
+        # ``_start_qrng_tunnel`` for the full soft-fail policy.
         self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
 
-    @modal.exit()
-    def stop_tunnel(self) -> None:
-        _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
+        wake_url = f"{self._VLLM_BASE_URL}/wake_up"
+        t0 = time.monotonic()
+        try:
+            r = httpx.post(wake_url, timeout=self._SLEEP_WAKE_TIMEOUT_S)
+            r.raise_for_status()
+        except Exception as err:
+            duration_ms = (time.monotonic() - t0) * 1000.0
+            log.error(
+                "vllm wake failed for %s: %s",
+                self.SERVED_MODEL_NAME,
+                err,
+                extra={
+                    "event": VLLM_WAKE_FAIL,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "duration_ms": duration_ms,
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                },
+            )
+            raise
+        duration_ms = (time.monotonic() - t0) * 1000.0
+        log.info(
+            "vllm engine awake (snapshot-restored) for %s",
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": VLLM_WAKE_OK,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "duration_ms": duration_ms,
+            },
+        )
 
-    @modal.asgi_app()
-    def serve(self) -> Any:
-        return self._asgi_app
+    @modal.exit()
+    def _stop(self) -> None:
+        """Tear down the sidecar and the vllm serve subprocess."""
+        import subprocess
+
+        _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
+        proc = getattr(self, "_vllm_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    @modal.web_server(port=_VLLM_PORT, startup_timeout=_STARTUP_TIMEOUT_S)
+    def serve(self) -> None:
+        """Modal proxies inbound HTTP traffic to ``vllm serve`` on port 8000.
+
+        The subprocess is already running by the time this function is
+        invoked (started in ``_start_and_sleep``, woken in ``_wake``).
+        @modal.web_server returns no app — Modal handles the proxy
+        itself; this function body is only entered for Modal's
+        port-readiness probe.
+        """
+        return None
 
 
 # ----- QRNG cloudflared sidecar wiring -------------------------------------
@@ -602,6 +754,7 @@ def _start_qrng_tunnel(served_model_name: str) -> Any:
         CLOUDFLARED_SIDECAR_SKIPPED,
     )
     from obs.logging import get_logger
+
     from qr_sampler.connectors.modal.cloudflared_sidecar import (
         CloudflaredConfig,
         CloudflaredConfigError,
@@ -653,13 +806,13 @@ def _start_qrng_tunnel(served_model_name: str) -> Any:
     sidecar = CloudflaredSidecar(config)
     try:
         sidecar.start()
-    except Exception as err:  # noqa: BLE001 -- sidecar failure must NOT kill the container
+    except Exception as err:
         # Cloudflared binary missing from PATH, tunnel unreachable,
         # service-token revoked, etc. Same soft-fail policy.
         stderr_tail = None
         try:
             stderr_tail = "\n".join(list(sidecar._stderr_tail)[-30:])
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         log.warning(
             "QRNG cloudflared sidecar failed to start for %s: %s: %s; "
@@ -676,8 +829,7 @@ def _start_qrng_tunnel(served_model_name: str) -> Any:
             },
         )
         log.info(
-            "QRNG cloudflared sidecar skipped for %s "
-            "(falling back to system entropy)",
+            "QRNG cloudflared sidecar skipped for %s (falling back to system entropy)",
             served_model_name,
             extra={
                 "event": CLOUDFLARED_SIDECAR_SKIPPED,
@@ -688,7 +840,7 @@ def _start_qrng_tunnel(served_model_name: str) -> Any:
         # Best-effort cleanup of any partially-started sidecar process.
         try:
             sidecar.stop()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return None
 
@@ -832,9 +984,7 @@ qr_llm_chat_secret = modal.Secret.from_name("qr-llm-chat-prod")
 # OWUI 0.9.5 keeps SQLite at /data/webui.db by default; we override with
 # a Neon DSN via OWUI_DATABASE_URL in the secret, but the Volume still
 # holds chat-attachment uploads and any future on-disk state.
-owui_data_volume = modal.Volume.from_name(
-    "qr-llm-chat-data", create_if_missing=True
-)
+owui_data_volume = modal.Volume.from_name("qr-llm-chat-data", create_if_missing=True)
 
 
 @app.cls(

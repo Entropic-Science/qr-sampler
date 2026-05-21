@@ -48,7 +48,10 @@ ARG VLLM_BASE_TAG=v0.17.0
 FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    VLLM_LOGGING_LEVEL=DEBUG \
+    VLLM_SERVER_DEV_MODE=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1
 
 # The vllm/vllm-openai base ships only `python3.12` + `pip` on PATH (pip's
 # shebang hardcodes /usr/local/bin/python3.12). Modal's image-attach step
