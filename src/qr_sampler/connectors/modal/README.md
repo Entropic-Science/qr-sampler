@@ -73,7 +73,7 @@ constants in `app.py`:
 `AdapterLogitsProcessor`). The Dockerfile layers
 `transformers @ git+...@main` and bumps `huggingface_hub>=0.30.0` on
 top because v0.17.0 ships `transformers<5`, but the `google/gemma-4-31B`
-(gemma-4 GDN) and `Qwen/Qwen3.6-27B` (qwen3_5 GDN) model architectures
+(gemma-4 GDN) and `Qwen/Qwen3.5-9B` (qwen3_5 GDN) model architectures
 only land in transformers `main` (v5.x). The recipe mirrors
 `createmp-evalsuite/modal_app.py` lines 46-67, which has empirically
 loaded both model families on Modal A100 GPUs.

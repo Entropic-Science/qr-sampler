@@ -1,6 +1,7 @@
 # Dockerfile for the Modal-hosted vLLM container that serves
-# Qwen 3.6 27B on H200 (was B200 pre-2026-05-19 cutover; Gemma 4 31B
-# paused 2026-05-20 — see app.py module docstring).
+# Qwen 3.5 9B at vLLM-default bf16 on H100:1 (was B200/H200 bf16 27B
+# pre-2026-05-21 cutover; FP8 was tried briefly in iter-06 drafts and
+# dropped; Gemma 4 31B paused 2026-05-20 — see app.py module docstring).
 #
 # Built once and pushed by `modal deploy -m qr_sampler.connectors.modal.app`.
 #
@@ -10,7 +11,7 @@
 #   * Hopper / H200 CUDA support (vLLM v0.17.0 ships matching CUDA wheels).
 #   * V1 engine (`AdapterLogitsProcessor`) -- ours plugs in via the
 #     `vllm.logits_processors` entry point.
-#   * Loads Qwen/Qwen3.6-27B (qwen3_5 GDN). The architecture entry only
+#   * Loads Qwen/Qwen3.5-9B (qwen3_5 GDN). The architecture entry only
 #     exists in transformers `main`, which the layer below installs over
 #     the base.
 #
@@ -18,18 +19,18 @@
 #   modal deploy -m qr_sampler.connectors.modal.app
 
 # vLLM v0.17.0 is the V1 engine release whose bundled transformers still
-# pins <5. The Qwen3.6-27B architecture we need to load (qwen3_5 GDN /
+# pins <5. The Qwen3.5-9B architecture we need to load (qwen3_5 GDN /
 # Qwen3_5ForConditionalGeneration) requires transformers>=5 (the
 # registration lives on `main`, not in any tagged release yet). We
 # override transformers below with --no-deps so vLLM's other pinned
 # siblings (tokenizers, safetensors, ...) keep their vLLM-validated
 # versions. Recipe mirrors C:/Code/createmp-evalsuite/modal_app.py
 # lines 46-67 which has already proven this combination loads Qwen3.5-9B
-# on Modal (the 27B variant we use has the same model_type=qwen3_5 but
-# adds a vision encoder; if vLLM's V1 ``profile_run`` MM dummy probe
-# proves unsuppressable on the 27B at this version, see the
-# ``vllm.hf.config_probe`` event in modal logs -- it records the HF
-# ``architectures`` + ``has_vision_config`` fields used to triage).
+# on Modal. The 9B has the same model_type=qwen3_5 + vision encoder as
+# the 27B; if vLLM's V1 ``profile_run`` MM dummy probe regresses at this
+# version, see the ``vllm.hf.config_probe`` event in modal logs -- it
+# records the HF ``architectures`` + ``has_vision_config`` fields used
+# to triage.
 #
 # Why we reverted v0.21.0 -> v0.17.0 (2026-05-20)
 # -----------------------------------------------
@@ -37,7 +38,7 @@
 # but produced two consecutive cold-start failures: (1) Gemma4 hit
 # ``max_tokens_per_mm_item (2496) > max_num_batched_tokens (2048)``
 # because vLLM's MM auto-config silently dropped our 4096 override; (2)
-# Qwen3.6-27B hit a ``StopIteration`` inside transformers ``Qwen3VLProcessor.
+# Qwen3.5-9B hit a ``StopIteration`` inside transformers ``Qwen3VLProcessor.
 # get_text_with_replacements`` from V1's unconditional MM dummy probe.
 # Neither knob (``limit_mm_per_prompt`` / ``max_num_batched_tokens``)
 # suppressed the probe. Reverting to v0.17.0 mirrors the
@@ -53,11 +54,22 @@ FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 # INFO once the EngineCore 500 cascade is closed and Phase 2 §15.1-15.5
 # success criteria are green. Tracked in
 # qr-llm-chat/CLEANUP_REPORT.md "Phase 2 follow-up reservations".
+#
+# Phase 3 iter-05 (2026-05-21): TORCH_NCCL_ENABLE_MONITORING=0 silences
+# the NCCL HeartbeatMonitor::runLoop thread that flooded iter-04 logs
+# with "Broken pipe" stack traces from TCPStore::check after Modal's
+# GPU-snapshot restore (the watchdog probes a socket that snapshot
+# captured pre-restore, so the FD doesn't survive). The monitor is a
+# debugging aid for multi-GPU collectives; on single-GPU H100 vLLM with
+# tensor_parallel=1 it has no collectives to watch anyway. Set via image
+# env so it takes effect BEFORE libtorch_cuda.so reads the env at NCCL
+# init time (subprocess env would be too late for the static init).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     VLLM_LOGGING_LEVEL=DEBUG \
     VLLM_SERVER_DEV_MODE=1 \
-    HF_HUB_ENABLE_HF_TRANSFER=1
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    TORCH_NCCL_ENABLE_MONITORING=0
 
 # The vllm/vllm-openai base ships only `python3.12` + `pip` on PATH (pip's
 # shebang hardcodes /usr/local/bin/python3.12). Modal's image-attach step
@@ -108,13 +120,13 @@ RUN apt-get update \
 # --- transformers main override (qwen3_5 GDN architecture) -----------------
 #
 # vLLM 0.17.0 pins transformers<5 in its wheel, but the qwen3_5 GDN
-# architecture (Qwen3.6-27B) only lands in transformers main (v5.x) --
-# it is not in any tagged release at the time of writing. We install
-# transformers@<pinned-commit> with --no-deps so vLLM's other pinned
-# siblings (tokenizers, safetensors, ...) keep their vLLM-validated
+# architecture (Qwen3.5-9B / Qwen3.6-27B) only lands in transformers main
+# (v5.x) -- it is not in any tagged release at the time of writing. We
+# install transformers@<pinned-commit> with --no-deps so vLLM's other
+# pinned siblings (tokenizers, safetensors, ...) keep their vLLM-validated
 # versions. Mirrors createmp-evalsuite/modal_app.py lines 64-67 (the
-# empirically proven recipe for the 9B sibling; we use it here for the
-# 27B variant which shares the same model_type).
+# empirically proven recipe for the 9B; both Qwen3_5 sizes share the same
+# model_type).
 #
 # transformers pin: tagged release v5.5.4 (was commit 52b82b2 from main,
 # replaced 2026-05-20 after iteration 1's StopIteration crash).
@@ -132,8 +144,8 @@ RUN apt-get update \
 #   (3) v5.5.4 is the version currently installed in the local dev
 #       venv; using it in the container too keeps deploy and local
 #       smoke-test behaviour aligned.
-#   (4) Per the vLLM Qwen3.6-27B recipe (recipes.vllm.ai/Qwen/
-#       Qwen3.6-27B), the model "works out of the box" with default
+#   (4) Per the vLLM Qwen3.5-9B recipe (recipes.vllm.ai/Qwen/
+#       Qwen3.5-9B), the model "works out of the box" with default
 #       MM enabled. With v5.5.4 transformers, that recipe applies to
 #       our deploy too.
 #

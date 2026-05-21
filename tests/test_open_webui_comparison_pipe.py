@@ -118,7 +118,7 @@ def _patched_pipe(monkeypatch: pytest.MonkeyPatch, handler: _RecordingHandler) -
     p.valves.service_token_secret = "secret-a,secret-b"
     p.valves.vllm_base_url = "https://vllm.example/v1"
     p.valves.vllm_api_key = "vllm-key"
-    p.valves.base_models = "gemma-4-31b-reasoning,qwen-3.6-27b-reasoning"
+    p.valves.base_models = "gemma-4-31b-reasoning,qwen3.5-9b-reasoning"
 
     real_async_client = httpx.AsyncClient
 
@@ -150,7 +150,7 @@ class TestPipesRegistry:
         ids = [e["id"] for e in entries]
         assert ids == [
             "gemma-4-31b-reasoning--qr-vs-prng",
-            "qwen-3.6-27b-reasoning--qr-vs-prng",
+            "qwen3.5-9b-reasoning--qr-vs-prng",
         ]
         # Display name carries the base + the comparison hint.
         assert all("Quantum vs Pseudo-random" in e["name"] for e in entries)
@@ -260,7 +260,7 @@ class TestStreamingFanOut:
         )
         pipe = _patched_pipe(monkeypatch, handler)
         body = {
-            "model": "qwen-3.6-27b-reasoning--qr-vs-prng",
+            "model": "qwen3.5-9b-reasoning--qr-vs-prng",
             "messages": [{"role": "user", "content": "hi"}],
         }
 
@@ -269,7 +269,7 @@ class TestStreamingFanOut:
         vllm_bodies = [
             json.loads(c.content) for c in handler.calls if c.url.path == "/v1/chat/completions"
         ]
-        assert all(b["model"] == "qwen-3.6-27b-reasoning" for b in vllm_bodies)
+        assert all(b["model"] == "qwen3.5-9b-reasoning" for b in vllm_bodies)
 
     def test_intermediate_yields_have_table_and_buffer_contents(
         self, monkeypatch: pytest.MonkeyPatch

@@ -76,8 +76,8 @@ def apply(valves: Any) -> None:
         model_base_urls["gemma-4-31b-reasoning"] = gemma
         model_base_urls["gemma-4-31b-reasoning--qr-vs-prng"] = gemma
     if qwen:
-        model_base_urls["qwen-3.6-27b-reasoning"] = qwen
-        model_base_urls["qwen-3.6-27b-reasoning--qr-vs-prng"] = qwen
+        model_base_urls["qwen3.5-9b-reasoning"] = qwen
+        model_base_urls["qwen3.5-9b-reasoning--qr-vs-prng"] = qwen
     if model_base_urls:
         overrides["model_base_urls"] = model_base_urls
 

@@ -204,7 +204,7 @@ def _install_mm_probe_skip_patch() -> None:
 
     vLLM V1's ``profile_run`` runs an MM dummy probe unconditionally for any
     HF model whose ``architectures`` ends in ``*ForConditionalGeneration``,
-    even when no MM input will ever flow. The probe crashes for Qwen3.6-27B
+    even when no MM input will ever flow. The probe crashes for Qwen3.5-9B
     (and Qwen3.5-9B, and several other "text-mostly" models whose HF config
     carries a populated vision_config) inside
     ``transformers.processing_utils.get_text_with_replacements`` with
@@ -273,8 +273,8 @@ async def build_engine(
 ) -> Any:
     """Construct one V1 ``AsyncLLM`` engine serving the configured model.
 
-    Per the official vLLM Qwen3.6-27B recipe (recipes.vllm.ai/Qwen/
-    Qwen3.6-27B), the model "works out of the box" with no special MM
+    Per the official vLLM Qwen3.5-9B recipe (recipes.vllm.ai/Qwen/
+    Qwen3.5-9B), the model "works out of the box" with no special MM
     flags — multimodality is enabled by default and OWUI can send
     image attachments via ``/v1/chat/completions``.
 

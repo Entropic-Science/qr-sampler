@@ -31,7 +31,7 @@ modal secret create qr-sampler-prod \
   QRNG_TUNNEL_HOSTNAME=qbert-grpc.cipherstone.co \
   CF_ACCESS_CLIENT_ID=<Cloudflare Access Service Token client id> \
   CF_ACCESS_CLIENT_SECRET=<Cloudflare Access Service Token client secret> \
-  VLLM_MODELS=gemma-4-31b-reasoning,qwen-3.6-27b-reasoning \
+  VLLM_MODELS=gemma-4-31b-reasoning,qwen3.5-9b-reasoning \
   VLLM_DEFAULT_MODEL=gemma-4-31b-reasoning \
   VLLM_MAX_MODEL_LEN=65536 \
   VLLM_GPU_MEMORY_UTILIZATION_PER_ENGINE=0.45 \

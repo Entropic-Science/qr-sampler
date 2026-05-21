@@ -285,7 +285,7 @@ class Pipe:
 
         # --- Pseudo-model registry ---
         base_models: str = Field(
-            default="gemma-4-31b-reasoning,qwen-3.6-27b-reasoning",
+            default="gemma-4-31b-reasoning,qwen3.5-9b-reasoning",
             description=(
                 "Comma-separated list of real base models. The Pipe registers one "
                 "pseudo-model per entry, suffixed `--qr-vs-prng`."
