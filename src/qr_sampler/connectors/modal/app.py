@@ -524,8 +524,12 @@ class VllmQrQwen:
         import subprocess
         import time
 
+        import re
+
         import httpx
         from obs.events import (
+            VLLM_ARGV_UNRECOGNIZED,
+            VLLM_ARGV_VALIDATED,
             VLLM_ENGINE_BUILD_FAILED,
             VLLM_SLEEP_FAIL,
             VLLM_SLEEP_OK,
@@ -562,8 +566,20 @@ class VllmQrQwen:
             self.HF_REPO_ID,
             "--served-model-name",
             self.SERVED_MODEL_NAME,
+            # Iter-08 candidate D finding: bind vllm serve to 0.0.0.0,
+            # NOT to self._VLLM_HOST (127.0.0.1). Modal's
+            # @modal.web_server(port=8000) proxies inbound traffic via
+            # the container's *external* interface — a connection that
+            # vllm serve refuses when bound to loopback only. Symptom is
+            # silent TLS-accepted-then-hang on every external request,
+            # NOT a vLLM 500. Internal /health/sleep/wake_up probes from
+            # _start_and_sleep / _wake still use self._VLLM_HOST
+            # (127.0.0.1) — they share the process tree and don't go
+            # through Modal's proxy. modal-labs/modal-examples
+            # 06_gpu_and_ml/llm-serving/vllm_inference.py uses the same
+            # 0.0.0.0 binding for the same reason.
             "--host",
-            self._VLLM_HOST,
+            "0.0.0.0",
             "--port",
             str(self._VLLM_PORT),
             # Phase 3 iter-06 (2026-05-21): --enable-sleep-mode RESTORED.
@@ -653,6 +669,102 @@ class VllmQrQwen:
             "--logits-processors",
             "qr_sampler.engines.vllm:VLLMAdapter",
         ]
+
+        # Iter-08 (2026-05-21): vLLM's CLI churns between minor releases
+        # (PR #21739 removed --disable-log-requests in v0.10/v0.11). Probe
+        # ``vllm serve --help`` once and assert every ``--xxx`` in ``cmd``
+        # is in the live supported set. Fail-loud: a stale flag now names
+        # itself in the traceback instead of crashing as rc=2 / "unrecognized
+        # arguments". On the happy path, the ``vllm.argv.validated`` event
+        # is the canonical "deploy went through the argv gate" grep target.
+        try:
+            # Budget: 90 s. ``vllm serve --help`` is NOT fast — it triggers
+            # vLLM's argparse setup which imports AsyncEngineArgs → torch
+            # → the engine subsystem. First invocation in a fresh container
+            # is 20-40 s wall. iter-08 candidate B observed timeout at 15 s
+            # (silent skip trap; helper provides zero protection). The wall
+            # time is absorbed by the subsequent weight-load step since
+            # vllm serve was going to perform the same imports anyway.
+            #
+            # COLUMNS=200 + NO_COLOR=1: vLLM 0.17+ uses Rich for the help
+            # output. Rich's auto-wrap on narrow TTY breaks flag tokens
+            # across lines (``--max-model-`` then ``len`` on next line),
+            # and Rich's ANSI color codes break the regex. Force a wide
+            # terminal AND no-color to keep flag tokens contiguous + plain
+            # ASCII. iter-08 candidate C observed the 90 s probe succeed
+            # but return a flag set missing every core vllm-serve flag,
+            # because the help output was Rich-formatted.
+            help_env = dict(env)
+            help_env["COLUMNS"] = "200"
+            help_env["NO_COLOR"] = "1"
+            help_env["TERM"] = "dumb"
+            help_proc = subprocess.run(
+                ["vllm", "serve", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                env=help_env,
+            )
+            help_text = (help_proc.stdout or "") + (help_proc.stderr or "")
+            # Strip ANSI escape sequences as a belt-and-braces measure.
+            help_text = re.sub(r"\x1b\[[0-9;]*[mGKHfABCDsuJ]", "", help_text)
+            supported_flags = set(re.findall(r"--[a-z][a-z0-9-]*", help_text))
+        except Exception as err:
+            log.warning(
+                "vllm serve --help probe failed; skipping argv validation",
+                extra={
+                    "event": "vllm.argv.help_probe_failed",
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                },
+            )
+            supported_flags = set()
+        if supported_flags:
+            cmd_flags = [t for t in cmd if t.startswith("--")]
+            unknown = [t for t in cmd_flags if t not in supported_flags]
+            # Sanity check: if more than HALF the cmd's --flags look unknown,
+            # the probe parsing is implausibly bad — likely a vLLM help
+            # format change the regex can't keep up with. Fail-open with a
+            # WARNING rather than crash a working boot. iter-08 candidate
+            # C surfaced this: parsing returned a flag set missing every
+            # core vllm-serve flag, which would have raised RuntimeError
+            # on every container start despite the cmd being correct.
+            if unknown and len(unknown) > len(cmd_flags) / 2:
+                log.warning(
+                    "vllm.argv probe parsing returned implausible flag set "
+                    "(%d of %d cmd flags marked unknown); skipping validation",
+                    len(unknown),
+                    len(cmd_flags),
+                    extra={
+                        "event": "vllm.argv.probe_implausible",
+                        "unknown_flags": unknown,
+                        "supported_flag_count": len(supported_flags),
+                    },
+                )
+            elif unknown:
+                sample = sorted(supported_flags)[:20]
+                log.error(
+                    "vllm serve argv contains unrecognized flag(s): %s",
+                    unknown,
+                    extra={
+                        "event": VLLM_ARGV_UNRECOGNIZED,
+                        "unknown_flags": unknown,
+                        "supported_flags_sample": sample,
+                    },
+                )
+                raise RuntimeError(
+                    f"vllm serve argv contains unrecognized flag(s) {unknown}; "
+                    f"supported sample={sample}"
+                )
+            else:
+                log.info(
+                    "vllm serve argv validated against live --help output",
+                    extra={
+                        "event": VLLM_ARGV_VALIDATED,
+                        "cmd": cmd,
+                        "supported_flag_count": len(supported_flags),
+                    },
+                )
 
         log.info(
             "Spawning vllm serve subprocess for %s",
