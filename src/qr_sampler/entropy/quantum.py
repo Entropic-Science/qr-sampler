@@ -311,11 +311,22 @@ class QuantumGrpcSource(EntropySource):
         """Create the gRPC async channel and generic method handles."""
         import grpc.aio
 
+        # gRPC keepalive: tuned to respect the server's default
+        # ``min_ping_interval_without_data_ms = 300_000`` (5 min) policy.
+        # Earlier config (30 s + permit_without_calls=True +
+        # max_pings_without_data=0) pinged so aggressively that the QRNG
+        # server / cloudflared front replied ``GOAWAY ENHANCE_YOUR_CALM
+        # (too_many_pings)`` and dropped the channel mid-call (Errno 11
+        # BlockingIOError surfaced from grpcio's PollerCompletionQueue
+        # was the visible symptom). Per-token traffic keeps the channel
+        # busy anyway so ``permit_without_calls=False`` is harmless on
+        # the hot path; we still get a single keepalive on long idle
+        # gaps because the timer fires after ``keepalive_time_ms``
+        # elapses with no data.
         options = [
-            ("grpc.keepalive_time_ms", 30_000),
-            ("grpc.keepalive_timeout_ms", 10_000),
-            ("grpc.keepalive_permit_without_calls", True),
-            ("grpc.http2.max_pings_without_data", 0),
+            ("grpc.keepalive_time_ms", 300_000),
+            ("grpc.keepalive_timeout_ms", 20_000),
+            ("grpc.keepalive_permit_without_calls", False),
         ]
 
         self._channel = grpc.aio.insecure_channel(self._address, options=options)

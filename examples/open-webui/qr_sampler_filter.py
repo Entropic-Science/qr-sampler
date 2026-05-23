@@ -3,9 +3,9 @@
 title: QR-Sampler Parameters
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.5.0
+version: 0.6.0
 license: MIT
-description: qr-sampler params + entropic.science allowance metering + cold-start indicator + per-user creative-vs-T=1 sampling preset toggle + Qwen3.6 thinking-mode disable.
+description: qr-sampler params + entropic.science allowance metering + cold-start indicator + per-user creative-vs-T=1 sampling preset toggle + Qwen3.6 thinking-mode disable + QRNG-fallback warning banner.
 """
 
 from __future__ import annotations
@@ -374,6 +374,28 @@ class Filter:
             default="Spinning up the model — first request after a quiet period.",
             description="Markdown copy rendered above the assistant message during a cold start.",
         )
+
+        entropy_degraded_enabled: bool = Field(
+            default=True,
+            description=(
+                "Probe the upstream's /health/entropy on each inlet and emit "
+                "a visible warning above the assistant message when the QRNG "
+                "is unreachable (sampling falls back to system PRNG)."
+            ),
+        )
+        entropy_degraded_probe_timeout_s: float = Field(
+            default=1.5,
+            description="Hard cap on the QRNG-health probe HTTP request.",
+        )
+        entropy_degraded_message: str = Field(
+            default=(
+                "⚠️ Quantum entropy source unavailable — "
+                "this response is being sampled from the system PRNG fallback. "
+                "Quantum-driven sampling will resume automatically once the "
+                "QRNG endpoint becomes reachable again."
+            ),
+            description="Markdown copy rendered above the assistant message when QRNG is degraded.",
+        )
         cold_start_first_token_timeout_s: float = Field(
             default=60.0,
             description=(
@@ -399,7 +421,7 @@ class Filter:
             description="Temperature strategy: 'fixed' or 'edt' (entropy-dependent).",
         )
         fixed_temperature: float = Field(
-            default=0.7,
+            default=1.0,
             description="Constant temperature when strategy is 'fixed'.",
         )
         edt_base_temp: float = Field(
@@ -598,6 +620,9 @@ class Filter:
         if self.valves.cold_start_enabled:
             await self._maybe_emit_cold_start(body, __event_emitter__)
 
+        if self.valves.entropy_degraded_enabled:
+            await self._maybe_emit_entropy_degraded(body, __event_emitter__)
+
         # `stream: True` (or `False`) set by the caller is preserved as-is.
         return body
 
@@ -789,6 +814,67 @@ class Filter:
             return
 
         self._fallback_warned.add(dedup_key)
+
+    async def _maybe_emit_entropy_degraded(
+        self,
+        body: dict[str, Any],
+        emitter: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """Probe ``/health/entropy``; emit a visible warning if QRNG is in fallback.
+
+        The qr-sampler exposes ``/health/entropy`` on the same base URL
+        as ``/v1/chat/completions``. When the upstream QRNG is unreachable
+        (network failure, Cipherstone outage, provider-side rate limit),
+        the qr-sampler falls back to the system PRNG and the response is
+        no longer quantum-driven — which users care about. We probe the
+        endpoint here, on every inlet, and emit a prominent ``status``
+        event so the fallback is immediately visible above the assistant
+        bubble. A ``None`` result (probe couldn't reach the endpoint at
+        all) is treated as "unknown" and emits nothing — that case is
+        already covered by the cold-start indicator.
+        """
+        if emitter is None:
+            return
+        requested_model = body.get("model")
+        per_model_url = ""
+        if isinstance(requested_model, str) and requested_model:
+            per_model_url = (self.valves.model_base_urls or {}).get(requested_model, "").strip()
+        probe_base = (
+            per_model_url
+            or self.valves.cold_start_probe_base_url
+            or os.environ.get("OPENAI_API_BASE_URL", "")
+        ).strip()
+        if not probe_base:
+            return
+        url = probe_base.rstrip("/") + "/health/entropy"
+        try:
+            async with httpx.AsyncClient(timeout=self.valves.entropy_degraded_probe_timeout_s) as client:
+                response = await client.get(url)
+        except httpx.HTTPError:
+            return
+        if response.status_code != 200:
+            return
+        try:
+            payload = response.json()
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        rpc_ok = payload.get("rpc_ok")
+        if rpc_ok is True or not isinstance(rpc_ok, bool):
+            return
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": self.valves.entropy_degraded_message,
+                        "done": True,
+                    },
+                }
+            )
+        except Exception as exc:
+            _log.warning("entropy-degraded emit failed: %s", exc)
 
     async def _maybe_emit_cold_start(
         self,

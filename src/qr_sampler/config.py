@@ -199,8 +199,18 @@ class QRSamplerConfig(BaseSettings):
         description="Temperature strategy: 'fixed' or 'edt'",
     )
     fixed_temperature: float = Field(
-        default=0.7,
-        description="Constant temperature for fixed strategy",
+        default=1.0,
+        description=(
+            "Constant temperature for fixed strategy. Default is 1.0 — the "
+            "true 'no temperature scaling' baseline (logits used as-is for "
+            "quantum-driven softmax selection). The `creative_sampling` "
+            "preset overrides this with the HVH-Drift dynamic strategy "
+            "(temperature_strategy=hvh_drift, base 1.35 with per-token "
+            "entropy/varentropy drift). Earlier default of 0.7 was inherited "
+            "from generic LLM-sampling conventions but is wrong for a "
+            "quantum-entropy baseline — sharpening the distribution makes "
+            "the QRNG signal less load-bearing."
+        ),
     )
     edt_base_temp: float = Field(
         default=0.8,
