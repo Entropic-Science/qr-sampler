@@ -2,9 +2,9 @@
 title: QR vs PRNG Comparison
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.2.0
+version: 0.3.0
 license: MIT
-description: Streaming dual-column comparison of quantum vs pseudo-random sampling.
+description: Live-replacing dual-column comparison of quantum vs pseudo-random sampling + OWUI 0.9.5 pipe-id prefix fix.
 """
 
 from __future__ import annotations
@@ -58,10 +58,11 @@ _PREFLIGHT_PATH = "/allowance/preflight"
 _UPSERT_PATH = "/conversations/upsert"
 _QUANTUM_LABEL = "Quantum"
 _PRNG_LABEL = "Pseudo-random"
-# Multiplication-sign and middle-dot are intentional per spec section 5.4 markdown.
-_INTRO_BLOCKQUOTE = (
-    "> Comparison mode is on. Same prompt, same model, only the random source differs.\n"
-    f">\n> **Left = {_QUANTUM_LABEL}** \u00b7 **Right = {_PRNG_LABEL}** \u00b7 ~2\u00d7 usage"
+# Compact status caption surfaced via the OWUI ``status`` event once at the
+# top of the stream \u2014 replaces the prior verbose blockquote preamble which
+# was being re-rendered on every streaming tick.
+_COMPARISON_STATUS_DESCRIPTION = (
+    f"Comparison mode \u00b7 {_QUANTUM_LABEL} vs {_PRNG_LABEL} \u00b7 ~2\u00d7 usage"
 )
 
 _log = logging.getLogger("qr_sampler.open_webui_comparison_pipe")
@@ -87,16 +88,15 @@ def _render_dual_column_markdown(
 ) -> str:
     """Render the dual-column markdown table.
 
-    Per spec §5.4, the message content is re-emitted on every delta tick with
-    the full current state of both buffers. Pipe characters in the buffer
-    contents would break the table layout, so they are escaped to `\\|`.
-    Newlines inside a buffer are converted to `<br>` because markdown table
-    cells cannot contain raw newlines.
+    The buffer state is pushed via OWUI ``replace`` events (see ``_run``)
+    rather than re-yielded into the message body, so this no longer
+    includes the verbose preamble blockquote — the table header row
+    labels the columns directly and the comparison-mode caption lives in
+    the status indicator above the bubble.
     """
     safe_left = _escape_for_table_cell(left)
     safe_right = _escape_for_table_cell(right)
     body = (
-        f"{_INTRO_BLOCKQUOTE}\n\n"
         f"| {_QUANTUM_LABEL} | {_PRNG_LABEL} |\n"
         "|---|---|\n"
         f"| {safe_left} | {safe_right} |"
@@ -229,8 +229,20 @@ def _coerce_nonneg_int(value: Any) -> int:
     return max(0, result)
 
 
+_OWUI_PIPE_FUNCTION_PREFIX = "qr_comparison_pipe."
+
+
 def _strip_pseudo_suffix(model_id: str) -> str:
-    """`gemma-4-31b-reasoning--qr-vs-prng` → `gemma-4-31b-reasoning`."""
+    """Reduce an OWUI-routed pipe model id to its base served-model id.
+
+    OWUI 0.9.5 dispatches to a Pipe function with ``body["model"]`` set to
+    the fully-qualified id ``<function_id>.<pipe_entry_id>`` (e.g.
+    ``qr_comparison_pipe.gemma-4-31b-reasoning--qr-vs-prng``). vLLM's
+    ``/v1/models`` only knows the bare served name, so we strip both the
+    OWUI function-id prefix and the ``--qr-vs-prng`` pseudo-model suffix
+    before forwarding upstream.
+    """
+    model_id = model_id.removeprefix(_OWUI_PIPE_FUNCTION_PREFIX)
     if model_id.endswith(_PSEUDO_MODEL_SUFFIX):
         return model_id[: -len(_PSEUDO_MODEL_SUFFIX)]
     return model_id
@@ -454,6 +466,25 @@ class Pipe:
         # the Modal endpoint serving `base_model`, so only that container wakes.
         cold_indicator_emitted = await self._maybe_emit_cold_start(emitter, base_model)
 
+        # Compact status caption emitted ONCE so OWUI surfaces
+        # "Comparison mode · Quantum vs Pseudo-random" above the
+        # assistant bubble instead of re-rendering a preamble inside the
+        # message body on every streaming tick. Skipped when the
+        # cold-start indicator already claims the status slot.
+        if emitter is not None and not cold_indicator_emitted:
+            try:
+                await emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": _COMPARISON_STATUS_DESCRIPTION,
+                            "done": False,
+                        },
+                    }
+                )
+            except Exception as exc:
+                _log.warning("comparison status emit failed: %s", exc)
+
         l_buf: list[str] = []
         r_buf: list[str] = []
         l_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -511,8 +542,18 @@ class Pipe:
                 delta_event.set()
             except Exception as exc:
                 # Surface in-column, keep the other side running.
-                _log.warning("comparison side %s errored: %s", entropy_source, exc)
-                buf.append(f"[stream error: {exc}]")
+                # Include the exception TYPE alongside its str. Some httpx
+                # exceptions (e.g. ``RemoteProtocolError``, ``ReadError``)
+                # serialise with an empty message when the underlying socket
+                # is closed mid-stream — without the type prefix the user
+                # would see ``[stream error: ]`` and have nothing to act on.
+                exc_label = type(exc).__name__
+                exc_msg = str(exc).strip()
+                rendered_exc = f"{exc_label}: {exc_msg}" if exc_msg else exc_label
+                _log.warning(
+                    "comparison side %s errored: %s", entropy_source, rendered_exc
+                )
+                buf.append(f"[stream error: {rendered_exc}]")
                 delta_event.set()
 
         left_task = asyncio.create_task(
@@ -522,6 +563,14 @@ class Pipe:
             consume_side("system", r_buf, r_usage),
         )
 
+        # OWUI's pipe contract appends every ``yield``-ed string to the
+        # message body, which is wrong for a dual-column markdown table
+        # that needs to be re-rendered on each token tick. We push live
+        # updates via the ``replace`` event_emitter type (see
+        # open_webui/socket/main.py:948-957: ``replace`` upserts the
+        # message ``content`` field) and yield exactly once at the end so
+        # the standard SSE/get_message_content persistence path stores
+        # the same final markdown.
         last_emitted = ""
         try:
             while not (left_task.done() and right_task.done()):
@@ -534,8 +583,13 @@ class Pipe:
                 wait_event.cancel()
                 delta_event.clear()
                 rendered = _render_dual_column_markdown("".join(l_buf), "".join(r_buf))
-                if rendered != last_emitted:
-                    yield rendered
+                if rendered != last_emitted and emitter is not None:
+                    try:
+                        await emitter(
+                            {"type": "replace", "data": {"content": rendered}}
+                        )
+                    except Exception as exc:
+                        _log.warning("comparison replace emit failed: %s", exc)
                     last_emitted = rendered
                 # Re-check loop condition after each wakeup.
                 if left_task in done and right_task in done:
@@ -564,8 +618,23 @@ class Pipe:
         final_render = _render_dual_column_markdown(
             "".join(l_buf), "".join(r_buf), usage_footer=usage_footer
         )
-        if final_render != last_emitted:
-            yield final_render
+        # Clear the comparison-mode status caption now that the table
+        # body carries the final state on its own.
+        if emitter is not None and not cold_indicator_emitted:
+            try:
+                await emitter(
+                    {"type": "status", "data": {"description": "", "done": True}}
+                )
+            except Exception as exc:
+                _log.warning("comparison status clear failed: %s", exc)
+        if emitter is not None and final_render != last_emitted:
+            try:
+                await emitter(
+                    {"type": "replace", "data": {"content": final_render}}
+                )
+            except Exception as exc:
+                _log.warning("comparison final replace emit failed: %s", exc)
+        yield final_render
 
         # Skip metering when no tokens were generated (PRD R-3.5: cold-start
         # timeout or upstream failure must not consume allowance).
@@ -752,6 +821,15 @@ class Pipe:
             **existing_extra,
             "qr_entropy_source_type": entropy_source_type,
         }
+        # Disable Qwen3.6's default thinking-mode output on BOTH sides
+        # (quantum + PRNG) regardless of whether upstream injected the
+        # kwarg. Explicit-set (rather than allow-list pass-through) keeps
+        # the comparison sides symmetric even when a caller bypasses the
+        # filter. ``chat_template_kwargs`` is a top-level vLLM
+        # ChatCompletionRequest field consumed by the Jinja chat template,
+        # not a logits-processor parameter — so it goes on ``side_body``
+        # directly, not under ``extra_body`` / ``vllm_xargs``.
+        side_body["chat_template_kwargs"] = {"enable_thinking": False}
         return side_body
 
     # -- entropic.science API ---------------------------------------------

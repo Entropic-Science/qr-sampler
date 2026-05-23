@@ -4,7 +4,7 @@ Layout (matches spec.md §5.5 / §4.1, with the labs-cutover per-model split):
 
     weights_volume     — Volume "llm-weights", mounted at /root/.cache/huggingface
     download_weights   — one-shot @app.function to populate weights_volume
-    VllmQrQwen         — @app.cls (H100:1) running Qwen/Qwen3.5-9B (bf16) alone
+    VllmQrQwen         — @app.cls (H100:1) running Qwen/Qwen3.6-27B-FP8 alone
 
 Each model is its own scale-to-zero @app.cls so OWUI's model picker wakes
 only the requested container. Open WebUI itself is provided by the
@@ -14,17 +14,33 @@ lives in the downstream `qr-llm-chat` package, imported lazily inside
 the @modal.enter hooks so this module stays usable without that
 dependency installed.
 
-Gemma 4 31B pause + Qwen 3.5 9B MM-probe monkey-patch (2026-05-21)
-------------------------------------------------------------------
+The active served model is configured at the top of this file via the
+``MODEL_*`` constants block. Swapping models is a four-line edit
+(``MODEL_HF_REPO_ID`` / ``MODEL_SERVED_NAME`` / ``MODEL_REVISION`` /
+``MODEL_GPU_MEMORY_UTILIZATION``) plus running ``download_weights`` for
+the new repo. ``MODEL_SERVED_NAME`` MUST stay in lockstep with
+``_QWEN_ID`` in ``qr_llm_chat/bootstrap_connections.py`` and the Pipe's
+``base_models`` default.
+
+Gemma 4 31B pause + Qwen 3.* MM-probe monkey-patch
+--------------------------------------------------
 1. ``VllmQrGemma`` (google/gemma-4-31B) is paused while the vLLM/
    transformers ecosystem stabilises around the gemma-4 GDN architecture.
    vLLM 0.17.0 does not register ``Gemma4ForConditionalGeneration``.
    Restore Gemma when a vLLM release ships gemma-4 GDN support.
 
-2. ``VllmQrQwen`` serves Qwen/Qwen3.5-9B at vLLM defaults (bf16, served
-   as ``qwen3.5-9b``). Both 9B and 27B Qwen3_5 variants have a populated
-   HF ``vision_config`` so vLLM V1's ``profile_run`` would otherwise run
-   an unconditional MM dummy probe that crashes in
+2. ``VllmQrQwen`` currently serves Qwen/Qwen3.6-27B-FP8 (HF-published
+   FP8 build, ~27 GiB resident weights, served as ``qwen3.6-27b``).
+   vLLM auto-detects the FP8 quantization config from the model's
+   ``config.json`` so no explicit ``--quantization fp8`` flag is needed
+   on the ``vllm serve`` command line. The bf16 build of the same model
+   was tried first but its ~54 GiB resident weight set exceeded Modal's
+   CRIU+CUDA checkpointer's reliable restore window
+   (``CudaCheckpointException: Get state command timed out``), so we
+   moved to the FP8 build whose half-size footprint sits comfortably
+   below the empirical ceiling. Both 9B and 27B Qwen3.* variants carry
+   a populated HF ``vision_config`` so vLLM V1's ``profile_run`` would
+   otherwise run an unconditional MM dummy probe that crashes in
    ``transformers.processing_utils.get_text_with_replacements`` with
    ``StopIteration``. The load-bearing fix is in
    ``qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch``,
@@ -34,8 +50,8 @@ Gemma 4 31B pause + Qwen 3.5 9B MM-probe monkey-patch (2026-05-21)
    ONE event (``vllm.mm.probe_skipped``) on every cold-start; absence of
    that event on a future cold-start means the patch lost its hook.
 
-Both prior model directories remain on the ``llm-weights`` volume; the
-restore path is a code-only change.
+Both prior model directories (Qwen3.5-9B, gemma-4-31B) remain on the
+``llm-weights`` volume; restoring either is a code-only change.
 
 Deploy:
     modal deploy -m qr_sampler.connectors.modal.app
@@ -71,6 +87,22 @@ from typing import Any
 import modal
 
 APP_NAME = "qr-llm-chat"
+
+# ---- Served model: single source of truth ----------------------------------
+# To swap the served model, edit these four constants, then:
+#   1. modal run -m qr_sampler.connectors.modal.app::download_weights
+#   2. modal deploy -m qr_sampler.connectors.modal.app
+#
+# ``MODEL_SERVED_NAME`` MUST stay in lockstep with ``_QWEN_ID`` in
+# ``qr_llm_chat/bootstrap_connections.py`` and with the comparison Pipe's
+# ``base_models`` default in
+# ``qr_llm_chat/functions/_sources/qr_comparison_pipe.py``. A mismatch breaks
+# OWUI routing (vLLM returns 404 on /v1/chat/completions when ``model:``
+# does not match ``/v1/models``).
+MODEL_HF_REPO_ID = "Qwen/Qwen3.6-27B-FP8"  # HF-published FP8 build (~27 GiB resident, vs ~54 GiB for bf16)
+MODEL_SERVED_NAME = "qwen3.6-27b"  # /v1/models id; lockstep with qr-llm-chat _QWEN_ID (precision is implementation detail, not picker-visible)
+MODEL_REVISION = os.environ.get("QWEN_REVISION", "")  # optional commit SHA pin
+MODEL_GPU_MEMORY_UTILIZATION = "0.8"  # was 0.9; lowered to match Modal's lfm_snapshot.py example for snapshot-restore reliability (smaller resident GPU state = faster cuda-checkpoint enumeration)
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
 # module import (i.e. each Modal container's Python process boot). The
@@ -155,9 +187,10 @@ def _qr_llm_chat_functions_dir() -> Path:
 
 # --- Volumes ---------------------------------------------------------------
 
-# Currently only Qwen 3.5 9B (served at bf16, vLLM default) is actively
-# served; the volume also retains prior model directories (Qwen 3.6 27B,
-# Gemma 4 31B) for warm-cache resume if those classes return.
+# Currently only Qwen 3.6 27B-FP8 (HF-published FP8 build) is actively
+# served; the volume also retains prior model directories (Qwen 3.6 27B
+# bf16, Qwen 3.5 9B, Gemma 4 31B) for warm-cache resume if any of those
+# return as the active ``MODEL_HF_REPO_ID``.
 # Populated by `download_weights`; each class mounts it read-only and reads
 # only its own subdirectory at engine init.
 weights_volume = modal.Volume.from_name("llm-weights", create_if_missing=True)
@@ -182,16 +215,23 @@ hf_token_secret = modal.Secret.from_name("huggingface-secret")
 # Lightweight image for the one-shot weights downloader.
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
-    # pydantic + pydantic-settings are needed because Modal's harness imports
-    # this entire module (``qr_sampler.connectors.modal.app``) to introspect
-    # ``download_weights`` before launching it, and the import transitively
-    # hits ``qr_sampler.__init__:19`` → ``qr_sampler.config`` which imports
-    # pydantic. Without these deps the function fails to start with
-    # ``ModuleNotFoundError: No module named 'pydantic'``.
+    # The full qr-sampler runtime dep set (mirroring pyproject.toml) is
+    # needed here because Modal's harness imports the entire defining
+    # module (``qr_sampler.connectors.modal.app``) to introspect
+    # ``download_weights`` before launching it. That import walks
+    # ``qr_sampler.__init__`` → ``qr_sampler.core.pipeline`` (numpy) →
+    # ``qr_sampler.entropy.registry`` (grpcio/protobuf) →
+    # ``qr_sampler.config`` (pydantic/pyyaml). Missing any one of these
+    # crashes the container at module-import time before download_weights
+    # is ever called.
     .pip_install(
         "huggingface_hub>=0.24",
-        "pydantic>=2,<3",
-        "pydantic-settings>=2,<3",
+        "numpy>=1.26,<3",
+        "pydantic>=2.5.0,<3",
+        "pydantic-settings>=2.5.0,<3",
+        "grpcio>=1.68.0",
+        "protobuf>=5.26.0",
+        "pyyaml>=6.0",
     )
     .env(
         {
@@ -270,25 +310,21 @@ app = modal.App(APP_NAME)
 # ----- One-shot weights download -------------------------------------------
 
 
-# 2026-05-21: Qwen/Qwen3.5-9B is the active build target — smaller, faster
-# cold-start than the briefly-tried 27B (createmp-evalsuite uses 9B
-# successfully). Both 9B and 27B variants share Qwen3_5ForConditionalGeneration
-# with a populated HF ``vision_config``; the MM-probe patch in
+# 2026-05-22: Qwen/Qwen3.6-27B-FP8 is the active build target. Both 9B and
+# 27B Qwen3.* variants (including the FP8 build) carry a populated HF
+# ``vision_config``; the MM-probe patch in
 # ``qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch``
 # (monkey-patches ``GPUModelRunner.profile_run`` to flip
 # ``mm_config.skip_mm_profiling=True``, vLLM's supported short-circuit at
 # gpu_model_runner.py:5226) suppresses the MM dummy probe for both sizes,
-# so this constant can swap without touching the patch.
+# so the served model can swap without touching the patch.
 #
-# MUST stay in lockstep with ``VllmQrQwen.HF_REPO_ID`` below — both reference
-# the same Hugging Face repo, one at download time, one at serve time. We
-# serve at vLLM default precision (bf16, matching HF's native dtype), so the
-# served model id (``SERVED_MODEL_NAME``) is the bare ``qwen3.5-9b`` with no
-# precision suffix.
-_QWEN_REPO = "Qwen/Qwen3.5-9B"
-# Pinned revisions are recorded here at deploy time. Empty string means
-# "latest at download time" — pin once you know the SHA you want to lock to.
-_QWEN_REVISION = os.environ.get("QWEN_REVISION", "")
+# The HF repo + revision below alias the module-level ``MODEL_HF_REPO_ID`` /
+# ``MODEL_REVISION`` declared near the top of this file. To swap models,
+# edit the ``MODEL_*`` block — not these aliases. The underscore-prefixed
+# names are retained for back-compat with anything that imports them.
+_QWEN_REPO = MODEL_HF_REPO_ID
+_QWEN_REVISION = MODEL_REVISION
 
 
 @app.function(
@@ -303,12 +339,18 @@ def download_weights() -> dict[str, str]:
     Run once per model switch / version bump:
         modal run -m qr_sampler.connectors.modal.app::download_weights
 
-    Idempotent — re-running just re-validates the cache. As of 2026-05-21
-    this targets Qwen/Qwen3.5-9B (served at vLLM-default bf16); the
-    MM-probe monkey-patch in ``vllm_serve._install_mm_probe_skip_patch``
-    makes this variant cold-startable. Prior weight directories
-    (Qwen3.6-27B, google/gemma-4-31B) remain on the volume so resuming
-    either is a code-only change with a warm cache hit.
+    Idempotent — re-running just re-validates the cache. The active repo +
+    optional revision pin come from the module-level ``MODEL_HF_REPO_ID`` /
+    ``MODEL_REVISION`` constants (aliased here as ``_QWEN_REPO`` /
+    ``_QWEN_REVISION``). As of 2026-05-22 this targets Qwen/Qwen3.6-27B-FP8
+    (the HF-published FP8 build, ~27 GiB resident weights — chosen over
+    the bf16 build because the latter's 54 GiB footprint exceeded Modal's
+    CRIU+CUDA checkpointer's reliable restore window). The MM-probe
+    monkey-patch in ``vllm_serve._install_mm_probe_skip_patch`` makes the
+    Qwen3.* family cold-startable regardless of the precision build.
+    Prior weight directories (Qwen/Qwen3.6-27B bf16, Qwen/Qwen3.5-9B,
+    google/gemma-4-31B) remain on the volume so resuming any of them is
+    a code-only change to ``MODEL_HF_REPO_ID`` with a warm cache hit.
     """
     from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
 
@@ -397,12 +439,13 @@ _CLS_KWARGS: dict[str, Any] = {
     # snap=True (POST /sleep?level=1, requires VLLM_SERVER_DEV_MODE=1) and
     # woken at snap=False (POST /wake_up).
     "experimental_options": {"enable_gpu_snapshot": True},
-    # 30 min idle -> shutdown. With GPU snapshot enabled, restore is
-    # cheap (~10-15 s) so scaling to zero is safe. We keep 1800 s for
-    # interactive chat UX (next message arrives while still warm) rather
-    # than relying purely on snapshot restore for every "let me think"
-    # pause.
-    "scaledown_window": 1800,
+    # 3 min idle -> shutdown. With GPU snapshot enabled, restore is
+    # cheap (~10-15 s) so scaling to zero aggressively is safe — the
+    # snapshot-restore is the warm path for any pause longer than the
+    # window. Tight scaledown keeps idle GPU cost minimal; a longer
+    # window (e.g. 1800 s) trades cost for occasionally skipping the
+    # restore on "let me think" pauses inside a chat session.
+    "scaledown_window": 180,
     "max_containers": 1,  # Pre-flight §11.8 cost ceiling, per model
     # Phase 3 iter-06 (2026-05-21): 2-hour container timeout (was 1 hour).
     # The snap=True path can legitimately consume up to:
@@ -417,13 +460,16 @@ _CLS_KWARGS: dict[str, Any] = {
 }
 
 
-# Phase 2 (2026-05-21): the vLLM class inherits the full snapshot config
-# from _CLS_KWARGS. The prior ``enable_memory_snapshot=False`` override is
-# removed because the new lifecycle starts ``vllm serve`` in
-# ``@modal.enter(snap=True)`` — with ``experimental_options={"enable_gpu_snapshot":
-# True}`` the GPU is attached during the snap=True phase, so the old
-# ``CUDA_VISIBLE_DEVICES=none`` crash in ``device_id_to_physical_device_id``
-# no longer applies.
+# 2026-05-22: switched the 27B from native bf16 (54 GiB resident weights —
+# beyond Modal's CRIU+CUDA checkpointer's reliable restore window, which
+# produced intermittent ``CudaCheckpointException: Get state command
+# timed out`` failures after scale-to-zero) to the HF-published FP8 build
+# ``Qwen/Qwen3.6-27B-FP8`` at ~27 GiB. The smaller resident footprint
+# fits comfortably within the checkpointer's headroom (the 9B at
+# ~10 GiB checkpointed reliably; 27 GiB is well below the empirical
+# ceiling), so we keep the snapshot-restored lifecycle and the
+# corresponding ~10-15 s warm restore. ``experimental_options`` is
+# unchanged from ``_CLS_KWARGS``.
 @app.cls(**_CLS_KWARGS)
 @modal.concurrent(max_inputs=8)
 class VllmQrQwen:
@@ -460,34 +506,41 @@ class VllmQrQwen:
     * ``@modal.exit() _stop`` — terminates the sidecar and the vLLM
       subprocess on container shutdown.
 
-    Qwen3.5-9B's HF config carries a populated ``vision_config`` which
-    would otherwise crash vLLM V1's MM dummy probe. The load-bearing fix
-    is the ``_install_mm_probe_skip_patch`` monkey-patch in
+    Qwen3.6-27B-FP8's HF config carries a populated ``vision_config``
+    which would otherwise crash vLLM V1's MM dummy probe. The load-bearing
+    fix is the ``_install_mm_probe_skip_patch`` monkey-patch in
     ``qr_sampler.connectors.modal.vllm_serve`` — kept importable for the
     ``--logits-processors``-discovery path (the entry point in
     ``pyproject.toml`` registers ``VLLMAdapter`` as
     ``vllm.logits_processors.qr_sampler``, which ``vllm serve`` picks up
-    automatically). We serve at vLLM defaults (bf16, matching HF's native
-    dtype); FP8 was tried in earlier iter-06 drafts and dropped (see
-    ``_CLS_KWARGS`` comment above). The vision config is suppressed by
-    the MM-probe patch loaded at the same entry-point hook.
+    automatically). We serve the HF-published FP8 build (vLLM auto-detects
+    the ``quantization_config`` from the model's ``config.json``, so no
+    explicit ``--quantization fp8`` is needed); the choice over the bf16
+    build is documented in the module docstring + the ``@app.cls``
+    comment above. The vision config is suppressed by the MM-probe
+    patch loaded at the same entry-point hook.
     """
 
     # Machine-friendly ID echoed by vLLM's /v1/models endpoint and used as
     # the routing key throughout OWUI + the comparison Pipe. No spaces or
     # parens here -- the human-readable display label
-    # ("qwen3.5-9b (quantum-random)") is set via an OWUI ``model`` table
+    # ("qwen3.6-27b (quantum-random)") is set via an OWUI ``model`` table
     # row override seeded by ``qr_llm_chat.bootstrap_connections``. The id
     # MUST stay in lockstep with ``_QWEN_ID`` in
     # ``qr_llm_chat/bootstrap_connections.py`` and the Pipe's
-    # ``base_models`` default. No precision suffix: we serve at vLLM
-    # defaults (bf16, matching HF's native dtype), which is implied by the
-    # bare model id.
-    SERVED_MODEL_NAME = "qwen3.5-9b"
+    # ``base_models`` default. No precision suffix in the served name:
+    # the model architecture id is the user-visible routing key, while
+    # the actual precision (currently FP8 from the HF-published build)
+    # is an implementation detail tracked via ``MODEL_HF_REPO_ID``.
+    #
+    # Both values below alias the module-level ``MODEL_SERVED_NAME`` /
+    # ``MODEL_HF_REPO_ID`` constants declared at the top of this file —
+    # edit those to swap models, not these class attributes.
+    SERVED_MODEL_NAME = MODEL_SERVED_NAME
     # Hugging Face repo id; same value as ``_QWEN_REPO`` above. The downloader
     # (``download_weights``) populates ``llm-weights`` from this repo; vLLM
     # then loads from the cached snapshot at serve time.
-    HF_REPO_ID = "Qwen/Qwen3.5-9B"
+    HF_REPO_ID = MODEL_HF_REPO_ID
 
     # vLLM serve HTTP endpoint inside the container. Modal's
     # @modal.web_server proxies inbound traffic here.
@@ -599,22 +652,26 @@ class VllmQrQwen:
             # TORCH_NCCL_ENABLE_MONITORING=0 in Dockerfile.vllm; it
             # was diagnostic noise, not a request-blocker.
             "--enable-sleep-mode",
-            # Precision: vLLM 0.17.0 defaults (bf16 weights + bf16 KV cache),
-            # matching Qwen/Qwen3.5-9B's native HF dtype. iter-06 dropped the
-            # earlier ``--quantization fp8 --kv-cache-dtype fp8`` flags after
-            # we decided the FP8 init complexity (Qwen3 GDN's List[Tensor]
-            # init_fp8_kv_scales monkey-patch in vllm_patches.py) wasn't worth
-            # it on an H100:1 that easily fits the 9B at bf16. Memory budget
-            # under bf16 (~18 GiB weights + KV) still fits the 79 GiB H100
-            # with the cmd's max-num-seqs/max-model-len caps. The
-            # init_fp8_kv_scales patch in vllm_patches.py stays in place but
-            # goes dormant — its own ``cache_dtype.startswith("fp8")`` gate
-            # short-circuits when the cmd does not request FP8.
+            # Precision: weights are FP8 (the model is ``Qwen/Qwen3.6-27B-FP8``,
+            # the HF-published FP8 build; vLLM auto-detects the FP8
+            # ``quantization_config`` in the model's ``config.json``, so no
+            # explicit ``--quantization fp8`` flag is needed on the serve
+            # command line). KV cache stays at vLLM's default (bf16), which
+            # keeps the ``init_fp8_kv_scales`` patch in ``vllm_patches.py``
+            # dormant — its own ``cache_dtype.startswith("fp8")`` gate
+            # short-circuits when the cmd does not request ``--kv-cache-dtype
+            # fp8``. FP8 weights (~27 GiB) + bf16 KV cache (bounded by
+            # max-num-seqs=16 × max-model-len=32768) + activation fits
+            # comfortably under the 73 GiB usable budget on the H100:1 with
+            # the gpu-memory-utilization=0.9 ceiling below.
             # Prefix caching (V1 default, explicit for documentation):
             # multi-turn web chat re-sends the full conversation each
             # turn — vLLM detects KV-block overlap with the previous
             # turn and skips re-prefill. The single most impactful UX
-            # knob for a chatbot deployment.
+            # knob for a chatbot deployment. Empirically NOT the cause
+            # of the intermittent cuda-checkpoint --get-state timeouts
+            # on snapshot restore (2026-05-22 A/B test: dropping it did
+            # not improve restore reliability), so kept on.
             "--enable-prefix-caching",
             # Context window: 32768 tokens. iter-04's 8192 capped real
             # multi-turn chat at ~4 turns before truncation, which is
@@ -625,12 +682,24 @@ class VllmQrQwen:
             "--max-model-len",
             "32768",
             # Concurrent generation slots inside the vLLM scheduler.
+            # Lowered to 4 (was 16, vLLM default 256) to keep the KV
+            # cache page count small enough for cuda-checkpoint to
+            # enumerate during snapshot restore within its 180 s timeout.
             # @modal.concurrent(max_inputs=8) caps in-flight requests
-            # per container at 8; 16 gives vLLM headroom for chunked-
-            # prefill + decode batching of in-flight requests. Default
-            # 256 wastes scheduler memory on a single-GPU H100.
+            # per container at 8; with --max-num-seqs=4 we accept that 5+
+            # simultaneous requests queue at the scheduler boundary
+            # rather than fan out further inside vLLM.
             "--max-num-seqs",
-            "16",
+            "4",
+            # Cap the CUDA graph capture set explicitly to match
+            # max-num-seqs above. vLLM auto-derives capture sizes from
+            # max-num-seqs but Modal's lfm_snapshot.py example sets this
+            # flag explicitly, which we mirror as a belt-and-braces
+            # guarantee that no larger graph variants sneak into the
+            # snapshotted state. Smaller captured graph set = less GPU
+            # state for cuda-checkpoint to enumerate on restore.
+            "--max-cudagraph-capture-size",
+            "4",
             # Per-step batch budget. Higher = better prefill throughput
             # (one step packs a long system prompt + new user message),
             # at the cost of slightly slower per-step decode. 8192 is
@@ -645,16 +714,17 @@ class VllmQrQwen:
             # Modal's default container RAM (~100 GiB).
             "--swap-space",
             "16",
-            # GPU memory utilization ceiling. 0.92 leaves ~5 GiB
-            # headroom on the 79 GiB H100 for cuBLAS workspaces +
-            # CUDA contexts. With bf16 weights (~18 GiB) + bf16 KV
-            # cache (~2× the iter-05 FP8 footprint per token, but
-            # bounded by max-num-seqs=16 × max-model-len=32768) +
-            # activation, total fits comfortably under the 73 GiB
-            # budget on H100:1. Drop to 0.85 if /wake_up surfaces
-            # OOM after the FP8-removal swap.
+            # GPU memory utilization ceiling. Read from the module-level
+            # ``MODEL_GPU_MEMORY_UTILIZATION`` constant so it tracks the
+            # active model: 0.92 was right for Qwen3.5-9B (bf16 ~18 GiB
+            # weights + KV cache fit easily on H100). For Qwen3.6-27B-FP8
+            # (~27 GiB FP8 weights), 0.9 leaves ~7 GiB headroom on the
+            # 79 GiB H100 for cuBLAS workspaces + CUDA contexts +
+            # paged-attention overflow to CPU (driven by --max-num-seqs 16
+            # + --swap-space 16 below). Drop further (0.88, 0.85) if
+            # /wake_up surfaces OOM after a model swap.
             "--gpu-memory-utilization",
-            "0.92",
+            MODEL_GPU_MEMORY_UTILIZATION,
             # Per-request body logging is OFF by default in vLLM 0.17+ —
             # the inverse opt-in flag is ``--enable-log-requests``. The
             # prior ``--disable-log-requests`` (from vLLM 0.6 era) was
@@ -812,6 +882,61 @@ class VllmQrQwen:
                 f"vllm serve /health did not return 200 within {self._STARTUP_TIMEOUT_S}s"
             )
 
+        # 2026-05-22: warmup inference BEFORE /sleep, per Modal's vLLM
+        # snapshot example pattern. The warmup runs trigger
+        # torch.compile (inductor pass) + CUDA graph capture for the
+        # realistic batch sizes the engine will see in production, so
+        # the inductor cache + graph state is fully baked at snapshot
+        # capture time. Without warmup, the snapshot captures partial
+        # compile state and the cuda-checkpoint enumerator times out on
+        # restore (paired with the ``TORCHINDUCTOR_COMPILE_THREADS=1``
+        # env var in Dockerfile.vllm which serialises the inductor
+        # compile so its driver state IS enumerable). max_tokens=8 +
+        # temperature=0 keeps each iteration sub-second; 3 iterations
+        # match Modal's reference example. Errors are soft-fail: if
+        # warmup cannot connect or vllm returns 5xx, we log and proceed
+        # to /sleep — the pre-snapshot path is best-effort and a partial
+        # warmup is better than no warmup.
+        warmup_url = f"{self._VLLM_BASE_URL}/v1/chat/completions"
+        warmup_body = {
+            "model": self.SERVED_MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        warmup_t0 = time.monotonic()
+        warmup_ok = 0
+        for i in range(3):
+            try:
+                r = httpx.post(warmup_url, json=warmup_body, timeout=120.0)
+                r.raise_for_status()
+                warmup_ok += 1
+            except Exception as exc:
+                log.warning(
+                    "warmup request %d/3 failed: %s",
+                    i + 1,
+                    exc,
+                    extra={
+                        "event": "vllm.warmup.failed",
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "attempt": i + 1,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+        warmup_duration_ms = (time.monotonic() - warmup_t0) * 1000.0
+        log.info(
+            "vllm warmup complete: %d/3 successful in %.0f ms",
+            warmup_ok,
+            warmup_duration_ms,
+            extra={
+                "event": "vllm.warmup.ok",
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "successful": warmup_ok,
+                "duration_ms": warmup_duration_ms,
+            },
+        )
+
         # Phase 3 iter-06 (2026-05-21): POST /sleep?level=1 RESTORED.
         # iter-05 attempted to skip this on the theory that Modal's
         # GPU snapshot could capture the live engine; it failed with
@@ -924,20 +1049,48 @@ class VllmQrQwen:
 
         log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
 
-        # iter-09 (2026-05-21): cloudflared sidecar RESTORED. iter-02
-        # suppressed it to isolate the snapshot /wake_up 500, which
-        # iter-08 candidate E proved was actually a --host 127.0.0.1
-        # binding issue (see LEARNINGS.md iter-08). The sidecar starts
-        # here in @modal.enter(snap=False) — POST-snapshot — so no live
-        # cloudflared socket is captured into the snapshot (auto-memory
-        # modal_vllm_303_hang). _start_qrng_tunnel is soft-fail: on any
-        # failure (missing CF Access service token, binary unavailable,
-        # tunnel unreachable) it logs a structured event and returns
-        # None, and the request path falls back to system entropy via
-        # FallbackEntropySource. The per-request entropy.degraded events
-        # surface a QRNG outage to operators without taking the engine
-        # down. See _start_qrng_tunnel docstring for the full design.
-        self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
+        # iter-12 (2026-05-22): cloudflared sidecar startup is now
+        # PARALLELIZED with /wake_up + /health below. Previously
+        # serialized, which added the sidecar's ~5-15 s tunnel-bootstrap
+        # window to every cold-start. Because ``_start_qrng_tunnel`` is
+        # soft-fail by design (returns ``None`` on any failure; the
+        # request path falls through to ``SystemEntropySource`` via
+        # ``FallbackEntropySource``), there is no correctness reason to
+        # block ``_wake`` on it — at worst, the first few tokens after a
+        # cold-start use system entropy and surface ``entropy.degraded``
+        # events until the tunnel is up. We initialise the attribute to
+        # ``None`` so any concurrent access during the bootstrap window
+        # gets the fallback path cleanly. The thread is a daemon so
+        # ``_stop`` need not join it on container shutdown.
+        #
+        # iter-09 background (retained for context): the sidecar starts
+        # here in ``@modal.enter(snap=False)`` — POST-snapshot — so no
+        # live cloudflared socket is captured into the snapshot (auto-
+        # memory modal_vllm_303_hang).
+        self._cloudflared = None
+
+        def _spawn_cloudflared() -> None:
+            try:
+                self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
+            except Exception as exc:
+                # _start_qrng_tunnel already soft-fails internally; this
+                # guard is belt-and-braces for an unhandled raise so the
+                # daemon thread cannot kill the container.
+                log.warning(
+                    "cloudflared background spawn raised: %s",
+                    exc,
+                    extra={
+                        "event": "cloudflared.background_spawn_raised",
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+
+        threading.Thread(
+            target=_spawn_cloudflared,
+            name=f"cloudflared-spawn-{self.SERVED_MODEL_NAME}",
+            daemon=True,
+        ).start()
 
         # Phase 3 iter-06 (2026-05-21): POST /wake_up RESTORED, paired
         # with sleep mode restore in _start_and_sleep (see iter-05

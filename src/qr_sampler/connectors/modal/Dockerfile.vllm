@@ -77,7 +77,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TORCH_NCCL_ENABLE_MONITORING=0 \
     TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=86400 \
-    TORCH_CPP_LOG_LEVEL=ERROR
+    TORCH_CPP_LOG_LEVEL=ERROR \
+    TORCHINDUCTOR_COMPILE_THREADS=1
+# TORCHINDUCTOR_COMPILE_THREADS=1 is the Modal-documented fix for
+# torch.compile + memory snapshot conflicts (see
+# https://modal.com/docs/guide/memory-snapshots — "In certain cases,
+# running the Torch Compiler can cause Memory Snapshot creation to
+# fail"). Without this, the inductor's multi-threaded compile produces
+# CUDA driver state that NVIDIA's cuda-checkpoint --get-state cannot
+# enumerate within its 180 s timeout during snapshot RESTORE — symptom
+# is ``CudaCheckpointException: Failed to restore 1 processes: Get
+# state command timed out`` (see modal/_runtime/gpu_memory_snapshot.py
+# in the SDK). Single-threaded compile makes the resulting CUDA state
+# enumerable.
 
 # The vllm/vllm-openai base ships only `python3.12` + `pip` on PATH (pip's
 # shebang hardcodes /usr/local/bin/python3.12). Modal's image-attach step

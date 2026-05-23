@@ -162,9 +162,10 @@ a `python` symlink in `Dockerfile.vllm` (auto-memory
 Python dep is added; check whether it needs `.pip_install(...)` even
 if it's already in the Dockerfile.
 
-### vLLM model architecture mismatch (auto-memory `vllm_model_arch_mismatch`)
+### vLLM model architecture mismatch — CLOSED 2026-05-22 (auto-memory `vllm_model_arch_mismatch`)
 
-`Qwen/Qwen3.6-27B` has a populated `vision_config` in its HF config
+`Qwen/Qwen3.6-27B` (and the FP8 build below) has a populated
+`vision_config` in its HF config
 (`architectures=['Qwen3_5ForConditionalGeneration']`). vLLM V1's
 `profile_run` raises `StopIteration` when iterating
 `vision_config.merge_size`. Affects vLLM 0.17.0 + 0.21.0. The
@@ -172,6 +173,55 @@ if it's already in the Dockerfile.
 `mm_config.skip_mm_profiling=True` at `profile_run` entry. The patch
 fires `vllm.mm.probe_skipped` when active; absence of that event on a
 cold-start means the patch lost its hook.
+
+### FP8 switch + snapshot-restore tuning — iter-12 (2026-05-22, auto-memory `modal_snapshot_tuning`)
+
+`MODEL_HF_REPO_ID` is `Qwen/Qwen3.6-27B-FP8` (HF-published FP8 build,
+~27 GiB resident weights). The bf16 build was tried first but its
+~54 GiB resident weights exceeded Modal's CRIU+CUDA checkpointer's
+practical ceiling — every cold-cold restore raised
+`CudaCheckpointException: Failed to restore 1 processes: PID: 29 Get
+state command timed out` (cuda-checkpoint's hardcoded 180 s
+enumeration timeout in `modal/_runtime/gpu_memory_snapshot.py:22`).
+
+The FP8 build shrank resident state enough that the **warm-cache
+restore** path (Modal worker still has the snapshot hot, within
+~3-5 min of last request) now reliably wakes in **~2 s** as
+`vllm.wake.ok`. The **cold-cold path** (snapshot fetched from cold
+storage after >5 min idle) is still intermittent — ~30 % succeed in
+~20 s, the rest hit the same timeout and Modal falls back to a fresh
+start (~5 min full bootstrap). This is the structural limit for our
+configuration; see the auto-memory entry for the full enumeration of
+knobs explored.
+
+Applied alongside the FP8 switch (kept because empirically helpful):
+
+- `TORCHINDUCTOR_COMPILE_THREADS=1` env var in `Dockerfile.vllm` — the
+  Modal-documented workaround for torch.compile producing
+  unenumerable inductor state.
+- Warmup phase in `_start_and_sleep` — 3 chat completion requests
+  with `max_tokens=8, temperature=0` between `/health` and `/sleep`,
+  bakes the compile + cudagraph artefacts INTO the snapshot.
+- `--max-num-seqs 4` (was 16) — fewer KV-cache pages = fewer CUDA
+  allocations to enumerate.
+- `--max-cudagraph-capture-size 4` — belt-and-braces alignment with
+  Modal's `lfm_snapshot.py` example pattern.
+- `--gpu-memory-utilization 0.8` (was 0.9) — matches Modal example;
+  leaves headroom for cuda-checkpoint's own state buffer.
+
+Reverted (proved not load-bearing):
+
+- `--enforce-eager` — empirical cold-cold restores still timed out
+  with eager mode, so compile/CUDA-graph state was NOT the marginal
+  cost; reverting restored ~10-20 % inference throughput.
+- Dropping `--enable-prefix-caching` — 2/3 restores still failed
+  without it (A/B tested 2026-05-22). Re-enabled for multi-turn KV
+  reuse.
+
+If a future Modal release exposes `CUDA_CHECKPOINT_TIMEOUT` as a
+tunable, or NVIDIA ships a cuda-checkpoint with faster enumeration
+for FP8 + custom-ops workloads, revisit and consider re-enabling
+larger `--max-num-seqs` for higher concurrency.
 
 ### vLLM CLI flag churn (auto-memory `vllm_cli_flag_churn`)
 

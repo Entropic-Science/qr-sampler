@@ -32,21 +32,35 @@ _HERE = Path(__file__).resolve().parent
 _HELPER_FILES = ("_modal_warmth.py", "entropic_science_profile.py")
 
 _FRONTMATTER_RE = re.compile(r'^"""\s*\n(.*?)\n"""', re.DOTALL)
+_LEADING_COMMENTS_RE = re.compile(r"^(?:#[^\n]*\n|\s*\n)+")
 _IMPORT_BLOCK_RE = re.compile(
     r"try:\s*\n\s*from \. import.*?(?=\n# -+\n)",
     re.DOTALL,
 )
 
 
+def _strip_leading_comments(src: str) -> str:
+    """Drop any leading ``#``-comment lines (e.g. file-level ``# ruff: noqa``).
+
+    Ruff's file-level ``noqa`` directive lives ABOVE the module docstring;
+    the bundler's frontmatter regex requires the docstring to be the first
+    thing it sees, so the source has to be peeled past those comments before
+    the regex matches. We drop the comments from the bundled output too —
+    they only matter at lint time on the source, not in the embedded module.
+    """
+    return _LEADING_COMMENTS_RE.sub("", src, count=1)
+
+
 def _strip_module_header(src: str) -> str:
     """Drop the leading docstring + `from __future__ import annotations` line."""
+    src = _strip_leading_comments(src)
     src = _FRONTMATTER_RE.sub("", src, count=1).lstrip()
     return src.replace("from __future__ import annotations\n\n", "", 1)
 
 
 def _read_meta_from_docstring(src: str) -> dict[str, str]:
     """Extract `title`, `author`, `version`, `license`, `description`."""
-    match = _FRONTMATTER_RE.match(src)
+    match = _FRONTMATTER_RE.match(_strip_leading_comments(src))
     if match is None:
         raise RuntimeError("plugin source is missing the OWUI-style docstring header")
 

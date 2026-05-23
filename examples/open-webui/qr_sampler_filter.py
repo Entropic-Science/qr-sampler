@@ -3,9 +3,9 @@
 title: QR-Sampler Parameters
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.4.0
+version: 0.5.0
 license: MIT
-description: qr-sampler params + entropic.science allowance metering + cold-start indicator + per-user creative-vs-T=1 sampling preset toggle.
+description: qr-sampler params + entropic.science allowance metering + cold-start indicator + per-user creative-vs-T=1 sampling preset toggle + Qwen3.6 thinking-mode disable.
 """
 
 from __future__ import annotations
@@ -514,6 +514,21 @@ class Filter:
         """
         if not self.valves.enable_qr_sampling:
             return body
+
+        # Disable Qwen3.6's default reasoning/thinking output. Qwen3.6
+        # removed the ``/no_think`` soft switch from prior generations; the
+        # only documented disable is the per-request ``enable_thinking``
+        # template kwarg consumed by the Jinja chat template. This is a
+        # top-level OpenAI-compat field (NOT a qr-sampler logits-processor
+        # input), so it goes on ``body`` directly rather than under
+        # ``vllm_xargs``. vLLM 0.17.0's ChatCompletionRequest schema
+        # documents this field; it does not trigger the "fields ignored"
+        # warning that motivated the ``vllm_xargs`` routing for ``qr_*``
+        # keys. Defense in depth: even if a request bypasses this filter,
+        # ``--reasoning-parser qwen3`` in vllm serve still extracts any
+        # ``<think>`` block into ``reasoning_content`` so it lands in
+        # OWUI's collapsible panel rather than leaking into chat content.
+        body["chat_template_kwargs"] = {"enable_thinking": False}
 
         email = (__user__ or {}).get("email")
         if not isinstance(email, str) or not email:
