@@ -4,7 +4,7 @@ Layout (matches spec.md §5.5 / §4.1, with the labs-cutover per-model split):
 
     weights_volume     — Volume "llm-weights", mounted at /root/.cache/huggingface
     download_weights   — one-shot @app.function to populate weights_volume
-    VllmQrQwen         — @app.cls (H100:1) running Qwen/Qwen3.6-27B-FP8 alone
+    VllmQrQwen         — @app.cls (H100:1) running lovedheart/Qwen3.5-9B-FP8 alone
 
 Each model is its own scale-to-zero @app.cls so OWUI's model picker wakes
 only the requested container. Open WebUI itself is provided by the
@@ -29,16 +29,19 @@ Gemma 4 31B pause + Qwen 3.* MM-probe monkey-patch
    vLLM 0.17.0 does not register ``Gemma4ForConditionalGeneration``.
    Restore Gemma when a vLLM release ships gemma-4 GDN support.
 
-2. ``VllmQrQwen`` currently serves Qwen/Qwen3.6-27B-FP8 (HF-published
-   FP8 build, ~27 GiB resident weights, served as ``qwen3.6-27b``).
-   vLLM auto-detects the FP8 quantization config from the model's
-   ``config.json`` so no explicit ``--quantization fp8`` flag is needed
-   on the ``vllm serve`` command line. The bf16 build of the same model
-   was tried first but its ~54 GiB resident weight set exceeded Modal's
-   CRIU+CUDA checkpointer's reliable restore window
-   (``CudaCheckpointException: Get state command timed out``), so we
-   moved to the FP8 build whose half-size footprint sits comfortably
-   below the empirical ceiling. Both 9B and 27B Qwen3.* variants carry
+2. ``VllmQrQwen`` currently serves lovedheart/Qwen3.5-9B-FP8 (community
+   FP8 e4m3 quant of Qwen/Qwen3.5-9B, ~9 GiB resident weights, served
+   as ``qwen3.5-9b``). vLLM auto-detects the FP8 quantization config
+   from the model's ``config.json`` so no explicit ``--quantization fp8``
+   flag is needed on the ``vllm serve`` command line. iter-15 (2026-05-24)
+   swapped here from Qwen/Qwen3.6-27B-FP8 (~27 GiB) to optimise
+   cold-from-storage latency for a public-facing demo: ``/sleep level=1``
+   keeps weights resident in CPU RAM, so the snapshot's cold-storage
+   pull is bandwidth-bound by weight tensor size (~115 s for 27B, projected
+   ~40 s for 9B). The bf16 build of the same 9B model (~18 GiB) is the
+   official Qwen-org publication; no Qwen-org FP8 build exists for the
+   3.5-9B size at deploy time, so the ``lovedheart`` community quant is
+   the only path to a ≤10 GiB resident footprint. Both 9B and 27B Qwen3.* variants carry
    a populated HF ``vision_config`` so vLLM V1's ``profile_run`` would
    otherwise run an unconditional MM dummy probe that crashes in
    ``transformers.processing_utils.get_text_with_replacements`` with
@@ -82,7 +85,7 @@ import importlib.util
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import modal
 
@@ -99,10 +102,38 @@ APP_NAME = "qr-llm-chat"
 # ``qr_llm_chat/functions/_sources/qr_comparison_pipe.py``. A mismatch breaks
 # OWUI routing (vLLM returns 404 on /v1/chat/completions when ``model:``
 # does not match ``/v1/models``).
-MODEL_HF_REPO_ID = "Qwen/Qwen3.6-27B-FP8"  # HF-published FP8 build (~27 GiB resident, vs ~54 GiB for bf16)
-MODEL_SERVED_NAME = "qwen3.6-27b"  # /v1/models id; lockstep with qr-llm-chat _QWEN_ID (precision is implementation detail, not picker-visible)
-MODEL_REVISION = os.environ.get("QWEN_REVISION", "")  # optional commit SHA pin
-MODEL_GPU_MEMORY_UTILIZATION = "0.8"  # was 0.9; lowered to match Modal's lfm_snapshot.py example for snapshot-restore reliability (smaller resident GPU state = faster cuda-checkpoint enumeration)
+MODEL_HF_REPO_ID = "lovedheart/Qwen3.5-9B-FP8"  # community FP8 e4m3 build of Qwen3.5-9B (~9 GiB resident, vs ~18 GiB for the official bf16 build, vs ~27 GiB for the prior Qwen3.6-27B-FP8). Demo-grade: 3x smaller cold-from-storage payload than the 27B pin → projected snapshot restore ~40 s vs 115-125 s. Architecture is Qwen3_5ForConditionalGeneration so the existing transformers==5.5.4 + MM-probe monkey-patch combo applies unchanged. No official Qwen-org FP8 build of 3.5-9B exists at deploy time (2026-05-24); ``lovedheart`` is the only published FP8 quant. If a future Qwen-org FP8 build appears, switch back to ``Qwen/<...>``.
+MODEL_SERVED_NAME = "qwen3.5-9b"  # /v1/models id; lockstep with qr-llm-chat _QWEN_ID (precision is implementation detail, not picker-visible)
+
+# iter-14: Snapshot identity hardening. The HF revision used to default to
+# os.environ.get("QWEN_REVISION", "") which (a) silently resolves to "latest"
+# (whatever main currently points at — changes without our deploys), and (b)
+# makes an env var part of the snapshot input surface. Both are sources of
+# the brittle cold-cold restore behaviour iter-09..iter-13 chased. We now
+# hardcode the SHA. To bump: look up the current commit on
+# https://huggingface.co/lovedheart/Qwen3.5-9B-FP8/commits/main, paste the full
+# 40-char hex here, and bump SNAPSHOT_IDENTITY_VERSION below in lockstep.
+# An empty string here still falls through (so dev iteration on environments
+# without the SHA available is unblocked), but the predeploy.ps1 gate in
+# qr-llm-chat refuses to deploy until this is populated.
+MODEL_REVISION: str = "5d77dcb2e2c606bc261b5b8e946a67781f18d733"  # lovedheart/Qwen3.5-9B-FP8 main as of 2026-05-24 via HF API
+
+# iter-14: Snapshot identity version. Modal computes the snapshot key from
+# the image hash + the @modal.enter(snap=True) body. This constant is NOT
+# read by Modal directly; it is logged on every cold-start so an operator
+# can grep ``modal app logs`` and confirm "the cold-start I am looking at
+# belongs to identity version X". Bump this string when an intentional
+# snapshot-bust is needed (e.g. flipping a snap=True kwarg, or after
+# upgrading vllm/transformers). When this bumps but the image digest does
+# not, the cold-start log will show two events with the same
+# image_digest + different identity_version — which is the operator's
+# signal that the snapshot needs to be re-materialised.
+#
+# Format: "iter-NN-MMM" where NN is the iteration log number and MMM is a
+# monotonic sub-iteration counter inside that iter.
+SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-15-001-qwen3.5-9b-fp8-demo"
+
+MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tight for 27B-FP8) to 0.85 with the 9B-FP8 swap. 9 GiB weights leave plenty of headroom under H100's 79 GiB even at 0.85 utilization; the extra 5 % expands the KV cache budget so multi-turn chats stay coherent through a longer demo session without prefix caching (which is the one knob we can't re-enable per auto-memory iter14_snapshot_load_working).
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
 # module import (i.e. each Modal container's Python process boot). The
@@ -241,7 +272,34 @@ download_image = (
     )
 )
 
-# GPU image built from Dockerfile.vllm, including the qr-sampler source.
+# iter-14b finding (2026-05-23, reverted): An earlier iter-14 revision
+# baked weights into the image at /opt/models/qwen3.6-27b-fp8 via a
+# `.run_commands(["hf download ..."], secrets=[hf_token_secret])` layer.
+# Empirically this BROKE memory-snapshot restore: the 27 GB of weights
+# mmap'd into the container's address space inflated the GPU-state set
+# the cuda-checkpoint enumerator has to walk during snapshot capture,
+# pushing capture time over Modal's 180 s `CUDA_CHECKPOINT_TIMEOUT`.
+# Both iter-14b cold-starts ran the full `_start_and_sleep` path (no
+# snapshot reuse) and the second one's capture window was 201 s.
+#
+# Modal's official guidance — and their `lfm_snapshot.py` reference
+# example for the exact same pattern (vLLM + sleep mode + GPU snapshot)
+# — explicitly puts weights on a Volume mount:
+#   > "GPU Memory Snapshots do not speed up model loading from storage."
+#   > Snapshots should target "library initialization (imports) and JIT
+#   > compilation."
+# So weights belong on the `llm-weights` Volume (already populated by
+# `download_weights`), and the snapshot captures only Python imports +
+# torch.compile artefacts + CUDA graphs.
+#
+# This revert KEEPS all other iter-14 work:
+#   * MODEL_REVISION pinned to a specific HF SHA (predeploy gate enforced)
+#   * SNAPSHOT_IDENTITY_VERSION constant + `vllm.snapshot.identity` event
+#   * `vllm.snapshot.restore_class` event (threshold raised to 900 s)
+#   * predeploy.ps1 + deploy.ps1 + JSON-bundle regeneration discipline
+#   * OWUI progressive status indicator
+# The image-baked-weights idea is preserved in git history; do NOT
+# resurrect without first reading Modal's snapshot docs again.
 #
 # Why NO `add_python` kwarg here (was previously `add_python="3.12"`):
 # `add_python="X"` makes Modal install an ADDITIONAL Python interpreter as a
@@ -310,7 +368,7 @@ app = modal.App(APP_NAME)
 # ----- One-shot weights download -------------------------------------------
 
 
-# 2026-05-22: Qwen/Qwen3.6-27B-FP8 is the active build target. Both 9B and
+# 2026-05-24 (iter-15): lovedheart/Qwen3.5-9B-FP8 is the active build target. Both 9B and
 # 27B Qwen3.* variants (including the FP8 build) carry a populated HF
 # ``vision_config``; the MM-probe patch in
 # ``qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch``
@@ -342,7 +400,7 @@ def download_weights() -> dict[str, str]:
     Idempotent — re-running just re-validates the cache. The active repo +
     optional revision pin come from the module-level ``MODEL_HF_REPO_ID`` /
     ``MODEL_REVISION`` constants (aliased here as ``_QWEN_REPO`` /
-    ``_QWEN_REVISION``). As of 2026-05-22 this targets Qwen/Qwen3.6-27B-FP8
+    ``_QWEN_REVISION``). As of 2026-05-24 (iter-15) this targets lovedheart/Qwen3.5-9B-FP8
     (the HF-published FP8 build, ~27 GiB resident weights — chosen over
     the bf16 build because the latter's 54 GiB footprint exceeded Modal's
     CRIU+CUDA checkpointer's reliable restore window). The MM-probe
@@ -427,6 +485,14 @@ _CLS_KWARGS: dict[str, Any] = {
     # narrow multiplier) — the prior comment block in git history
     # explains the latency math in detail.
     "region": "us",
+    # iter-14b revert: weights_volume mount RESTORED. Putting weights on
+    # the Volume (not in the image) is Modal's recommended pattern for
+    # vLLM + GPU memory snapshots — see `lfm_snapshot.py` example and the
+    # docs quote: "GPU Memory Snapshots do not speed up model loading
+    # from storage." Volume-mounted weights keep snapshot capture
+    # focused on imports + torch.compile artefacts (small, fast to
+    # enumerate via cuda-checkpoint), avoiding the 180s timeout that
+    # image-baked weights triggered.
     "volumes": {
         "/root/.cache/huggingface": weights_volume,
         "/root/.cache/vllm": vllm_cache_volume,
@@ -524,7 +590,7 @@ class VllmQrQwen:
     # Machine-friendly ID echoed by vLLM's /v1/models endpoint and used as
     # the routing key throughout OWUI + the comparison Pipe. No spaces or
     # parens here -- the human-readable display label
-    # ("qwen3.6-27b (quantum-random)") is set via an OWUI ``model`` table
+    # ("qwen3.5-9b (quantum-random)") is set via an OWUI ``model`` table
     # row override seeded by ``qr_llm_chat.bootstrap_connections``. The id
     # MUST stay in lockstep with ``_QWEN_ID`` in
     # ``qr_llm_chat/bootstrap_connections.py`` and the Pipe's
@@ -618,6 +684,12 @@ class VllmQrQwen:
         cmd = [
             "vllm",
             "serve",
+            # iter-14b revert: pass HF_REPO_ID. vLLM resolves this against
+            # the local HF cache mounted at /root/.cache/huggingface
+            # (Volume-backed, pre-populated by `download_weights`), so
+            # there is NO HF Hub network round-trip on cold-start when
+            # the Volume is warm. The MODEL_REVISION pin (see top of
+            # file) ensures vLLM loads the exact same commit each time.
             self.HF_REPO_ID,
             "--served-model-name",
             self.SERVED_MODEL_NAME,
@@ -652,27 +724,35 @@ class VllmQrQwen:
             # TORCH_NCCL_ENABLE_MONITORING=0 in Dockerfile.vllm; it
             # was diagnostic noise, not a request-blocker.
             "--enable-sleep-mode",
-            # Precision: weights are FP8 (the model is ``Qwen/Qwen3.6-27B-FP8``,
-            # the HF-published FP8 build; vLLM auto-detects the FP8
+            # Precision: weights are FP8 e4m3 (the model is
+            # ``lovedheart/Qwen3.5-9B-FP8``, a community FP8 quant of
+            # Qwen/Qwen3.5-9B; vLLM auto-detects the FP8
             # ``quantization_config`` in the model's ``config.json``, so no
             # explicit ``--quantization fp8`` flag is needed on the serve
             # command line). KV cache stays at vLLM's default (bf16), which
             # keeps the ``init_fp8_kv_scales`` patch in ``vllm_patches.py``
             # dormant — its own ``cache_dtype.startswith("fp8")`` gate
             # short-circuits when the cmd does not request ``--kv-cache-dtype
-            # fp8``. FP8 weights (~27 GiB) + bf16 KV cache (bounded by
-            # max-num-seqs=16 × max-model-len=32768) + activation fits
+            # fp8``. FP8 weights (~9 GiB) + bf16 KV cache (bounded by
+            # max-num-seqs=4 × max-model-len=32768) + activation fits
             # comfortably under the 73 GiB usable budget on the H100:1 with
-            # the gpu-memory-utilization=0.9 ceiling below.
-            # Prefix caching (V1 default, explicit for documentation):
-            # multi-turn web chat re-sends the full conversation each
-            # turn — vLLM detects KV-block overlap with the previous
-            # turn and skips re-prefill. The single most impactful UX
-            # knob for a chatbot deployment. Empirically NOT the cause
-            # of the intermittent cuda-checkpoint --get-state timeouts
-            # on snapshot restore (2026-05-22 A/B test: dropping it did
-            # not improve restore reliability), so kept on.
-            "--enable-prefix-caching",
+            # the gpu-memory-utilization=0.85 ceiling below.
+            # iter-14d (2026-05-23): --enable-prefix-caching DROPPED.
+            # The 2026-05-22 A/B test that previously kept it on was
+            # against the IMAGE-BAKED weights path, which had its own
+            # bigger snapshot-state problem (now reverted in iter-14c).
+            # With the Volume-mounted-weights baseline restored, the
+            # documented unreliable triad (custom logits processors +
+            # FP8 + prefix caching, auto-memory ``modal_snapshot_tuning``)
+            # is back in play and prefix caching is the easiest leg to
+            # disable without losing the QR sampling pipeline. iter-14c
+            # confirmed every cold-cold runs snap=True (no snapshot
+            # reuse across containers); dropping prefix caching is the
+            # next variable to test. UX cost: multi-turn chats redo
+            # the system-prompt prefill each turn (~hundreds of ms on
+            # this hardware). The user has explicitly accepted slower
+            # normal-start in exchange for reliable snapshot load.
+            # "--enable-prefix-caching",  # DISABLED iter-14d
             # Context window: 32768 tokens. iter-04's 8192 capped real
             # multi-turn chat at ~4 turns before truncation, which is
             # unusable for OWUI's typical session. 32k accommodates
@@ -716,13 +796,16 @@ class VllmQrQwen:
             "16",
             # GPU memory utilization ceiling. Read from the module-level
             # ``MODEL_GPU_MEMORY_UTILIZATION`` constant so it tracks the
-            # active model: 0.92 was right for Qwen3.5-9B (bf16 ~18 GiB
-            # weights + KV cache fit easily on H100). For Qwen3.6-27B-FP8
-            # (~27 GiB FP8 weights), 0.9 leaves ~7 GiB headroom on the
-            # 79 GiB H100 for cuBLAS workspaces + CUDA contexts +
-            # paged-attention overflow to CPU (driven by --max-num-seqs 16
-            # + --swap-space 16 below). Drop further (0.88, 0.85) if
-            # /wake_up surfaces OOM after a model swap.
+            # active model: iter-15 (2026-05-24) uses 0.85 for
+            # lovedheart/Qwen3.5-9B-FP8 (FP8 e4m3 ~9 GiB weights).
+            # The prior pin (Qwen3.6-27B-FP8 ~27 GiB) ran at 0.8 to
+            # leave ~7 GiB headroom on the 79 GiB H100 for cuBLAS
+            # workspaces + CUDA contexts + paged-attention overflow
+            # to CPU. With ~18 GiB freed up by the 9B FP8 swap, we can
+            # comfortably afford the extra 5% utilization to expand
+            # the KV cache budget for multi-turn demo sessions. Drop
+            # further (0.8, 0.75) if /wake_up surfaces OOM after a
+            # future model swap.
             "--gpu-memory-utilization",
             MODEL_GPU_MEMORY_UTILIZATION,
             # Per-request body logging is OFF by default in vLLM 0.17+ —
@@ -937,16 +1020,24 @@ class VllmQrQwen:
             },
         )
 
-        # Phase 3 iter-06 (2026-05-21): POST /sleep?level=1 RESTORED.
-        # iter-05 attempted to skip this on the theory that Modal's
-        # GPU snapshot could capture the live engine; it failed with
-        # CudaCheckpointException because Modal's CRIU+CUDA checkpoint
-        # API timed out enumerating 58 GiB of live KV cache + 3621
-        # blocks. level=1 releases all KV blocks to CPU before snapshot
-        # so only the ~10 GiB weights region remains — small enough for
-        # the checkpointer to enumerate within its window. level=2
-        # would also discard weights and require a full reload on wake;
-        # we want fast restore.
+        # iter-14f (2026-05-23): REVERTED /sleep?level=2 back to level=1.
+        # Level=2 produced fast cold-from-storage restore (10-14 s
+        # observed in iter-14e logs with `vllm.snapshot.restore_class=
+        # snapshot_hit`) BUT the model emitted gibberish on actual
+        # inference (CJK + Cyrillic + emoji noise like "laut jewe拍下
+        # Gui开机คณะกรรมการ ..."). Diagnosis: vLLM 0.17 + custom logits
+        # processor + /sleep level=2 + memory snapshot together don't
+        # properly restore weight tensors on wake — /wake_up returned in
+        # 530 ms (far too fast for genuine 27 GB weight reload from
+        # disk, which should be 2-5 s at PCIe Gen4) and the GPU memory
+        # for weights ended up in undefined state. The fast wake was a
+        # red flag we should have caught before declaring victory.
+        #
+        # Reverted to level=1: snapshot keeps weights in CPU RAM,
+        # cold-from-storage retrieval is bandwidth-bound at 115-125 s,
+        # but inference outputs are correct. iter-14d already proved
+        # level=1 is reliable for snapshot CAPTURE under 180 s (when
+        # paired with --enable-prefix-caching off — that fix stays).
         sleep_url = f"{self._VLLM_BASE_URL}/sleep?level=1"
         t0 = time.monotonic()
         try:
@@ -1025,6 +1116,16 @@ class VllmQrQwen:
                 },
             )
 
+        # iter-14: real-wall-clock timestamp used by _wake to classify the
+        # next restore as snapshot_hit vs snapshot_miss. Real wall clock
+        # (not monotonic) because CRIU's snapshot/restore preserves
+        # time.time() but not necessarily time.monotonic() across the
+        # container boundary. Stored on self so it gets captured into the
+        # snapshot — _wake on a TRUE restore reads this as a stale (much
+        # older) value than time.time() returns in the restored container,
+        # which is exactly the signal we need.
+        self._snap_built_at_wallclock = time.time()
+
     @modal.enter(snap=False)
     def _wake(self) -> None:
         """Start cloudflared sidecar and wake the engine after snapshot restore.
@@ -1042,12 +1143,32 @@ class VllmQrQwen:
         import httpx
         from obs.events import (
             VLLM_COLDSTART_COMPLETE,
+            VLLM_SNAPSHOT_IDENTITY,
+            VLLM_SNAPSHOT_RESTORE_CLASS,
             VLLM_WAKE_FAIL,
             VLLM_WAKE_OK,
         )
         from obs.logging import get_logger
 
         log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
+
+        # iter-14: emit the snapshot identity FIRST so even if anything
+        # below in _wake fails, the operator can correlate the failed
+        # cold-start to a specific deploy. Read MODAL_IMAGE_ID from env
+        # (set by Modal) so the image hash is visible alongside the
+        # version constant. ``modal_image_id`` may be unset on the deploy
+        # host (e.g. local smoke tests) — log "<unset>" rather than
+        # raising, since this event is purely diagnostic.
+        log.info(
+            "vllm cold-start: snapshot identity",
+            extra={
+                "event": VLLM_SNAPSHOT_IDENTITY,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "identity_version": SNAPSHOT_IDENTITY_VERSION,
+                "model_revision": MODEL_REVISION or "<unpinned>",
+                "image_digest": os.environ.get("MODAL_IMAGE_ID", "<unset>"),
+            },
+        )
 
         # iter-12 (2026-05-22): cloudflared sidecar startup is now
         # PARALLELIZED with /wake_up + /health below. Previously
@@ -1187,6 +1308,53 @@ class VllmQrQwen:
                 "event": VLLM_COLDSTART_COMPLETE,
                 "served_model_name": self.SERVED_MODEL_NAME,
                 "total_elapsed_ms": total_elapsed_ms,
+            },
+        )
+
+        # iter-14: classify this restore as snapshot_hit vs snapshot_miss
+        # using the wall-clock gap between _start_and_sleep finishing and
+        # _wake running. ``_snap_built_at_wallclock`` is captured at the
+        # end of _start_and_sleep and frozen into the snapshot; on a TRUE
+        # restore the stored value is much older than the current
+        # ``time.time()`` (because the container that took the snapshot
+        # has long since died), whereas on the snap-create-then-wake-
+        # immediately path it is only a few seconds old. 60 s is a safe
+        # threshold: snapshot creation + restore happen within seconds;
+        # scaledown_window=180 s guarantees real restores see at minimum
+        # ~3 minutes of gap.
+        # iter-14e tuning: with /sleep level=2 the snapshot capture
+        # window collapsed from 150-200 s to ~31 s (weights are freed
+        # before snapshot rather than CPU-cached, so cuda-checkpoint has
+        # almost nothing to enumerate). The classification threshold
+        # has to drop in step:
+        #   * MISS path (just captured): gap ≈ 31-60 s on level-2.
+        #   * HIT path (restored from cold storage): gap ≥ some idle +
+        #     capture; iter-14e observed 259 s on a force-stop-and-ping
+        #     test (gap = pre-warm-end → /health-during-restore).
+        # 90 s is a comfortable margin above any capture window we
+        # observe at level=2, and well below the smallest restore gap.
+        snap_built_at = getattr(self, "_snap_built_at_wallclock", None)
+        if snap_built_at is None:
+            restore_class = "unknown"
+            inference_signal = "snap_built_at_wallclock=missing"
+        else:
+            gap_s = time.time() - snap_built_at
+            if gap_s < 90.0:
+                restore_class = "snapshot_miss"
+                inference_signal = f"gap_to_snap_built_s={gap_s:.1f}<90"
+            else:
+                restore_class = "snapshot_hit"
+                inference_signal = f"gap_to_snap_built_s={gap_s:.1f}>=90"
+        log.info(
+            "vllm cold-start restore class: %s for %s",
+            restore_class,
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": VLLM_SNAPSHOT_RESTORE_CLASS,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "restore_class": restore_class,
+                "total_elapsed_ms": total_elapsed_ms,
+                "inference_signal": inference_signal,
             },
         )
 

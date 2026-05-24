@@ -1,7 +1,11 @@
 # Dockerfile for the Modal-hosted vLLM container that serves
-# Qwen 3.5 9B at vLLM-default bf16 on H100:1 (was B200/H200 bf16 27B
-# pre-2026-05-21 cutover; FP8 was tried briefly in iter-06 drafts and
-# dropped; Gemma 4 31B paused 2026-05-20 — see app.py module docstring).
+# Qwen 3.5 9B at FP8 e4m3 (lovedheart/Qwen3.5-9B-FP8) on H100:1.
+# History: B200/H200 bf16 27B pre-2026-05-21 cutover → H100 Qwen3.5-9B
+# bf16 → H100 Qwen3.6-27B-FP8 (iter-09..iter-14) → H100 Qwen3.5-9B-FP8
+# (iter-15, 2026-05-24, machine-consciousness-conference demo). The
+# bf16 / FP8 / 27B / 9B history is captured in the auto-memory entries
+# iter14_snapshot_load_working + iter14_cold_start_hardening + this
+# header. Gemma 4 31B paused 2026-05-20 — see app.py module docstring.
 #
 # Built once and pushed by `modal deploy -m qr_sampler.connectors.modal.app`.
 #
@@ -45,6 +49,16 @@
 # createmp-evalsuite-validated recipe; Gemma is paused (see app.py
 # module docstring) until vLLM ships a release with both Gemma4 GDN
 # support AND a workable text-only MM-probe knob.
+# iter-14 (2026-05-23): TODO — pin by digest, not tag. Tags on the
+# vllm/vllm-openai DockerHub repo are MUTABLE (vLLM has retagged
+# v0.17.0 in the past for security backports). To pin: run
+#   docker pull vllm/vllm-openai:v0.17.0
+#   docker inspect --format='{{index .RepoDigests 0}}' vllm/vllm-openai:v0.17.0
+# then replace the tag-based FROM below with
+#   FROM vllm/vllm-openai@sha256:<digest>
+# Until that is done, this image's reproducibility is at the mercy of
+# upstream maintainers re-tagging v0.17.0. predeploy.ps1 surfaces a
+# warning when the FROM line does not start with `vllm/vllm-openai@`.
 ARG VLLM_BASE_TAG=v0.17.0
 FROM vllm/vllm-openai:${VLLM_BASE_TAG}
 
@@ -204,10 +218,28 @@ RUN pip install --no-cache-dir --no-deps \
 # NET_ADMIN capability. Installing from the official .deb (rather than `apt
 # install cloudflared`, which is not in Debian's default repos) keeps us on a
 # pinned-by-URL recent build.
-RUN curl -fsSL \
+#
+# iter-14 (2026-05-23): kept `/releases/latest/download/` because pinning to
+# a specific cloudflared version requires looking up the release tag +
+# its SHA256 from web (unavailable in offline build env). HOWEVER we now
+# CAPTURE THE VERSION + SHA in the build log so each image build records
+# exactly which cloudflared bytes ended up in it — a snapshot identity
+# drift between deploys is then trivially detectable via the
+# `cloudflared.version` + `cloudflared.sha256` lines in the build log,
+# even without enforcing the pin in advance.
+#
+# Follow-up: once the deploy host has been on the network we can pin the
+# release tag and switch to `sha256sum -c` enforcement (the version
+# capture below makes the SHA we need visible). At that point the
+# `/releases/latest/download/` URL becomes
+# `/releases/download/<version>/cloudflared-linux-amd64.deb`.
+RUN set -eux \
+    && curl -fsSL \
         https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
         -o /tmp/cloudflared.deb \
+    && echo "cloudflared.sha256 $(sha256sum /tmp/cloudflared.deb | cut -d' ' -f1)" \
     && dpkg -i /tmp/cloudflared.deb \
+    && echo "cloudflared.version $(cloudflared --version 2>&1 | head -1)" \
     && rm /tmp/cloudflared.deb
 
 # Default qr-sampler configuration. Overridden by the Modal Secret at runtime.
