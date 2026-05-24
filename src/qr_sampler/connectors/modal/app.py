@@ -160,7 +160,7 @@ MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tig
 PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
 PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
 PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
-PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-17c-001-prismaquant-vllm-0.20-b200"
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-18-001-prismaquant-rtxpro6000"
 PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
@@ -242,6 +242,44 @@ def _qr_llm_chat_functions_dir() -> Path:
             "in qr_sampler/connectors/modal/app.py."
         )
     return functions_dir
+
+
+def _qr_llm_chat_static_assets_dir() -> Path:
+    """Resolve the on-disk location of `qr_llm_chat/static_assets/` at deploy time.
+
+    Twin of ``_qr_llm_chat_functions_dir`` — see that function for the
+    full container-restore tolerance rationale. The static assets
+    directory holds the splash overlay CSS / JS / SVG that
+    ``qr_llm_chat.bootstrap_static_assets`` copies into OWUI's
+    ``STATIC_DIR``. The pyproject.toml package-data entry
+    (``qr_llm_chat.static_assets = ["*.css", "*.js", "*.svg"]``) makes
+    importlib.resources see the files in an editable install, but
+    Modal's ``.add_local_python_source("qr_llm_chat", copy=True)`` only
+    ships ``.py`` / ``.pyi`` source files — so the non-Python assets
+    never reach the container without this explicit ``.add_local_dir``
+    layer. Symptom of regression: ``bootstrap_static_assets done:
+    wrote=0 skipped=0 missing=3`` in OWUI logs at restore (iter-17c).
+    """
+    spec = importlib.util.find_spec("qr_llm_chat")
+    in_modal_container = bool(os.environ.get("MODAL_TASK_ID"))
+    if spec is None or spec.origin is None:
+        if in_modal_container:
+            return Path("/__qr_llm_chat_static_assets_unavailable_in_container__")
+        raise RuntimeError(
+            "qr_llm_chat is not importable in the deploy host's Python env. "
+            "Run `pip install -e <path/to/qr-llm-chat>` in the venv you use "
+            "for `modal deploy` and try again."
+        )
+    static_assets_dir = Path(spec.origin).resolve().parent / "static_assets"
+    if not static_assets_dir.is_dir():
+        if in_modal_container:
+            return Path("/__qr_llm_chat_static_assets_unavailable_in_container__")
+        raise RuntimeError(
+            f"Expected `qr_llm_chat/static_assets/` at {static_assets_dir}; not found. "
+            "If the package layout has changed, update _qr_llm_chat_static_assets_dir "
+            "in qr_sampler/connectors/modal/app.py."
+        )
+    return static_assets_dir
 
 
 # --- Volumes ---------------------------------------------------------------
@@ -1112,6 +1150,40 @@ class VllmQrQwen:
             },
         )
 
+        # iter-18 (2026-05-24): defensive mirror of the VllmQrPrismaQuant
+        # commit. The `vllm-cache` Volume here is already pre-warmed
+        # from iter-14/15 (which is why VllmQrQwen never hit the
+        # iter-17c CRIU restore failure that motivated this fix). But
+        # if a future operator resets the Volume — or the cache key
+        # rotates on a vLLM upgrade — the next snapshot capture would
+        # silently include filesystem references to a `torch_compile_cache/<hash>`
+        # directory that isn't on the persistent mount yet, and restore
+        # would fail with "Runner failed with exit code: 128". This
+        # commit is idempotent on an already-populated Volume (no-op
+        # when there's nothing new to flush), so the cost is ~0 in the
+        # common case and the protection is real in the regression case.
+        try:
+            vllm_cache_volume.commit()
+            log.info(
+                "vllm-cache Volume committed pre-snapshot",
+                extra={
+                    "event": "vllm.volume.commit_ok",
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "volume": "vllm-cache",
+                },
+            )
+        except Exception as exc:  # pragma: no cover -- belt-and-braces
+            log.warning(
+                "vllm-cache Volume commit failed: %s",
+                exc,
+                extra={
+                    "event": "vllm.volume.commit_fail",
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "volume": "vllm-cache",
+                    "error_type": type(exc).__name__,
+                },
+            )
+
         # iter-14f (2026-05-23): REVERTED /sleep?level=2 back to level=1.
         # Level=2 produced fast cold-from-storage restore (10-14 s
         # observed in iter-14e logs with `vllm.snapshot.restore_class=
@@ -1569,9 +1641,18 @@ _PRISMAQUANT_CLS_KWARGS: dict[str, Any] = {
         "/root/.cache/huggingface": weights_volume,
         "/root/.cache/vllm": vllm_prismaquant_cache_volume,
     },
-    # iter-17c (2026-05-24): B200+ (Blackwell) instead of H100:1 (Hopper).
-    # PrismaQuant's NVFP4 quantized weights require sm_100+ silicon —
-    # iter-17b crashed deterministically at vLLM 0.20's
+    # iter-18 (2026-05-24): downgraded from B200+ ($6.25/h) to
+    # RTX PRO 6000 ($3.03/h) — 51% cheaper Blackwell tier on Modal.
+    # Both SKUs are Blackwell silicon (sm_100 for B200, sm_120 for
+    # RTX PRO 6000) and share the same NVFP4 + MXFP8 kernel support
+    # (`FlashInferCutlassNvFp4LinearKernel` validates on both). The
+    # iter-17c log confirmed PrismaQuant fits in ~21 GiB resident
+    # weights; RTX PRO 6000's 96 GB VRAM leaves ~75 GiB headroom
+    # for the bf16 KV cache at --max-num-seqs=4 — comfortably more
+    # than needed for the demo workload.
+    #
+    # iter-17c (kept for context): the previous "B200+" Hopper→Blackwell
+    # swap was driven by iter-17b's deterministic crash at vLLM 0.20's
     # ``init_nvfp4_linear_kernel`` with:
     #   ValueError: Forced NVFP4 kernel FlashInferCutlassNvFp4LinearKernel
     #     is not supported: FlashInfer + >=sm_100 required
@@ -1580,14 +1661,10 @@ _PRISMAQUANT_CLS_KWARGS: dict[str, Any] = {
     # silicon. PrismaQuant's recipe was developed on DGX Spark (Grace
     # Blackwell GB10) so the model card's "vLLM 0.11+ required" omitted
     # the implicit Blackwell prereq.
-    # "B200+" is Modal's broad tier — schedules onto either B200 or B300
-    # silicon (both sm_100, same NVFP4 kernel support). Broader pool
-    # than narrow "B200" — important because Blackwell capacity on
-    # Modal is bursty (the same lesson the auto-memory captured for
-    # H200 in iter-04, see _CLS_KWARGS region comment).
+    #
     # The iter-15 VllmQrQwen sibling stays on H100:1 — Qwen3.5-9B-FP8
     # is pure FP8 + bf16, no NVFP4 layers, so Hopper is plenty.
-    "gpu": "B200+",
+    "gpu": "RTX-PRO-6000",
 }
 
 
@@ -1878,6 +1955,43 @@ class VllmQrPrismaQuant:
                 "duration_ms": warmup_duration_ms,
             },
         )
+
+        # iter-18 (2026-05-24): Persist torch.compile artefacts to the
+        # `vllm-cache-prismaquant` Volume BEFORE Modal's CRIU snapshot.
+        # The Volume is brand-new (created in iter-17) and vLLM writes
+        # `/root/.cache/vllm/torch_compile_cache/<hash>/...` during
+        # engine init. Those writes land in the ephemeral container
+        # layer until `commit()` flushes them to the persistent 9p
+        # mount; without this call, CRIU captures filesystem references
+        # to directories that don't exist on the restored Volume, and
+        # restore fails with:
+        #   failed to walk "vo-.../torch_compile_cache" of type 4000:
+        #   no such file or directory; Runner failed with exit code: 128
+        # (the iter-17c symptom). VllmQrQwen has been getting away
+        # without this because its `vllm-cache` Volume is pre-warmed
+        # from iter-14/15 — see the defensive mirror at the bottom of
+        # VllmQrQwen._start_and_sleep for that case.
+        try:
+            vllm_prismaquant_cache_volume.commit()
+            log.info(
+                "vllm-cache-prismaquant Volume committed pre-snapshot",
+                extra={
+                    "event": "vllm.volume.commit_ok",
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "volume": "vllm-cache-prismaquant",
+                },
+            )
+        except Exception as exc:  # pragma: no cover -- belt-and-braces
+            log.warning(
+                "vllm-cache-prismaquant Volume commit failed: %s",
+                exc,
+                extra={
+                    "event": "vllm.volume.commit_fail",
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "volume": "vllm-cache-prismaquant",
+                    "error_type": type(exc).__name__,
+                },
+            )
 
         # /sleep level=1 — same rationale as VllmQrQwen (level=2 produces
         # gibberish per auto-memory iter14_snapshot_load_working).
@@ -2433,6 +2547,20 @@ _OWUI_IMAGE = (
     .add_local_dir(
         str(_qr_llm_chat_functions_dir()),
         remote_path="/root/qr_llm_chat/functions",
+        copy=True,
+    )
+    # iter-18 (2026-05-24): same `add_local_python_source` filter as the
+    # `functions/*.json` workaround above — the splash overlay's
+    # `static_assets/{custom.css, loader.js, entropic-logo.svg}` never
+    # reached the container despite the pyproject.toml package-data entry,
+    # because Modal's add_local_python_source ships .py / .pyi only.
+    # Without this layer, `qr_llm_chat.bootstrap_static_assets` logs
+    # `bootstrap_static_assets done: wrote=0 ... missing=3` at restore
+    # and the OWUI app loads bare (no splash overlay, no scanline FX,
+    # no rotating taglines — the entire iter-15 demo UX is invisible).
+    .add_local_dir(
+        str(_qr_llm_chat_static_assets_dir()),
+        remote_path="/root/qr_llm_chat/static_assets",
         copy=True,
     )
 )
