@@ -139,7 +139,7 @@ MODEL_REVISION: str = "09de726107c7f9c6b44e34c28541579f0b73a719"  # rdtand/Qwen3
 #
 # Format: "iter-NN-MMM" where NN is the iteration log number and MMM is a
 # monotonic sub-iteration counter inside that iter.
-SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-16-002-prismaquant-text-only"
+SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-16-001-qwen3.6-27b-prismaquant"
 
 MODEL_GPU_MEMORY_UTILIZATION = "0.8"  # iter-16: kept at 0.8 (operator override of the 0.90 recipe pin). The PrismaQuant model card asks for 0.90 to maximise KV cache for MTP-bursting workloads, but we (a) disable --speculative-config so MTP never runs (qr-sampler's per-token QRNG entropy accounting assumes one logits call per token; speculative bursts would skew the bits-per-token math the iter-15 ticker shows), and (b) prefer the headroom for cuBLAS / FlashInfer NVFP4 workspaces at the cost of a smaller in-flight batch budget. Matches the prior 27B-FP8 + 9B-FP8 deploys for cuda-checkpoint enumeration reliability.
 
@@ -855,27 +855,6 @@ class VllmQrQwen:
             # + https://docs.openwebui.com/features/chat-conversations/chat-features/reasoning-models/
             "--reasoning-parser",
             "qwen3",
-            # iter-16b (2026-05-24): force text-only model class to skip
-            # vision tower construction. The PrismaQuant config reports
-            # ``Qwen3_5ForConditionalGeneration`` (image-text-to-text) which
-            # makes vLLM 0.17 build the full multimodal class — including
-            # the vision tower whose QKV ``QKVParallelLinear`` layer trips
-            # ``compressed_tensors.py:680 NotImplementedError: No
-            # compressed-tensors compatible scheme was found.`` during
-            # ``_init_executor → load_model``. The MM-probe monkey-patch
-            # only skips PROFILING; the model class is constructed first,
-            # so it can't help here. Overriding ``architectures`` to the
-            # sibling ``Qwen3_5ForCausalLM`` (text-only) tells vLLM to look
-            # up a class in the same module that has no ``self.visual``
-            # attribute. The vision-tower safetensor shards stay on disk
-            # untouched (vLLM only loads weights for parameters that exist
-            # on the constructed model). The demo is text-only, so dropping
-            # the vision tower is a no-op for users. If a future deploy
-            # wants vision inputs, either (a) wait for a vLLM release that
-            # supports the PrismaQuant compressed-tensors scheme on the
-            # vision QKV, or (b) switch to a non-PrismaQuant build.
-            "--hf-overrides",
-            '{"architectures":["Qwen3_5ForCausalLM"]}',
             # iter-16: --speculative-config (MTP n=3) deliberately OMITTED.
             # The PrismaQuant model card recommends it for raw decode-
             # throughput gains, but speculative decoding generates multiple
