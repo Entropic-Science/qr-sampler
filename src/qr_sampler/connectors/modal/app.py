@@ -160,7 +160,7 @@ MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tig
 PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
 PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
 PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
-PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-17-001-prismaquant-vllm-0.20"
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-17c-001-prismaquant-vllm-0.20-b200"
 PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
@@ -1563,12 +1563,31 @@ class VllmQrQwen:
 # experimental_options, etc. so cold-start lifecycle behaviour matches.
 
 _PRISMAQUANT_CLS_KWARGS: dict[str, Any] = {
-    **{k: v for k, v in _CLS_KWARGS.items() if k not in {"image", "volumes"}},
+    **{k: v for k, v in _CLS_KWARGS.items() if k not in {"image", "volumes", "gpu"}},
     "image": vllm_prismaquant_image,
     "volumes": {
         "/root/.cache/huggingface": weights_volume,
         "/root/.cache/vllm": vllm_prismaquant_cache_volume,
     },
+    # iter-17c (2026-05-24): B200+ (Blackwell) instead of H100:1 (Hopper).
+    # PrismaQuant's NVFP4 quantized weights require sm_100+ silicon —
+    # iter-17b crashed deterministically at vLLM 0.20's
+    # ``init_nvfp4_linear_kernel`` with:
+    #   ValueError: Forced NVFP4 kernel FlashInferCutlassNvFp4LinearKernel
+    #     is not supported: FlashInfer + >=sm_100 required
+    # The "FlashInfer-cutlass" backend in vLLM 0.20 is a FlashInfer
+    # *kernel*, not a Hopper *emulation* layer — it requires Blackwell
+    # silicon. PrismaQuant's recipe was developed on DGX Spark (Grace
+    # Blackwell GB10) so the model card's "vLLM 0.11+ required" omitted
+    # the implicit Blackwell prereq.
+    # "B200+" is Modal's broad tier — schedules onto either B200 or B300
+    # silicon (both sm_100, same NVFP4 kernel support). Broader pool
+    # than narrow "B200" — important because Blackwell capacity on
+    # Modal is bursty (the same lesson the auto-memory captured for
+    # H200 in iter-04, see _CLS_KWARGS region comment).
+    # The iter-15 VllmQrQwen sibling stays on H100:1 — Qwen3.5-9B-FP8
+    # is pure FP8 + bf16, no NVFP4 layers, so Hopper is plenty.
+    "gpu": "B200+",
 }
 
 
