@@ -4,7 +4,7 @@ Layout (matches spec.md §5.5 / §4.1, with the labs-cutover per-model split):
 
     weights_volume     — Volume "llm-weights", mounted at /root/.cache/huggingface
     download_weights   — one-shot @app.function to populate weights_volume
-    VllmQrQwen         — @app.cls (H100:1) running lovedheart/Qwen3.5-9B-FP8 alone
+    VllmQrQwen         — @app.cls (H100:1) running rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm alone
 
 Each model is its own scale-to-zero @app.cls so OWUI's model picker wakes
 only the requested container. Open WebUI itself is provided by the
@@ -29,19 +29,26 @@ Gemma 4 31B pause + Qwen 3.* MM-probe monkey-patch
    vLLM 0.17.0 does not register ``Gemma4ForConditionalGeneration``.
    Restore Gemma when a vLLM release ships gemma-4 GDN support.
 
-2. ``VllmQrQwen`` currently serves lovedheart/Qwen3.5-9B-FP8 (community
-   FP8 e4m3 quant of Qwen/Qwen3.5-9B, ~9 GiB resident weights, served
-   as ``qwen3.5-9b``). vLLM auto-detects the FP8 quantization config
-   from the model's ``config.json`` so no explicit ``--quantization fp8``
-   flag is needed on the ``vllm serve`` command line. iter-15 (2026-05-24)
-   swapped here from Qwen/Qwen3.6-27B-FP8 (~27 GiB) to optimise
-   cold-from-storage latency for a public-facing demo: ``/sleep level=1``
-   keeps weights resident in CPU RAM, so the snapshot's cold-storage
-   pull is bandwidth-bound by weight tensor size (~115 s for 27B, projected
-   ~40 s for 9B). The bf16 build of the same 9B model (~18 GiB) is the
-   official Qwen-org publication; no Qwen-org FP8 build exists for the
-   3.5-9B size at deploy time, so the ``lovedheart`` community quant is
-   the only path to a ≤10 GiB resident footprint. Both 9B and 27B Qwen3.* variants carry
+2. ``VllmQrQwen`` currently serves rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm
+   (PrismaQuant 5.5-bit mixed quant of Qwen/Qwen3.6-27B — NVFP4 weights
+   + MXFP8 select layers + BF16 norms via the ``compressed-tensors``
+   scheme, ~18 GiB resident weights, served as ``qwen3.6-27b-prismaquant``,
+   picker-rendered as "Qwen3.6-27B-PrismaQuant (quantum-random)").
+   vLLM auto-detects the quantization config from the model's
+   ``config.json`` so no explicit ``--quantization`` flag is needed.
+   iter-16 (2026-05-24) swapped here from the iter-15 stop-over
+   (lovedheart/Qwen3.5-9B-FP8, ~9 GiB) back to a 27B-class model — the
+   PrismaQuant compression buys us ~⅔ the resident footprint of the
+   prior Qwen3.6-27B-FP8 (~27 GiB) while keeping the 27B quality
+   ceiling. ``/sleep level=1`` keeps weights resident in CPU RAM so
+   snapshot cold-storage restore is bandwidth-bound by tensor size —
+   projected ~80 s for the PrismaQuant 18 GiB vs ~115 s for the prior
+   27B-FP8. Required serve-side env: VLLM_NVFP4_GEMM_BACKEND=
+   flashinfer-cutlass (set in Dockerfile.vllm). Required serve flag:
+   --trust-remote-code (per recipe). The MTP draft head shipped in the
+   checkpoint is LOADED BUT UNUSED — ``--speculative-config`` is
+   deliberately omitted because speculative-decoding bursts conflict
+   with qr-sampler's per-token QRNG entropy accounting. Both 9B and 27B Qwen3.* variants carry
    a populated HF ``vision_config`` so vLLM V1's ``profile_run`` would
    otherwise run an unconditional MM dummy probe that crashes in
    ``transformers.processing_utils.get_text_with_replacements`` with
@@ -102,8 +109,8 @@ APP_NAME = "qr-llm-chat"
 # ``qr_llm_chat/functions/_sources/qr_comparison_pipe.py``. A mismatch breaks
 # OWUI routing (vLLM returns 404 on /v1/chat/completions when ``model:``
 # does not match ``/v1/models``).
-MODEL_HF_REPO_ID = "lovedheart/Qwen3.5-9B-FP8"  # community FP8 e4m3 build of Qwen3.5-9B (~9 GiB resident, vs ~18 GiB for the official bf16 build, vs ~27 GiB for the prior Qwen3.6-27B-FP8). Demo-grade: 3x smaller cold-from-storage payload than the 27B pin → projected snapshot restore ~40 s vs 115-125 s. Architecture is Qwen3_5ForConditionalGeneration so the existing transformers==5.5.4 + MM-probe monkey-patch combo applies unchanged. No official Qwen-org FP8 build of 3.5-9B exists at deploy time (2026-05-24); ``lovedheart`` is the only published FP8 quant. If a future Qwen-org FP8 build appears, switch back to ``Qwen/<...>``.
-MODEL_SERVED_NAME = "qwen3.5-9b"  # /v1/models id; lockstep with qr-llm-chat _QWEN_ID (precision is implementation detail, not picker-visible)
+MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"  # iter-16: PrismaQuant 5.5-bit mixed-quant build of Qwen/Qwen3.6-27B (NVFP4 weights + MXFP8 select layers + BF16 norms — see config.json quantization_config.quant_method=compressed-tensors). ~18 GiB resident weights, vs ~27 GiB for the prior Qwen3.6-27B-FP8 and ~9 GiB for the iter-15 Qwen3.5-9B-FP8 stop-over. Architecture is Qwen3_5ForConditionalGeneration (same family as both prior pins) so the existing transformers==5.5.4 + MM-probe monkey-patch combo applies unchanged. Requires VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass env var (set in Dockerfile.vllm) so the NVFP4 GEMM path is explicit; without it vLLM auto-selects but flashinfer-cutlass is the recipe-pinned backend for H100. Also requires --trust-remote-code (per recipe). MTP speculative decoding (--speculative-config) is DELIBERATELY DISABLED for this deploy — see the cmd-list comment for why (QRNG per-token entropy accounting conflict).
+MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"  # /v1/models id; lockstep with qr-llm-chat _QWEN_ID. Lowercase + hyphens for url-safety; the picker-visible label "Qwen3.6-27B-PrismaQuant (quantum-random)" is set separately via the qr_llm_chat ``model`` table override.
 
 # iter-14: Snapshot identity hardening. The HF revision used to default to
 # os.environ.get("QWEN_REVISION", "") which (a) silently resolves to "latest"
@@ -111,12 +118,13 @@ MODEL_SERVED_NAME = "qwen3.5-9b"  # /v1/models id; lockstep with qr-llm-chat _QW
 # makes an env var part of the snapshot input surface. Both are sources of
 # the brittle cold-cold restore behaviour iter-09..iter-13 chased. We now
 # hardcode the SHA. To bump: look up the current commit on
-# https://huggingface.co/lovedheart/Qwen3.5-9B-FP8/commits/main, paste the full
-# 40-char hex here, and bump SNAPSHOT_IDENTITY_VERSION below in lockstep.
+# https://huggingface.co/rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm/commits/main,
+# paste the full 40-char hex here, and bump SNAPSHOT_IDENTITY_VERSION below in
+# lockstep.
 # An empty string here still falls through (so dev iteration on environments
 # without the SHA available is unblocked), but the predeploy.ps1 gate in
 # qr-llm-chat refuses to deploy until this is populated.
-MODEL_REVISION: str = "5d77dcb2e2c606bc261b5b8e946a67781f18d733"  # lovedheart/Qwen3.5-9B-FP8 main as of 2026-05-24 via HF API
+MODEL_REVISION: str = "09de726107c7f9c6b44e34c28541579f0b73a719"  # rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm main as of 2026-05-24 via HF API
 
 # iter-14: Snapshot identity version. Modal computes the snapshot key from
 # the image hash + the @modal.enter(snap=True) body. This constant is NOT
@@ -131,9 +139,9 @@ MODEL_REVISION: str = "5d77dcb2e2c606bc261b5b8e946a67781f18d733"  # lovedheart/Q
 #
 # Format: "iter-NN-MMM" where NN is the iteration log number and MMM is a
 # monotonic sub-iteration counter inside that iter.
-SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-15-001-qwen3.5-9b-fp8-demo"
+SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-16-001-qwen3.6-27b-prismaquant"
 
-MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tight for 27B-FP8) to 0.85 with the 9B-FP8 swap. 9 GiB weights leave plenty of headroom under H100's 79 GiB even at 0.85 utilization; the extra 5 % expands the KV cache budget so multi-turn chats stay coherent through a longer demo session without prefix caching (which is the one knob we can't re-enable per auto-memory iter14_snapshot_load_working).
+MODEL_GPU_MEMORY_UTILIZATION = "0.8"  # iter-16: kept at 0.8 (operator override of the 0.90 recipe pin). The PrismaQuant model card asks for 0.90 to maximise KV cache for MTP-bursting workloads, but we (a) disable --speculative-config so MTP never runs (qr-sampler's per-token QRNG entropy accounting assumes one logits call per token; speculative bursts would skew the bits-per-token math the iter-15 ticker shows), and (b) prefer the headroom for cuBLAS / FlashInfer NVFP4 workspaces at the cost of a smaller in-flight batch budget. Matches the prior 27B-FP8 + 9B-FP8 deploys for cuda-checkpoint enumeration reliability.
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
 # module import (i.e. each Modal container's Python process boot). The
@@ -368,7 +376,7 @@ app = modal.App(APP_NAME)
 # ----- One-shot weights download -------------------------------------------
 
 
-# 2026-05-24 (iter-15): lovedheart/Qwen3.5-9B-FP8 is the active build target. Both 9B and
+# 2026-05-24 (iter-16): rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm is the active build target. Both 9B and
 # 27B Qwen3.* variants (including the FP8 build) carry a populated HF
 # ``vision_config``; the MM-probe patch in
 # ``qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch``
@@ -400,7 +408,7 @@ def download_weights() -> dict[str, str]:
     Idempotent — re-running just re-validates the cache. The active repo +
     optional revision pin come from the module-level ``MODEL_HF_REPO_ID`` /
     ``MODEL_REVISION`` constants (aliased here as ``_QWEN_REPO`` /
-    ``_QWEN_REVISION``). As of 2026-05-24 (iter-15) this targets lovedheart/Qwen3.5-9B-FP8
+    ``_QWEN_REVISION``). As of 2026-05-24 (iter-16) this targets rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm
     (the HF-published FP8 build, ~27 GiB resident weights — chosen over
     the bf16 build because the latter's 54 GiB footprint exceeded Modal's
     CRIU+CUDA checkpointer's reliable restore window). The MM-probe
@@ -590,7 +598,7 @@ class VllmQrQwen:
     # Machine-friendly ID echoed by vLLM's /v1/models endpoint and used as
     # the routing key throughout OWUI + the comparison Pipe. No spaces or
     # parens here -- the human-readable display label
-    # ("qwen3.5-9b (quantum-random)") is set via an OWUI ``model`` table
+    # ("Qwen3.6-27B-PrismaQuant (quantum-random)") is set via an OWUI ``model`` table
     # row override seeded by ``qr_llm_chat.bootstrap_connections``. The id
     # MUST stay in lockstep with ``_QWEN_ID`` in
     # ``qr_llm_chat/bootstrap_connections.py`` and the Pipe's
@@ -724,19 +732,29 @@ class VllmQrQwen:
             # TORCH_NCCL_ENABLE_MONITORING=0 in Dockerfile.vllm; it
             # was diagnostic noise, not a request-blocker.
             "--enable-sleep-mode",
-            # Precision: weights are FP8 e4m3 (the model is
-            # ``lovedheart/Qwen3.5-9B-FP8``, a community FP8 quant of
-            # Qwen/Qwen3.5-9B; vLLM auto-detects the FP8
-            # ``quantization_config`` in the model's ``config.json``, so no
-            # explicit ``--quantization fp8`` flag is needed on the serve
-            # command line). KV cache stays at vLLM's default (bf16), which
-            # keeps the ``init_fp8_kv_scales`` patch in ``vllm_patches.py``
+            # iter-16: PrismaQuant requires --trust-remote-code per the
+            # published recipe (https://huggingface.co/rdtand/Qwen3.6-27B-
+            # PrismaQuant-5.5bit-vllm "Serving (vLLM only)" section). The
+            # build ships custom kernel registrations in
+            # config.json/quantization_config; vLLM's compressed-tensors
+            # loader needs this flag to import the model's own modeling code
+            # alongside the standard Qwen3_5ForConditionalGeneration shim.
+            "--trust-remote-code",
+            # Precision: weights are mixed NVFP4 (most layers) + MXFP8
+            # (select layers) + BF16 (norms) — 5.5-bit average — driven by
+            # the ``compressed-tensors`` quantization scheme. vLLM auto-
+            # detects the scheme from config.json's ``quantization_config``
+            # so no explicit ``--quantization`` flag is needed. The
+            # ``init_fp8_kv_scales`` patch in ``vllm_patches.py`` stays
             # dormant — its own ``cache_dtype.startswith("fp8")`` gate
             # short-circuits when the cmd does not request ``--kv-cache-dtype
-            # fp8``. FP8 weights (~9 GiB) + bf16 KV cache (bounded by
-            # max-num-seqs=4 × max-model-len=32768) + activation fits
-            # comfortably under the 73 GiB usable budget on the H100:1 with
-            # the gpu-memory-utilization=0.85 ceiling below.
+            # fp8``. ~18 GiB resident weights + bf16 KV cache (bounded by
+            # max-num-seqs=4 × max-model-len=32768) fits comfortably under
+            # the 73 GiB usable budget on the H100:1 with the
+            # gpu-memory-utilization=0.8 ceiling. The MTP draft head shipped
+            # in the safetensors is loaded but unused (no --speculative-
+            # config); a future iter could re-enable MTP after teaching
+            # qr-sampler to fan out QRNG entropy fetches per draft token.
             # iter-14d (2026-05-23): --enable-prefix-caching DROPPED.
             # The 2026-05-22 A/B test that previously kept it on was
             # against the IMAGE-BAKED weights path, which had its own
@@ -837,6 +855,20 @@ class VllmQrQwen:
             # + https://docs.openwebui.com/features/chat-conversations/chat-features/reasoning-models/
             "--reasoning-parser",
             "qwen3",
+            # iter-16: --speculative-config (MTP n=3) deliberately OMITTED.
+            # The PrismaQuant model card recommends it for raw decode-
+            # throughput gains, but speculative decoding generates multiple
+            # draft tokens per forward pass — which collides with the
+            # qr-sampler logits processor's per-token QRNG entropy
+            # accounting (one entropy fetch per logits call, per token).
+            # Re-enabling MTP would either silently skew the bits-per-token
+            # math the iter-15 entropy ticker shows, or require deeper
+            # qr-sampler changes to fan out entropy fetches across draft
+            # tokens. For the demo, deterministic per-token quantum
+            # sampling is the point — not raw throughput. To re-enable
+            # later, add:
+            #   "--speculative-config",
+            #   '{"method":"mtp","num_speculative_tokens":3}',
         ]
 
         # Iter-08 / iter-10: vLLM's CLI churns between minor releases
