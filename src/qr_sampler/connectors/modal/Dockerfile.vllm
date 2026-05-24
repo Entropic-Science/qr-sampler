@@ -1,11 +1,14 @@
 # Dockerfile for the Modal-hosted vLLM container that serves
-# Qwen 3.5 9B at FP8 e4m3 (lovedheart/Qwen3.5-9B-FP8) on H100:1.
+# Qwen3.6-27B-PrismaQuant (5.5-bit NVFP4+MXFP8 mixed quant) on H100:1.
 # History: B200/H200 bf16 27B pre-2026-05-21 cutover → H100 Qwen3.5-9B
 # bf16 → H100 Qwen3.6-27B-FP8 (iter-09..iter-14) → H100 Qwen3.5-9B-FP8
-# (iter-15, 2026-05-24, machine-consciousness-conference demo). The
-# bf16 / FP8 / 27B / 9B history is captured in the auto-memory entries
-# iter14_snapshot_load_working + iter14_cold_start_hardening + this
-# header. Gemma 4 31B paused 2026-05-20 — see app.py module docstring.
+# (iter-15 stop-over) → H100 rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm
+# (iter-16, 2026-05-24, machine-consciousness-conference demo). The
+# PrismaQuant build delivers ~18 GiB resident weights (~⅔ of the prior
+# 27B-FP8 footprint) plus an MTP draft head for ~1.8x decode throughput
+# via n=3 speculative decoding (recipe-measured optimum). NVFP4 attention
+# uses FlashInfer's cutlass kernels on H100 (Blackwell-native NVFP4
+# emulated). Gemma 4 31B paused 2026-05-20 — see app.py module docstring.
 #
 # Built once and pushed by `modal deploy -m qr_sampler.connectors.modal.app`.
 #
@@ -92,7 +95,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TORCH_NCCL_ENABLE_MONITORING=0 \
     TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=86400 \
     TORCH_CPP_LOG_LEVEL=ERROR \
-    TORCHINDUCTOR_COMPILE_THREADS=1
+    TORCHINDUCTOR_COMPILE_THREADS=1 \
+    VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass
+# VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass (iter-16): the PrismaQuant
+# model card pins this to make the NVFP4 GEMM backend choice explicit.
+# Without it, vLLM auto-selects from available backends at engine init,
+# which on H100 typically falls back to FlashInfer's cutlass kernels
+# anyway — but documenting the pin in the snapshot input surface means
+# a future vLLM that ships a different auto-selection heuristic
+# (e.g. picking Marlin or a CUDA-graph-pinned path) does not silently
+# change the cold-start behaviour. The flashinfer-cutlass path is what
+# the recipe was measured against. Source:
+# https://huggingface.co/rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm
+# "Serving (vLLM only)" section.
 # TORCHINDUCTOR_COMPILE_THREADS=1 is the Modal-documented fix for
 # torch.compile + memory snapshot conflicts (see
 # https://modal.com/docs/guide/memory-snapshots — "In certain cases,
