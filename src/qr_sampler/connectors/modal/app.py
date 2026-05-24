@@ -160,7 +160,7 @@ MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tig
 PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
 PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
 PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
-PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-18-001-prismaquant-rtxpro6000"
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-18-002-prismaquant-b200"
 PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
@@ -1641,17 +1641,30 @@ _PRISMAQUANT_CLS_KWARGS: dict[str, Any] = {
         "/root/.cache/huggingface": weights_volume,
         "/root/.cache/vllm": vllm_prismaquant_cache_volume,
     },
-    # iter-18 (2026-05-24): downgraded from B200+ ($6.25/h) to
-    # RTX PRO 6000 ($3.03/h) — 51% cheaper Blackwell tier on Modal.
-    # Both SKUs are Blackwell silicon (sm_100 for B200, sm_120 for
-    # RTX PRO 6000) and share the same NVFP4 + MXFP8 kernel support
-    # (`FlashInferCutlassNvFp4LinearKernel` validates on both). The
-    # iter-17c log confirmed PrismaQuant fits in ~21 GiB resident
-    # weights; RTX PRO 6000's 96 GB VRAM leaves ~75 GiB headroom
-    # for the bf16 KV cache at --max-num-seqs=4 — comfortably more
-    # than needed for the demo workload.
+    # iter-18b (2026-05-24): REVERTED RTX-PRO-6000 -> B200+ after
+    # iter-18a snapshot-restore failures. iter-18a deployed cleanly
+    # to RTX PRO 6000, built the snapshot successfully, and the
+    # same-container wake succeeded (734 ms vllm.wake.ok, 5.94 s
+    # end-to-end /health). But every cross-container restore failed
+    # with the EXACT 180s NVIDIA cuda-checkpoint timeout documented
+    # in the iter14 auto-memory:
+    #   modal._runtime.gpu_memory_snapshot.CudaCheckpointException:
+    #     Failed to restore 1 processes: PID: 43 Get state command
+    #     timed out
+    #   Runner failed with exit code: 1
+    # Modal retried every ~1-2 min for 13+ min, all failing the same
+    # way. RTX PRO 6000 is sm_120 (consumer Blackwell); the datacenter
+    # B200 is sm_100, with more mature cuda-checkpoint support. Same
+    # NVFP4 + MXFP8 kernel suite works on both (we confirmed
+    # FlashInferCutlassNvFp4LinearKernel loaded cleanly on
+    # RTX PRO 6000), so reverting only affects the snapshot-restore
+    # path — the model + runtime combination remains untouched.
+    # Cost trade: $6.25/h instead of $3.03/h, but containers only
+    # spin up on demand for the demo, and snapshot-hit makes the
+    # cold-start <30 s instead of 400 s+, so the per-user-experience
+    # economics favour the more expensive SKU on this workload.
     #
-    # iter-17c (kept for context): the previous "B200+" Hopper→Blackwell
+    # iter-17c (kept for context): the original Hopper -> Blackwell
     # swap was driven by iter-17b's deterministic crash at vLLM 0.20's
     # ``init_nvfp4_linear_kernel`` with:
     #   ValueError: Forced NVFP4 kernel FlashInferCutlassNvFp4LinearKernel
@@ -1664,7 +1677,7 @@ _PRISMAQUANT_CLS_KWARGS: dict[str, Any] = {
     #
     # The iter-15 VllmQrQwen sibling stays on H100:1 — Qwen3.5-9B-FP8
     # is pure FP8 + bf16, no NVFP4 layers, so Hopper is plenty.
-    "gpu": "RTX-PRO-6000",
+    "gpu": "B200+",
 }
 
 
