@@ -2093,16 +2093,58 @@ class VllmQrPrismaQuant:
         )
         self._health_thread.start()
 
-    # The unchanged lifecycle methods only reference ``self.*`` attributes
-    # (SERVED_MODEL_NAME, _VLLM_BASE_URL, _cloudflared, _vllm_proc,
-    # _health_stop_event) which this class overrides above, so the
-    # function bodies work without modification. Borrowing the function
-    # objects keeps the @modal.exit / @modal.web_server decoration intact
-    # — that decoration lives on the function via attribute markers, not
-    # on the class scope.
+    # ``_poll_vllm_health`` is a regular method (no @modal.* decoration),
+    # so borrowing the function object via class-dict assignment is fine
+    # — it gets bound to ``self`` at call time and reads its own class
+    # attributes. The Modal-decorated lifecycle methods (_stop with
+    # @modal.exit, serve with @modal.web_server) CANNOT be borrowed: the
+    # decorator registers the function into a per-class data structure
+    # at definition time, so the registration is class-scoped even
+    # though the function object's marker is global. iter-17 first pass
+    # (commit 1650fd0) tried borrowing all three and Modal silently
+    # skipped the @modal.web_server registration for VllmQrPrismaQuant
+    # — the deploy output showed "Created function VllmQrPrismaQuant.*"
+    # but no matching "Created web endpoint for VllmQrPrismaQuant.serve",
+    # leaving the class with no public URL. iter-17a fix: define _stop
+    # and serve explicitly inside the class so their decorators run in
+    # VllmQrPrismaQuant's class context.
     _poll_vllm_health = VllmQrQwen._poll_vllm_health
-    _stop = VllmQrQwen._stop
-    serve = VllmQrQwen.serve
+
+    @modal.exit()
+    def _stop(self) -> None:
+        """Tear down the sidecar and the vllm serve subprocess.
+
+        Functionally identical to ``VllmQrQwen._stop`` — see that
+        method for full rationale. Defined explicitly here because
+        @modal.exit() class-scope registration prevents borrowing the
+        decorated function via class-dict assignment (see comment
+        above).
+        """
+        import subprocess
+
+        stop_event = getattr(self, "_health_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+
+        _stop_qrng_tunnel(getattr(self, "_cloudflared", None))
+        proc = getattr(self, "_vllm_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    @modal.web_server(port=_VLLM_PORT, startup_timeout=_STARTUP_TIMEOUT_S)
+    def serve(self) -> None:
+        """Modal proxies inbound HTTP traffic to ``vllm serve`` on port 8000.
+
+        Same rationale as ``VllmQrQwen.serve`` — the subprocess is
+        already running by the time this function is invoked
+        (_start_and_sleep + _wake have run), so this body is only
+        entered for Modal's port-readiness probe.
+        """
+        return None
 
 
 # ----- QRNG cloudflared sidecar wiring -------------------------------------
