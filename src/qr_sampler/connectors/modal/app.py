@@ -1684,8 +1684,20 @@ class VllmQrPrismaQuant:
             "4",
             "--max-num-batched-tokens",
             "8192",
-            "--swap-space",
-            "16",
+            # iter-17b (2026-05-24): --swap-space DROPPED for vLLM 0.20.
+            # vLLM 0.20 removed/renamed the --swap-space flag from
+            # AsyncEngineArgs CLI (caught by the in-process argv
+            # validator: vllm.argv.unrecognized event, container
+            # crashed in 3 s rather than running blind). The 0.17
+            # VllmQrQwen sibling still uses --swap-space=16 — kept
+            # there because that profile's argv set is validated and
+            # known-working. Dropping it here means PrismaQuant uses
+            # vLLM 0.20's default CPU-RAM swap budget for KV cache
+            # eviction; with --max-num-seqs=4 + --max-model-len=32768
+            # we will not saturate the KV cache during demo workloads
+            # so the default is fine. If a future deploy needs a
+            # bigger swap, look up the new flag name in vllm 0.20+
+            # docs (likely renamed to --cpu-offload-gb).
             "--gpu-memory-utilization",
             PRISMAQUANT_GPU_MEMORY_UTILIZATION,
             "--logits-processors",
