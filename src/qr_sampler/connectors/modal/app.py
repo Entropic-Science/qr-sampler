@@ -135,6 +135,34 @@ SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-15-001-qwen3.5-9b-fp8-demo"
 
 MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tight for 27B-FP8) to 0.85 with the 9B-FP8 swap. 9 GiB weights leave plenty of headroom under H100's 79 GiB even at 0.85 utilization; the extra 5 % expands the KV cache budget so multi-turn chats stay coherent through a longer demo session without prefix caching (which is the one knob we can't re-enable per auto-memory iter14_snapshot_load_working).
 
+# ---- iter-17 NEW PROFILE: PrismaQuant on vLLM v0.20.0 ---------------------
+# Parallel constants block for the experimental PrismaQuant profile. The
+# constants above (MODEL_*) drive VllmQrQwen on vLLM 0.17; these
+# (PRISMAQUANT_*) drive VllmQrPrismaQuant on vLLM 0.20. Each class reads
+# its own block, so an edit to one profile does NOT invalidate the
+# other's snapshot identity. To swap the PrismaQuant build:
+#   1. Edit PRISMAQUANT_MODEL_HF_REPO_ID / _REVISION below.
+#   2. modal run -m qr_sampler.connectors.modal.app::download_weights_prismaquant
+#   3. Bump PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION in lockstep so the prior
+#      snapshot identity is invalidated cleanly.
+#   4. modal deploy.
+#
+# Why a separate profile (vs editing the MODEL_* block):
+#   * vLLM 0.20 ships a strictly larger compressed-tensors scheme set
+#     than 0.17 — required for PrismaQuant's mixed NVFP4 + MXFP8 weights.
+#     vLLM 0.17 raised ``NotImplementedError: No compressed-tensors
+#     compatible scheme was found`` on engine init (iter-16 traceback
+#     captured in artifacts/iter-16-coldstart.log).
+#   * vLLM major upgrades carry collateral risk: PyTorch baseline +
+#     CUDA toolkit + the monkey-patches in vllm_serve.py / vllm_patches.py.
+#     Isolating the upgrade in a SECOND class lets the iter-15 9B-FP8
+#     stack stay a known-good fallback while we validate 0.20.
+PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
+PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
+PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-17-001-prismaquant-vllm-0.20"
+PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
+
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
 # module import (i.e. each Modal container's Python process boot). The
 # end-of-_wake event uses ``time.monotonic() - _CONTAINER_START_MONOTONIC``
@@ -360,6 +388,34 @@ vllm_image = (
     .add_local_python_source("obs", copy=True)
 )
 
+# iter-17: parallel image for the PrismaQuant profile, built from
+# Dockerfile.vllm-prismaquant (FROM vllm/vllm-openai:v0.20.0). The two
+# images are bytewise different — different vLLM major, different env
+# block (PrismaQuant pins VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass) —
+# so Modal hashes them to distinct digests and each profile gets its
+# own snapshot identity. Modal Volume mounts (llm-weights, the
+# cloudflared sidecar setup, the qr-sampler + obs source layers)
+# mirror the iter-15 image.
+vllm_prismaquant_image = (
+    modal.Image.from_dockerfile(
+        str(Path(__file__).parent / "Dockerfile.vllm-prismaquant"),
+        context_dir=str(_REPO_ROOT),
+    )
+    .add_local_python_source("qr_sampler", copy=True)
+    .add_local_python_source("obs", copy=True)
+)
+
+# iter-17: parallel torch.compile cache. vLLM 0.17 and 0.20 emit
+# incompatible AOT artefacts (different vLLM internal IR + different
+# PyTorch baseline) — sharing the cache between the two profiles would
+# cause vLLM 0.20 to either miss the cache (best case, slow first-load)
+# or crash trying to load 0.17-format binaries (worst case). Separate
+# Volume isolates them cleanly. Same per-version cache-key discipline
+# as the iter-14 vllm-cache Volume (see comment on vllm_cache_volume).
+vllm_prismaquant_cache_volume = modal.Volume.from_name(
+    "vllm-cache-prismaquant", create_if_missing=True
+)
+
 # --- App -------------------------------------------------------------------
 
 app = modal.App(APP_NAME)
@@ -422,6 +478,42 @@ def download_weights() -> dict[str, str]:
     return {
         "qwen_path": qwen_path,
         "qwen_revision": _QWEN_REVISION or "(latest)",
+    }
+
+
+@app.function(
+    image=download_image,
+    volumes={"/root/.cache/huggingface": weights_volume},
+    secrets=[hf_token_secret],
+    timeout=60 * 60,  # 1 hour
+)
+def download_weights_prismaquant() -> dict[str, str]:
+    """Populate the ``llm-weights`` Volume with the PrismaQuant model.
+
+    iter-17 parallel to ``download_weights``. Shares the same
+    ``llm-weights`` Volume (HF caches files by repo_id under
+    ``~/.cache/huggingface/hub/`` so the two profiles' weights live in
+    separate subdirectories — no collision). Run once per model bump:
+
+        modal run -m qr_sampler.connectors.modal.app::download_weights_prismaquant
+
+    Idempotent. Pins the SHA from ``PRISMAQUANT_MODEL_REVISION`` for
+    snapshot-identity hygiene; ``snapshot_download`` validates the
+    revision matches the cache and re-pulls only if the local files are
+    stale.
+    """
+    from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+
+    kwargs: dict[str, Any] = {"repo_id": PRISMAQUANT_MODEL_HF_REPO_ID}
+    if PRISMAQUANT_MODEL_REVISION:
+        kwargs["revision"] = PRISMAQUANT_MODEL_REVISION
+
+    path = snapshot_download(**kwargs)
+    weights_volume.commit()  # type: ignore[attr-defined]
+
+    return {
+        "prismaquant_path": path,
+        "prismaquant_revision": PRISMAQUANT_MODEL_REVISION or "(latest)",
     }
 
 
@@ -1459,6 +1551,558 @@ class VllmQrQwen:
         port-readiness probe.
         """
         return None
+
+
+# ----- iter-17 NEW PROFILE: VllmQrPrismaQuant ------------------------------
+#
+# Parallel to VllmQrQwen above. Uses ``vllm_prismaquant_image`` (vLLM
+# v0.20.0) + ``vllm_prismaquant_cache_volume`` (separate torch.compile
+# cache) so the iter-15 stack stays untouched. Shares the ``llm-weights``
+# Volume because the HF cache layout is keyed by repo_id — no collision.
+# Otherwise mirrors ``_CLS_KWARGS`` for the GPU pin, scaledown window,
+# experimental_options, etc. so cold-start lifecycle behaviour matches.
+
+_PRISMAQUANT_CLS_KWARGS: dict[str, Any] = {
+    **{k: v for k, v in _CLS_KWARGS.items() if k not in {"image", "volumes"}},
+    "image": vllm_prismaquant_image,
+    "volumes": {
+        "/root/.cache/huggingface": weights_volume,
+        "/root/.cache/vllm": vllm_prismaquant_cache_volume,
+    },
+}
+
+
+@app.cls(**_PRISMAQUANT_CLS_KWARGS)
+@modal.concurrent(max_inputs=8)
+class VllmQrPrismaQuant:
+    """vLLM v0.20.0 + rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm.
+
+    iter-17 new-engine-type profile. Parallel to ``VllmQrQwen`` (which
+    serves Qwen3.5-9B-FP8 on vLLM 0.17); see that class for full
+    lifecycle docs — every architectural decision (snap=True for
+    snapshot build, snap=False for wake, cloudflared post-snapshot,
+    background /health poller, /sleep level=1) is mirrored here.
+
+    Notable diffs vs VllmQrQwen:
+
+      * vLLM v0.20.0 base image (Dockerfile.vllm-prismaquant) —
+        compressed-tensors loader now recognises NVFP4 (W4A16Fp4) +
+        MXFP8 (W8A8Mxfp8) schemes which PrismaQuant needs.
+      * ``--trust-remote-code`` (per the PrismaQuant recipe).
+      * ``--hf-overrides '{"architectures":["Qwen3_5ForCausalLM"]}'`` so
+        vLLM constructs the text-only model class. The PrismaQuant
+        config reports ``Qwen3_5ForConditionalGeneration`` which would
+        build the vision tower; that path failed in iter-16 at vLLM
+        0.17 and is unverified at 0.20. Forcing text-only sidesteps
+        the question for the text-chat demo; re-enable vision when a
+        future iter ships a config that loads cleanly.
+      * ``VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass`` env (Dockerfile)
+        pins the NVFP4 GEMM backend per the PrismaQuant recipe.
+      * MTP speculative decoding NOT enabled — qr-sampler's per-token
+        QRNG entropy accounting assumes one logits call per token.
+      * Snapshot identity references ``PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION``
+        + ``PRISMAQUANT_MODEL_REVISION`` so this class's snapshot is
+        independent from VllmQrQwen's.
+
+    The unchanged lifecycle methods (``_poll_vllm_health``, ``_stop``,
+    ``serve``) are borrowed from ``VllmQrQwen`` via class-dict
+    assignment — Modal's decoration lives on the function object, so
+    sharing the function preserves the hook wiring. If a future
+    refactor breaks that pattern, the methods can be fully duplicated
+    here at the cost of code bulk.
+    """
+
+    SERVED_MODEL_NAME = PRISMAQUANT_MODEL_SERVED_NAME
+    HF_REPO_ID = PRISMAQUANT_MODEL_HF_REPO_ID
+
+    _VLLM_PORT = 8000
+    _VLLM_HOST = "127.0.0.1"
+    _VLLM_BASE_URL = f"http://{_VLLM_HOST}:{_VLLM_PORT}"
+    _STARTUP_TIMEOUT_S = 1200
+    _SLEEP_WAKE_TIMEOUT_S = 300
+
+    @modal.enter(snap=True)
+    def _start_and_sleep(self) -> None:
+        """Spawn ``vllm serve`` with PrismaQuant args, warm, /sleep.
+
+        Near-copy of VllmQrQwen._start_and_sleep with the cmd list
+        updated for vLLM 0.20 + PrismaQuant. See VllmQrQwen for full
+        rationale on each unchanged step (argv validation, warmup
+        before sleep, GPU drain pre-snapshot, wall-clock anchor).
+        """
+        import subprocess
+        import time
+
+        import httpx
+        from obs.events import (
+            VLLM_ARGV_UNRECOGNIZED,
+            VLLM_ARGV_VALIDATED,
+            VLLM_ENGINE_BUILD_FAILED,
+            VLLM_SLEEP_FAIL,
+            VLLM_SLEEP_OK,
+        )
+        from obs.logging import get_logger
+
+        log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+        cmd = [
+            "vllm",
+            "serve",
+            self.HF_REPO_ID,
+            "--served-model-name",
+            self.SERVED_MODEL_NAME,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(self._VLLM_PORT),
+            "--enable-sleep-mode",
+            # iter-17: --trust-remote-code per PrismaQuant recipe. vLLM's
+            # compressed-tensors loader needs to import the model's own
+            # modeling code to resolve the per-layer NVFP4 / MXFP8 / BF16
+            # scheme assignments.
+            "--trust-remote-code",
+            # iter-17: force text-only model class. PrismaQuant's
+            # config.json reports ``Qwen3_5ForConditionalGeneration``
+            # which builds the vision tower; that path was the iter-16
+            # crash site at vLLM 0.17 and stays unverified at 0.20.
+            # Forcing ``Qwen3_5ForCausalLM`` (sibling class in
+            # vllm/model_executor/models/qwen3_5.py with no
+            # ``self.visual``) sidesteps the question for our text-chat
+            # demo. Vision-input support can be re-enabled in a future
+            # iter once vLLM ships a release that loads the PrismaQuant
+            # vision-QKV scheme cleanly.
+            "--hf-overrides",
+            '{"architectures":["Qwen3_5ForCausalLM"]}',
+            "--max-model-len",
+            "32768",
+            "--max-num-seqs",
+            "4",
+            "--max-cudagraph-capture-size",
+            "4",
+            "--max-num-batched-tokens",
+            "8192",
+            "--swap-space",
+            "16",
+            "--gpu-memory-utilization",
+            PRISMAQUANT_GPU_MEMORY_UTILIZATION,
+            "--logits-processors",
+            "qr_sampler.engines.vllm:VLLMAdapter",
+            "--reasoning-parser",
+            "qwen3",
+            # iter-17: --speculative-config (MTP n=3) deliberately OMITTED.
+            # Recipe-recommended for raw throughput, but speculative bursts
+            # generate multiple draft tokens per forward pass — collides
+            # with qr-sampler's per-token QRNG entropy accounting (one
+            # fetch per logits call assumed). See bootstrap_connections
+            # _QWEN_ID block for the full rationale.
+        ]
+
+        # argv gate — same fail-fast pattern as VllmQrQwen.
+        try:
+            from vllm.entrypoints.openai.cli_args import make_arg_parser
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+            _argv_parser = make_arg_parser(FlexibleArgumentParser())
+            supported_flags = {
+                opt
+                for action in _argv_parser._actions
+                for opt in action.option_strings
+                if opt.startswith("--")
+            }
+        except Exception as err:
+            log.warning(
+                "vllm argparse introspection failed; skipping argv validation",
+                extra={
+                    "event": "vllm.argv.help_probe_failed",
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                },
+            )
+            supported_flags = set()
+        if supported_flags:
+            unknown = [t for t in cmd if t.startswith("--") and t not in supported_flags]
+            if unknown:
+                sample = sorted(supported_flags)[:20]
+                log.error(
+                    "vllm serve argv contains unrecognized flag(s): %s",
+                    unknown,
+                    extra={
+                        "event": VLLM_ARGV_UNRECOGNIZED,
+                        "unknown_flags": unknown,
+                        "supported_flags_sample": sample,
+                    },
+                )
+                raise RuntimeError(
+                    f"vllm serve argv contains unrecognized flag(s) {unknown}; "
+                    f"supported sample={sample}"
+                )
+            log.info(
+                "vllm serve argv validated against vllm.entrypoints.openai.cli_args",
+                extra={
+                    "event": VLLM_ARGV_VALIDATED,
+                    "cmd": cmd,
+                    "supported_flag_count": len(supported_flags),
+                },
+            )
+
+        log.info(
+            "Spawning vllm serve subprocess for %s",
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": "vllm.subprocess.spawn",
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "hf_repo_id": self.HF_REPO_ID,
+                "cmd": cmd,
+            },
+        )
+
+        self._vllm_proc = subprocess.Popen(cmd, env=env)
+
+        # Poll /health until ready.
+        deadline = time.monotonic() + self._STARTUP_TIMEOUT_S
+        health_url = f"{self._VLLM_BASE_URL}/health"
+        ready = False
+        while time.monotonic() < deadline:
+            rc = self._vllm_proc.poll()
+            if rc is not None:
+                log.error(
+                    "vllm serve exited during startup (rc=%s)",
+                    rc,
+                    extra={
+                        "event": VLLM_ENGINE_BUILD_FAILED,
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "hf_repo_id": self.HF_REPO_ID,
+                        "error_type": "SubprocessExited",
+                        "error_msg": f"vllm serve exited with rc={rc}",
+                        "phase": "VllmQrPrismaQuant._start_and_sleep",
+                    },
+                )
+                raise RuntimeError(f"vllm serve exited rc={rc} during startup")
+            try:
+                r = httpx.get(health_url, timeout=5.0)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+        if not ready:
+            log.error(
+                "vllm serve did not become healthy within %ds",
+                self._STARTUP_TIMEOUT_S,
+                extra={
+                    "event": VLLM_ENGINE_BUILD_FAILED,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "hf_repo_id": self.HF_REPO_ID,
+                    "error_type": "StartupTimeout",
+                    "error_msg": f"/health never returned 200 within {self._STARTUP_TIMEOUT_S}s",
+                    "phase": "VllmQrPrismaQuant._start_and_sleep",
+                },
+            )
+            raise RuntimeError(
+                f"vllm serve /health did not return 200 within {self._STARTUP_TIMEOUT_S}s"
+            )
+
+        # Warmup before /sleep — bakes torch.compile + cudagraph state.
+        warmup_url = f"{self._VLLM_BASE_URL}/v1/chat/completions"
+        warmup_body = {
+            "model": self.SERVED_MODEL_NAME,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 8,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        warmup_t0 = time.monotonic()
+        warmup_ok = 0
+        for i in range(3):
+            try:
+                r = httpx.post(warmup_url, json=warmup_body, timeout=120.0)
+                r.raise_for_status()
+                warmup_ok += 1
+            except Exception as exc:
+                log.warning(
+                    "warmup request %d/3 failed: %s",
+                    i + 1,
+                    exc,
+                    extra={
+                        "event": "vllm.warmup.failed",
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "attempt": i + 1,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+        warmup_duration_ms = (time.monotonic() - warmup_t0) * 1000.0
+        log.info(
+            "vllm warmup complete: %d/3 successful in %.0f ms",
+            warmup_ok,
+            warmup_duration_ms,
+            extra={
+                "event": "vllm.warmup.ok",
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "successful": warmup_ok,
+                "duration_ms": warmup_duration_ms,
+            },
+        )
+
+        # /sleep level=1 — same rationale as VllmQrQwen (level=2 produces
+        # gibberish per auto-memory iter14_snapshot_load_working).
+        sleep_url = f"{self._VLLM_BASE_URL}/sleep?level=1"
+        t0 = time.monotonic()
+        try:
+            r = httpx.post(sleep_url, timeout=self._SLEEP_WAKE_TIMEOUT_S)
+            r.raise_for_status()
+        except Exception as err:
+            duration_ms = (time.monotonic() - t0) * 1000.0
+            log.error(
+                "vllm sleep failed for %s: %s",
+                self.SERVED_MODEL_NAME,
+                err,
+                extra={
+                    "event": VLLM_SLEEP_FAIL,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "duration_ms": duration_ms,
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                },
+            )
+            raise
+        duration_ms = (time.monotonic() - t0) * 1000.0
+        log.info(
+            "vllm engine sleeping (snapshot-ready) for %s",
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": VLLM_SLEEP_OK,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "duration_ms": duration_ms,
+            },
+        )
+
+        # GPU drain pre-snapshot.
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                log.info(
+                    "GPU allocator drained pre-snapshot",
+                    extra={
+                        "event": "vllm.snapshot.gpu_drained",
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                    },
+                )
+        except Exception as exc:
+            log.warning(
+                "pre-snapshot GPU drain skipped: %s",
+                exc,
+                extra={
+                    "event": "vllm.snapshot.gpu_drain_skipped",
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "error_type": type(exc).__name__,
+                },
+            )
+
+        # Wall-clock anchor for the iter-14 snapshot_hit/miss classifier.
+        self._snap_built_at_wallclock = time.time()
+
+    @modal.enter(snap=False)
+    def _wake(self) -> None:
+        """Wake the engine + emit PrismaQuant snapshot-identity events.
+
+        Near-copy of VllmQrQwen._wake. The only meaningful diff is
+        substituting PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION /
+        PRISMAQUANT_MODEL_REVISION for the iter-15 constants in the
+        ``vllm.snapshot.identity`` event so the operator can correlate
+        cold-starts to this profile specifically. The rest (cloudflared
+        background spawn, /wake_up + /health, coldstart-complete event,
+        snapshot-restore-class classifier, background health poller)
+        is structurally identical.
+        """
+        import threading
+        import time
+
+        import httpx
+        from obs.events import (
+            VLLM_COLDSTART_COMPLETE,
+            VLLM_SNAPSHOT_IDENTITY,
+            VLLM_SNAPSHOT_RESTORE_CLASS,
+            VLLM_WAKE_FAIL,
+            VLLM_WAKE_OK,
+        )
+        from obs.logging import get_logger
+
+        log = get_logger(f"qr_sampler.modal.app.{self.SERVED_MODEL_NAME}")
+
+        # iter-17: identity references PRISMAQUANT_* constants so this
+        # profile's snapshot history is greppable independently of the
+        # iter-15 VllmQrQwen identity stream.
+        log.info(
+            "vllm cold-start: snapshot identity",
+            extra={
+                "event": VLLM_SNAPSHOT_IDENTITY,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "identity_version": PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION,
+                "model_revision": PRISMAQUANT_MODEL_REVISION or "<unpinned>",
+                "image_digest": os.environ.get("MODAL_IMAGE_ID", "<unset>"),
+            },
+        )
+
+        # cloudflared sidecar background spawn — same pattern as VllmQrQwen.
+        self._cloudflared = None
+
+        def _spawn_cloudflared() -> None:
+            try:
+                self._cloudflared = _start_qrng_tunnel(self.SERVED_MODEL_NAME)
+            except Exception as exc:
+                log.warning(
+                    "cloudflared background spawn raised: %s",
+                    exc,
+                    extra={
+                        "event": "cloudflared.background_spawn_raised",
+                        "served_model_name": self.SERVED_MODEL_NAME,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+
+        threading.Thread(
+            target=_spawn_cloudflared,
+            name=f"cloudflared-spawn-{self.SERVED_MODEL_NAME}",
+            daemon=True,
+        ).start()
+
+        # /wake_up + post-wake /health poll.
+        wake_url = f"{self._VLLM_BASE_URL}/wake_up"
+        t0 = time.monotonic()
+        try:
+            r = httpx.post(wake_url, timeout=self._SLEEP_WAKE_TIMEOUT_S)
+            r.raise_for_status()
+        except Exception as err:
+            duration_ms = (time.monotonic() - t0) * 1000.0
+            log.error(
+                "vllm wake failed for %s: %s",
+                self.SERVED_MODEL_NAME,
+                err,
+                extra={
+                    "event": VLLM_WAKE_FAIL,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "duration_ms": duration_ms,
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                },
+            )
+            raise
+        wake_duration_ms = (time.monotonic() - t0) * 1000.0
+
+        health_url = f"{self._VLLM_BASE_URL}/health"
+        deadline = time.monotonic() + self._SLEEP_WAKE_TIMEOUT_S
+        ready = False
+        while time.monotonic() < deadline:
+            try:
+                r = httpx.get(health_url, timeout=5.0)
+                if r.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1.0)
+        total_duration_ms = (time.monotonic() - t0) * 1000.0
+        if not ready:
+            log.error(
+                "vllm post-wake /health never returned 200 for %s within %ds",
+                self.SERVED_MODEL_NAME,
+                self._SLEEP_WAKE_TIMEOUT_S,
+                extra={
+                    "event": VLLM_WAKE_FAIL,
+                    "served_model_name": self.SERVED_MODEL_NAME,
+                    "duration_ms": total_duration_ms,
+                    "wake_post_duration_ms": wake_duration_ms,
+                    "error_type": "PostWakeHealthTimeout",
+                    "error_msg": (
+                        f"/health did not return 200 within "
+                        f"{self._SLEEP_WAKE_TIMEOUT_S}s after /wake_up"
+                    ),
+                },
+            )
+            raise RuntimeError(
+                f"vllm post-wake /health did not return 200 within "
+                f"{self._SLEEP_WAKE_TIMEOUT_S}s"
+            )
+        log.info(
+            "vllm engine awake + healthy (snapshot-restored) for %s",
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": VLLM_WAKE_OK,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "duration_ms": total_duration_ms,
+                "wake_post_duration_ms": wake_duration_ms,
+            },
+        )
+
+        # coldstart.complete + restore-class events.
+        total_elapsed_ms = (time.monotonic() - _CONTAINER_START_MONOTONIC) * 1000.0
+        log.info(
+            "vllm cold-start complete for %s (total %.1f ms since container start)",
+            self.SERVED_MODEL_NAME,
+            total_elapsed_ms,
+            extra={
+                "event": VLLM_COLDSTART_COMPLETE,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "total_elapsed_ms": total_elapsed_ms,
+            },
+        )
+
+        snap_built_at = getattr(self, "_snap_built_at_wallclock", None)
+        if snap_built_at is None:
+            restore_class = "unknown"
+            inference_signal = "snap_built_at_wallclock=missing"
+        else:
+            gap_s = time.time() - snap_built_at
+            if gap_s < 90.0:
+                restore_class = "snapshot_miss"
+                inference_signal = f"gap_to_snap_built_s={gap_s:.1f}<90"
+            else:
+                restore_class = "snapshot_hit"
+                inference_signal = f"gap_to_snap_built_s={gap_s:.1f}>=90"
+        log.info(
+            "vllm cold-start restore class: %s for %s",
+            restore_class,
+            self.SERVED_MODEL_NAME,
+            extra={
+                "event": VLLM_SNAPSHOT_RESTORE_CLASS,
+                "served_model_name": self.SERVED_MODEL_NAME,
+                "restore_class": restore_class,
+                "total_elapsed_ms": total_elapsed_ms,
+                "inference_signal": inference_signal,
+            },
+        )
+
+        # Background /health poller — same as VllmQrQwen.
+        self._health_stop_event = threading.Event()
+        self._health_thread = threading.Thread(
+            target=self._poll_vllm_health,
+            args=(self._health_stop_event,),
+            daemon=True,
+            name=f"vllm-health-{self.SERVED_MODEL_NAME}",
+        )
+        self._health_thread.start()
+
+    # The unchanged lifecycle methods only reference ``self.*`` attributes
+    # (SERVED_MODEL_NAME, _VLLM_BASE_URL, _cloudflared, _vllm_proc,
+    # _health_stop_event) which this class overrides above, so the
+    # function bodies work without modification. Borrowing the function
+    # objects keeps the @modal.exit / @modal.web_server decoration intact
+    # — that decoration lives on the function via attribute markers, not
+    # on the class scope.
+    _poll_vllm_health = VllmQrQwen._poll_vllm_health
+    _stop = VllmQrQwen._stop
+    serve = VllmQrQwen.serve
 
 
 # ----- QRNG cloudflared sidecar wiring -------------------------------------
