@@ -559,7 +559,12 @@ def download_weights_prismaquant() -> dict[str, str]:
 #
 # Each class:
 #   * Loads ONE model into ONE H200 container.
-#   * Scales to zero independently via `scaledown_window=180` (3 min idle).
+#   * Scales to zero independently via `scaledown_window=300` (5 min idle).
+#     iter-39 bumped 180→300 after the operator caught GPU containers
+#     incurring cost between back-to-back demo questions. Once the
+#     scaledown fires Modal calls `@modal.exit()` and TERMINATES the
+#     container (releasing the GPU back to the pool); the warm-restore
+#     comes from the memory snapshot, not from a persisted container.
 #   * Exposes its own public Modal URL via `@modal.asgi_app()`.
 #
 # OWUI's bundled qr_comparison_pipe routes per-request to the right
@@ -635,13 +640,31 @@ _CLS_KWARGS: dict[str, Any] = {
     # snap=True (POST /sleep?level=1, requires VLLM_SERVER_DEV_MODE=1) and
     # woken at snap=False (POST /wake_up).
     "experimental_options": {"enable_gpu_snapshot": True},
-    # 3 min idle -> shutdown. With GPU snapshot enabled, restore is
-    # cheap (~10-15 s) so scaling to zero aggressively is safe — the
-    # snapshot-restore is the warm path for any pause longer than the
-    # window. Tight scaledown keeps idle GPU cost minimal; a longer
-    # window (e.g. 1800 s) trades cost for occasionally skipping the
-    # restore on "let me think" pauses inside a chat session.
-    "scaledown_window": 180,
+    # iter-39 (2026-05-25): 5 min idle -> shutdown (bumped from 3 min).
+    # User caught a B200 PrismaQuant container running between demo
+    # questions and accruing GPU cost; the prior 3-min window was
+    # tight enough that quick back-to-back prompts kept the container
+    # alive but slightly-longer pauses landed in the awkward 3-5 min
+    # window where the container had JUST scaled down and the next
+    # prompt paid another restore. 5 min gives the demo session a
+    # comfortable "single train of thought" buffer.
+    #
+    # ENDING SEMANTICS (Modal documentation, §Lifecycle):
+    # - When scaledown_window expires with no in-flight requests,
+    #   Modal calls the class's ``@modal.exit()`` handler (our
+    #   _stop method, which kills the cloudflared sidecar + vllm
+    #   serve subprocess), then TERMINATES the container.
+    # - Terminating the container RELEASES the GPU back to Modal's
+    #   pool — billing stops. enable_memory_snapshot=True preserves
+    #   the warm snapshot for fast next start, but the snapshot
+    #   itself is not GPU-resident.
+    # - max_containers=1 below caps the per-class replica count at
+    #   one — Modal will NEVER stand up a second container while
+    #   the first is idle. Combined with min_containers omitted
+    #   (defaults to 0, no warm-pinned replicas), this guarantees
+    #   that an idle period beyond 300 s always results in zero
+    #   running containers for the class.
+    "scaledown_window": 300,
     "max_containers": 1,  # Pre-flight §11.8 cost ceiling, per model
     # Phase 3 iter-06 (2026-05-21): 2-hour container timeout (was 1 hour).
     # The snap=True path can legitimately consume up to:
@@ -1484,8 +1507,8 @@ class VllmQrQwen:
         # has long since died), whereas on the snap-create-then-wake-
         # immediately path it is only a few seconds old. 60 s is a safe
         # threshold: snapshot creation + restore happen within seconds;
-        # scaledown_window=180 s guarantees real restores see at minimum
-        # ~3 minutes of gap.
+        # scaledown_window=300 s (iter-39) guarantees real restores see
+        # at minimum ~5 minutes of gap.
         # iter-14e tuning: with /sleep level=2 the snapshot capture
         # window collapsed from 150-200 s to ~31 s (weights are freed
         # before snapshot rather than CPU-cached, so cuda-checkpoint has
@@ -2598,7 +2621,27 @@ owui_data_volume = modal.Volume.from_name("qr-llm-chat-data", create_if_missing=
     secrets=[qr_sampler_prod_secret, qr_llm_chat_secret],
     volumes={"/data": owui_data_volume},
     enable_memory_snapshot=True,
-    scaledown_window=1800,  # 30 min idle — see qr-llm-chat spec §3.5 cost note.
+    # iter-39 (2026-05-25): scaledown_window at Modal's documented max
+    # (20 min = 1200 s). Modal 1.0 hard-caps scaledown_window at 1200 s
+    # per the cold-start / scale docs; the prior 1800 s value here was
+    # silently clamped. For the operator's requested "12 h warm
+    # period", we drive it via a scheduled cron keep-alive
+    # (see ``keep_owui_warm`` below) rather than trying to push
+    # scaledown_window past Modal's ceiling.
+    #
+    # ENDING SEMANTICS (Modal documentation, §lifecycle-functions):
+    # - On scaledown_window expiry Modal invokes ``@modal.exit()``
+    #   (no-op for OWUIService; the FastAPI lifespan ASGI shutdown
+    #   handles teardown). The exit handler has a 30 s grace period.
+    # - After exit returns the container is TERMINATED and the
+    #   CPU/RAM allocation is released — billing stops.
+    # - ``enable_memory_snapshot=True`` preserves the warm boot
+    #   image so the next request restores from snapshot in
+    #   ~30-60 s instead of doing a from-zero ``import open_webui``.
+    # - ``min_containers=0`` below ensures NO warm-pinned replica
+    #   sits idle racking up cost when the cron pauses (e.g.
+    #   overnight); max_containers=1 prevents fan-out.
+    scaledown_window=1200,  # 20 min = Modal-documented hard max.
     timeout=60 * 60,
     min_containers=0,  # NEVER set ≥1 — keep-warm cost is unacceptable (Q10).
     # Hard cap at 1 replica. OWUI keeps in-memory state (PersistentConfig
@@ -2653,3 +2696,108 @@ class OWUIService:
     @modal.asgi_app()
     def serve(self) -> Any:
         return self._asgi_app
+
+
+# ----- OWUI keep-warm cron (iter-39) ----------------------------------------
+#
+# Modal's ``scaledown_window`` is hard-capped at 20 min (per the cold-start +
+# scaling docs). The operator's spec is "OWUI stays warm for 12 hours" — too
+# long for scaledown_window alone. The Modal-documented pattern for >20 min
+# warm periods (https://modal.com/docs/guide/cold-start §Increase warm pool /
+# https://modal.com/docs/guide/scale §Container lifecycle) is a scheduled
+# function that pings the endpoint, which resets the scaledown_window timer
+# every period.
+#
+# Schedule: ``*/15 6-17 * * *`` UTC fires every 15 min during the 12-hour
+# window 06:00-17:59 UTC = 08:00-19:59 CEST (the operator's timezone per
+# the qr-llm-chat-prod Modal Secret region pin). That window is "daytime
+# work hours" — outside it, no pings, OWUI's scaledown_window=1200 takes
+# over and the container terminates within 20 min of the last ping.
+#
+# 15 min interval stays comfortably below the 20-min scaledown so every
+# ping lands on a still-warm container. If a ping fails (Modal blip), the
+# next 15-min tick recovers; the worst case is one cold-cold restore.
+#
+# Cost: a single sub-second GET request every 15 min. The keep-warm
+# function itself runs on a sub-second cpu=0.125 container so its own
+# cost is negligible (~$0.00001/run × 48 runs/day = $0.0005/day). The
+# REAL cost is the OWUI container staying up for 12 h/day:
+#   1 vCPU × $0.000033/cpu-s × 43200 s/day = $1.43/day ≈ $43/mo.
+# Acceptable for the demo posture; document for the operator so they
+# can shrink the window (or kill this cron) if cost becomes a concern.
+#
+# Ending semantics: when the cron stops (e.g. operator removes this
+# function or changes the schedule) OWUI's normal scaledown_window=1200
+# is the safety net. There's no path where the container stays running
+# beyond 20 min past the last request or the last cron ping, whichever
+# is later.
+
+_KEEPALIVE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install(
+    "httpx==0.27.2",
+)
+
+
+@app.function(
+    image=_KEEPALIVE_IMAGE,
+    cpu=0.125,
+    memory=128,
+    schedule=modal.Cron("*/15 6-17 * * *"),
+    timeout=60,
+    secrets=[qr_llm_chat_secret],
+)
+def keep_owui_warm() -> None:
+    """Ping OWUI's auth-free ``/api/qr-status`` to reset its scaledown_window.
+
+    iter-39 (2026-05-25). Fires every 15 minutes during the 12-hour
+    daytime window 06:00-17:59 UTC (08:00-19:59 CEST). See the comment
+    block above for the cost rationale and the operator-tuneable knobs.
+
+    The hostname is deterministic for our deploy. ``WEBUI_URL`` is set
+    in the qr-llm-chat-prod Modal Secret (OWUI uses it for OAuth /
+    redirect URLs), so prefer it; fall back to the hardcoded constant
+    for redundancy if the secret value ever drifts.
+
+    Failure handling: log + return cleanly. A single missed ping is
+    bounded by the next 15-min tick, which will land before the
+    20-min scaledown_window expires. We do NOT raise — a permanently
+    raising keep-warm would spam Modal's alerting without recovering
+    OWUI any faster than the natural scaledown + next-request cycle.
+    """
+    import logging
+    import os
+
+    import httpx
+
+    log = logging.getLogger("qr_sampler.modal.app.keep_owui_warm")
+
+    url = (os.environ.get("WEBUI_URL") or "").rstrip("/")
+    if not url:
+        url = "https://alchemystack--qr-llm-chat-owuiservice-serve.modal.run"
+    endpoint = f"{url}/api/qr-status"
+
+    try:
+        # 60 s timeout matches Modal's edge proxy: a cold OWUI returns
+        # 303 chains for ~30-60 s before settling on the 200 from the
+        # warmed-up container. Following with httpx.follow_redirects
+        # exercises the same chain the donor-demo user's browser walks.
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            response = client.get(endpoint)
+        log.info(
+            "keep_owui_warm ping ok",
+            extra={
+                "event": "owui.keepalive.ok",
+                "url": endpoint,
+                "status_code": response.status_code,
+                "elapsed_ms": response.elapsed.total_seconds() * 1000.0,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 -- never crash the schedule
+        log.warning(
+            "keep_owui_warm ping failed: %s",
+            exc,
+            extra={
+                "event": "owui.keepalive.fail",
+                "url": endpoint,
+                "error": str(exc),
+            },
+        )
