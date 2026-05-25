@@ -85,7 +85,7 @@ Valves panel. Each Valve maps to a qr-sampler per-request parameter:
 | Valve | Default | Maps to | Description |
 |-------|---------|---------|-------------|
 | `signal_amplifier_type` | `zscore_mean` | `qr_signal_amplifier_type` | Amplification algorithm. |
-| `sample_count` | `20480` | `qr_sample_count` | Entropy bytes fetched per token. |
+| `sample_count` | `10000` | `qr_sample_count` | Entropy bytes fetched per token. |
 | `population_mean` | `127.5` | `qr_population_mean` | Null-hypothesis mean for byte values. |
 | `population_std` | `73.612...` | `qr_population_std` | Population std for uniform [0, 255]. |
 | `uniform_clamp_epsilon` | `1e-10` | `qr_uniform_clamp_epsilon` | Clamp u to avoid degenerate CDF. |

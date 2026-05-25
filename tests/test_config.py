@@ -44,7 +44,7 @@ class TestDefaults:
 
     def test_amplification_defaults(self, default_config: QRSamplerConfig) -> None:
         assert default_config.signal_amplifier_type == "zscore_mean"
-        assert default_config.sample_count == 20480
+        assert default_config.sample_count == 10000  # iter-48 default
         assert default_config.population_mean == 127.5
         assert default_config.population_std == pytest.approx(73.61215932167728)
         assert default_config.uniform_clamp_epsilon == 1e-10

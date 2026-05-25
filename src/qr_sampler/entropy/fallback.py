@@ -18,6 +18,27 @@ gives the diagnostic count when you grep for it.
 The transition back from fallback->primary also emits a structured
 ``entropy.recovered`` event so the operator sees the all-clear in the
 same log stream.
+
+iter-49 defensive audit (2026-05-25)
+------------------------------------
+The "fallback NEVER aborts the completion" contract that the qr-llm-chat
+iter-49 regenerate-banner depends on holds in this implementation:
+
+* ``get_random_bytes`` ONLY catches :class:`EntropyUnavailableError` from
+  the primary. On catch, the fallback (typically ``SystemEntropySource``,
+  which wraps ``os.urandom``) is called unconditionally.
+* ``os.urandom`` does not raise in practice on Linux containers; the only
+  realistic raise path is a catastrophic fallback failure, in which case
+  the wrapper re-raises ``EntropyUnavailableError`` — that propagates to
+  vLLM and would fail the completion. This is the documented contract
+  (see ``get_random_bytes`` docstring), but it has not been observed in
+  any deploy to date.
+* No "circuit breaker open" / "max fallback exhausted" path exists; the
+  wrapper degrades on every fetch independently and recovers on the
+  first successful primary call.
+
+Conclusion: the iter-49 banner only ever needs to surface a soft warning
+(QRNG was degraded), never an error.
 """
 
 from __future__ import annotations

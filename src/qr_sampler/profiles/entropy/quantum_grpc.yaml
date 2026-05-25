@@ -56,5 +56,7 @@ compatible_amplifiers:
 known_incompatible_amplifiers: []
 
 defaults:
-  sample_count: 20480
+  # iter-48 (2026-05-25): halved 20480 → 10000 in lockstep with the
+  # qr_sampler.config.QRSamplerConfig.sample_count default.
+  sample_count: 10000
   grpc_mode: unary

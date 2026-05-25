@@ -568,7 +568,7 @@ All configuration is done via environment variables with the `QR_` prefix. Per-r
 | Environment variable | extra_args key | Default | Description |
 |---|---|---|---|
 | `QR_SIGNAL_AMPLIFIER_TYPE` | `qr_signal_amplifier_type` | `zscore_mean` | Signal amplification algorithm |
-| `QR_SAMPLE_COUNT` | `qr_sample_count` | `20480` | Entropy bytes fetched per token |
+| `QR_SAMPLE_COUNT` | `qr_sample_count` | `10000` | Entropy bytes fetched per token |
 | `QR_POPULATION_MEAN` | `qr_population_mean` | `127.5` | Null-hypothesis mean for byte values |
 | `QR_POPULATION_STD` | `qr_population_std` | `73.612...` | Population std for uniform [0, 255] |
 | `QR_UNIFORM_CLAMP_EPSILON` | `qr_uniform_clamp_epsilon` | `1e-10` | Clamp u to avoid degenerate CDF |

@@ -447,7 +447,9 @@ class Filter:
             description="Signal amplification algorithm.",
         )
         sample_count: int = Field(
-            default=20480,
+            # iter-48 (2026-05-25, qr-llm-chat shared-core mirror):
+            # halved 20480 → 10000. Mirrors ``qr_sampler/config.py``.
+            default=10000,
             description="Number of entropy bytes to fetch per token.",
         )
 
@@ -617,6 +619,25 @@ class Filter:
             for field_name in self._QR_FIELDS:
                 xargs[f"qr_{field_name}"] = valve_dict[field_name]
 
+        # iter-47 (2026-05-25, qr-llm-chat shared-core mirror): when the
+        # request is routed through the qr-comparison Pipe (model id
+        # prefixed ``qr_comparison_pipe.`` and/or suffixed ``-vs-prng``),
+        # the Pipe owns the OWUI status slot end-to-end via its own
+        # live-status updater. The Filter's status emits race the Pipe's
+        # at the same ~1.5 s cadence, producing visible "alternating
+        # message" flicker. Gate the Filter's cold-start probe on the
+        # standalone path; the entropy-degraded probe still runs because
+        # the Pipe doesn't replicate that surface.
+        model_id = body.get("model")
+        is_pipe_pseudo = isinstance(model_id, str) and (
+            model_id.startswith("qr_comparison_pipe.")
+            or model_id.endswith("-vs-prng")
+        )
+        if is_pipe_pseudo:
+            if self.valves.entropy_degraded_enabled:
+                await self._maybe_emit_entropy_degraded(body, __event_emitter__)
+            return body
+
         if self.valves.cold_start_enabled:
             await self._maybe_emit_cold_start(body, __event_emitter__)
 
@@ -637,7 +658,16 @@ class Filter:
         watch for the first non-empty `choices[0].delta.content` and emit a
         `{type: "status", data: {done: True}}` event to dismiss the indicator
         we set in `inlet`. The event itself is forwarded unmodified.
+
+        iter-46 (2026-05-25, qr-llm-chat shared-core mirror): before any
+        downstream extraction, inline ``reasoning_content`` into
+        ``content`` for models that emit their entire response as
+        reasoning (Qwen 3.6 with ``--reasoning-parser qwen3``). Runs
+        BEFORE the cold-start gate so the mutation reaches subsequent
+        handlers in the OWUI chain regardless of cold-start state.
         """
+        event = _inline_reasoning_into_content(event)
+
         if not self.valves.cold_start_enabled or __event_emitter__ is None:
             return event
 
@@ -1007,6 +1037,45 @@ def _coerce_nonneg_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, result)
+
+
+def _inline_reasoning_into_content(event: dict[str, Any]) -> dict[str, Any]:
+    """Mutate-and-return an SSE event so OWUI sees content (not reasoning).
+
+    iter-46 (2026-05-25, qr-llm-chat shared-core mirror). Qwen 3.6 with
+    ``--reasoning-parser qwen3`` emits its entire response as
+    ``reasoning_content``; OWUI's native chat renderer treats that as a
+    collapsible "Thought" panel and shows an empty bubble. Moving the
+    reasoning text into ``content`` lets OWUI render the response as
+    plain assistant text. Only fires when ``content`` is empty AND
+    reasoning has text — preserves collapsible-above-answer rendering
+    for models that emit both fields.
+    """
+    if not isinstance(event, dict):
+        return event
+    data = event.get("data")
+    if isinstance(data, dict):
+        content = data.get("content")
+        reasoning = data.get("reasoning") or data.get("reasoning_content")
+        if (not content) and isinstance(reasoning, str) and reasoning:
+            data["content"] = reasoning
+            data["reasoning"] = ""
+            data["reasoning_content"] = ""
+    choices = event.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+            if (not content) and isinstance(reasoning, str) and reasoning:
+                delta["content"] = reasoning
+                delta["reasoning"] = ""
+                delta["reasoning_content"] = ""
+    return event
 
 
 def _extract_delta_text(event: dict[str, Any]) -> str:

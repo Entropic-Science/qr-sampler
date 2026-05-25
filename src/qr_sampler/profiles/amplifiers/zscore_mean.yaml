@@ -28,7 +28,7 @@ description: |
 
   Configuration:
     QR_SIGNAL_AMPLIFIER_TYPE=zscore_mean    (this is the default)
-    QR_SAMPLE_COUNT=20480                   (bytes per token, default)
+    QR_SAMPLE_COUNT=10000                   (bytes per token, default; iter-48)
     QR_POPULATION_MEAN=127.5               (null hypothesis mean)
     QR_POPULATION_STD=73.61215932...       (std of Uniform[0, 255])
 

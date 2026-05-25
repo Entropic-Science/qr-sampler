@@ -49,7 +49,7 @@ services:
       QR_FALLBACK_MODE: "${QR_FALLBACK_MODE:-system}"
 
       # --- qr-sampler: sampling parameters ---
-      QR_SAMPLE_COUNT: "${QR_SAMPLE_COUNT:-20480}"
+      QR_SAMPLE_COUNT: "${QR_SAMPLE_COUNT:-10000}"
       QR_TEMPERATURE_STRATEGY: "${QR_TEMPERATURE_STRATEGY:-fixed}"
       QR_FIXED_TEMPERATURE: "${QR_FIXED_TEMPERATURE:-0.7}"
       QR_TOP_K: "${QR_TOP_K:-0}"

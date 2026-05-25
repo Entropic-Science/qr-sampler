@@ -176,6 +176,26 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # --- Default pipeline (used when no per-request state exists) ---
         self._pipeline = self._pipelines[self._default_config.entropy_source_type]
 
+        # iter-49 (2026-05-25): publish the active FallbackEntropySource
+        # to the /health/entropy middleware so the qr-llm-chat OWUI side
+        # can snapshot fallback_count before/after a request and emit
+        # the regenerate-banner when QRNG degraded mid-request. The
+        # middleware module is imported lazily so a non-Modal dev/test
+        # context (no fastapi installed) does not break adapter import.
+        try:
+            from qr_sampler.connectors.modal.health_entropy_middleware import (
+                set_fallback_source as _qr_set_fallback_source,
+            )
+
+            _qr_set_fallback_source(self._pipeline.entropy_source)
+        except Exception:
+            # Defensive: missing fastapi, missing connectors.modal, or any
+            # other transient ImportError must not break the LogitsProcessor.
+            # The endpoint then returns 503 / unknown, and the qr-llm-chat
+            # side's snapshot-before-after no-ops with no banner — degraded
+            # but safe.
+            pass
+
         # --- Pre-compute default state ---
         self._default_config_hash = config_hash(self._default_config)
 

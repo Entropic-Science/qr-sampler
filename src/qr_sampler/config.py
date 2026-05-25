@@ -171,7 +171,14 @@ class QRSamplerConfig(BaseSettings):
         description="Signal amplification algorithm",
     )
     sample_count: int = Field(
-        default=20480,
+        # iter-48 (2026-05-25): halved from 20480 → 10000 to reduce
+        # per-token QRNG bandwidth. The full 20-kB budget exceeded what
+        # the amplifier needed to converge on z-score-mean at typical
+        # vocabulary sizes; 10 kB still produces statistically clean
+        # amplified signals while halving the per-token gRPC payload
+        # (and the colocation-bound backbone RTT cost — see
+        # ``qrng_colocation_constraint`` auto-memory).
+        default=10000,
         description="Number of entropy bytes to fetch per token",
     )
     population_mean: float = Field(

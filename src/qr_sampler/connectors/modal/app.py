@@ -689,8 +689,20 @@ _CLS_KWARGS: dict[str, Any] = {
 # ceiling), so we keep the snapshot-restored lifecycle and the
 # corresponding ~10-15 s warm restore. ``experimental_options`` is
 # unchanged from ``_CLS_KWARGS``.
-@app.cls(**_CLS_KWARGS)
-@modal.concurrent(max_inputs=8)
+#
+# iter-45 (2026-05-25): VllmQrQwen PAUSED — the @app.cls + @modal.concurrent
+# decorators are commented out so Modal does NOT spawn this function on
+# deploy (saves the per-deploy GPU mount + image-pull cost). The class
+# body is retained so a future re-introduction of Qwen 9B in the picker
+# is a two-line uncomment. Mirrors the prior Gemma-paused pattern (see
+# module docstring + the ``VllmQrGemma`` reference). The qr-llm-chat
+# OWUI side (``qr_llm_chat.bootstrap_connections``) no longer reads
+# ``VLLM_QR_QWEN_URL``, no longer seeds a Connection for ``qwen3.5-9b``,
+# and no longer registers the dual-lane pseudo-model — the only picker
+# entries after iter-45 are the two Qwen3.6-27B-PrismaQuant variants.
+#
+# @app.cls(**_CLS_KWARGS)            # PAUSED iter-45
+# @modal.concurrent(max_inputs=8)    # PAUSED iter-45
 class VllmQrQwen:
     """``vllm serve`` subprocess fronted by Modal's ``@modal.web_server``.
 
@@ -1836,6 +1848,17 @@ class VllmQrPrismaQuant:
             "qr_sampler.engines.vllm:VLLMAdapter",
             "--reasoning-parser",
             "qwen3",
+            # iter-49 (2026-05-25): expose /health/entropy via vLLM's
+            # ``--middleware`` extension point. The middleware is a
+            # plain ASGI callable; vLLM applies it before its own
+            # routing. The qr-llm-chat OWUI side polls this endpoint
+            # to detect QRNG fallback engagement across a request
+            # boundary and emit a regenerate-banner. The argv-validation
+            # gate above guards us — if vLLM 0.20 ever drops the
+            # ``--middleware`` flag, the deploy fails loudly before
+            # the container is born.
+            "--middleware",
+            "qr_sampler.connectors.modal.health_entropy_middleware:health_entropy_middleware",
             # iter-17: --speculative-config (MTP n=3) deliberately OMITTED.
             # Recipe-recommended for raw throughput, but speculative bursts
             # generate multiple draft tokens per forward pass — collides
