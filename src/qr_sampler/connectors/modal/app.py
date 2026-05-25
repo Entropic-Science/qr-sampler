@@ -2708,11 +2708,13 @@ class OWUIService:
 # function that pings the endpoint, which resets the scaledown_window timer
 # every period.
 #
-# Schedule: ``*/15 6-17 * * *`` UTC fires every 15 min during the 12-hour
-# window 06:00-17:59 UTC = 08:00-19:59 CEST (the operator's timezone per
-# the qr-llm-chat-prod Modal Secret region pin). That window is "daytime
-# work hours" — outside it, no pings, OWUI's scaledown_window=1200 takes
-# over and the container terminates within 20 min of the last ping.
+# Schedule: ``*/15 9-20 * * *`` America/Los_Angeles fires every 15 min
+# during the 12-hour window 09:00-20:59 PT (Pacific Time, auto-handles
+# the PDT↔PST switchover via Modal's tzdata). That window aligns with
+# West-Coast working hours when the operator runs donor demos. Outside
+# it no pings arrive and OWUI's scaledown_window=1200 takes over —
+# the container terminates within 20 min of the last cron ping or
+# user request, whichever is later.
 #
 # 15 min interval stays comfortably below the 20-min scaledown so every
 # ping lands on a still-warm container. If a ping fails (Modal blip), the
@@ -2741,7 +2743,7 @@ _KEEPALIVE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install(
     image=_KEEPALIVE_IMAGE,
     cpu=0.125,
     memory=128,
-    schedule=modal.Cron("*/15 6-17 * * *"),
+    schedule=modal.Cron("*/15 9-20 * * *", timezone="America/Los_Angeles"),
     timeout=60,
     secrets=[qr_llm_chat_secret],
 )
