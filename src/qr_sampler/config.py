@@ -91,8 +91,16 @@ class QRSamplerConfig(BaseSettings):
         description="gRPC call timeout in milliseconds",
     )
     grpc_retry_count: int = Field(
-        default=2,
-        description="Number of retries after gRPC failure",
+        default=0,
+        description=(
+            "Number of retries after gRPC failure. Default 0 (one attempt, no "
+            "retries) — for per-token entropy fetches, multi-attempt retry "
+            "stalls the engine (worst case 3 * adaptive_timeout_ms per token, "
+            "observed ~750 ms on degraded QRNG). The TCP pre-probe + the "
+            "circuit breaker handle persistent outages by engaging "
+            "FallbackEntropySource; bursty single-attempt failures get one "
+            "PRNG token and recover immediately."
+        ),
     )
     grpc_mode: str = Field(
         default="unary",
