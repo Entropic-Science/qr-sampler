@@ -1064,6 +1064,52 @@ class VllmQrQwen:
                 },
             )
 
+        # iter-49a (2026-05-25): conditionally add the /health/entropy
+        # middleware to the vllm serve cmd, gated on the import working
+        # cleanly in this container's Python. Two reasons for the gate:
+        #
+        # 1. vLLM's ``--middleware`` uses ``module.callable`` (rsplit on
+        #    the rightmost ``.``), NOT the ``module:callable`` form that
+        #    ``--logits-processors`` uses. A wrong format causes vLLM's
+        #    ``build_app`` to crash AFTER engine init has already burned
+        #    ~3 min of weight load + dynamo compile — disastrous for
+        #    iteration cadence. Validating the value imports HERE,
+        #    on-host, fails fast in <1 s.
+        # 2. The /health/entropy endpoint powers iter-49's regenerate-
+        #    banner — a cosmetic UX feature, not a load-bearing
+        #    dependency. If the middleware ever fails to import (renamed
+        #    fastapi dep, transitive ImportError on a future vLLM bump),
+        #    the container MUST still boot. The qr-llm-chat side
+        #    gracefully no-ops the banner when the endpoint returns 404.
+        try:
+            from qr_sampler.connectors.modal.health_entropy_middleware import (
+                health_entropy_middleware as _qr_he_probe,
+            )
+
+            if not callable(_qr_he_probe):
+                raise TypeError("health_entropy_middleware is not callable")
+            cmd.extend(
+                [
+                    "--middleware",
+                    "qr_sampler.connectors.modal.health_entropy_middleware.health_entropy_middleware",
+                ]
+            )
+            log.info(
+                "iter-49 /health/entropy middleware enabled",
+                extra={"event": "qr.health_entropy.middleware_enabled"},
+            )
+        except Exception as err:
+            log.warning(
+                "iter-49 /health/entropy middleware NOT importable; skipping "
+                "--middleware (regenerate-banner will silently no-op): %r",
+                err,
+                extra={
+                    "event": "qr.health_entropy.middleware_skipped",
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                },
+            )
+
         log.info(
             "Spawning vllm serve subprocess for %s",
             self.SERVED_MODEL_NAME,
@@ -1848,17 +1894,6 @@ class VllmQrPrismaQuant:
             "qr_sampler.engines.vllm:VLLMAdapter",
             "--reasoning-parser",
             "qwen3",
-            # iter-49 (2026-05-25): expose /health/entropy via vLLM's
-            # ``--middleware`` extension point. The middleware is a
-            # plain ASGI callable; vLLM applies it before its own
-            # routing. The qr-llm-chat OWUI side polls this endpoint
-            # to detect QRNG fallback engagement across a request
-            # boundary and emit a regenerate-banner. The argv-validation
-            # gate above guards us — if vLLM 0.20 ever drops the
-            # ``--middleware`` flag, the deploy fails loudly before
-            # the container is born.
-            "--middleware",
-            "qr_sampler.connectors.modal.health_entropy_middleware:health_entropy_middleware",
             # iter-17: --speculative-config (MTP n=3) deliberately OMITTED.
             # Recipe-recommended for raw throughput, but speculative bursts
             # generate multiple draft tokens per forward pass — collides
@@ -1912,6 +1947,52 @@ class VllmQrPrismaQuant:
                     "event": VLLM_ARGV_VALIDATED,
                     "cmd": cmd,
                     "supported_flag_count": len(supported_flags),
+                },
+            )
+
+        # iter-49a (2026-05-25): conditionally add the /health/entropy
+        # middleware to the vllm serve cmd, gated on the import working
+        # cleanly in this container's Python. Two reasons for the gate:
+        #
+        # 1. vLLM's ``--middleware`` uses ``module.callable`` (rsplit on
+        #    the rightmost ``.``), NOT the ``module:callable`` form that
+        #    ``--logits-processors`` uses. A wrong format causes vLLM's
+        #    ``build_app`` to crash AFTER engine init has already burned
+        #    ~3 min of weight load + dynamo compile — disastrous for
+        #    iteration cadence. Validating the value imports HERE,
+        #    on-host, fails fast in <1 s.
+        # 2. The /health/entropy endpoint powers iter-49's regenerate-
+        #    banner — a cosmetic UX feature, not a load-bearing
+        #    dependency. If the middleware ever fails to import (renamed
+        #    fastapi dep, transitive ImportError on a future vLLM bump),
+        #    the container MUST still boot. The qr-llm-chat side
+        #    gracefully no-ops the banner when the endpoint returns 404.
+        try:
+            from qr_sampler.connectors.modal.health_entropy_middleware import (
+                health_entropy_middleware as _qr_he_probe,
+            )
+
+            if not callable(_qr_he_probe):
+                raise TypeError("health_entropy_middleware is not callable")
+            cmd.extend(
+                [
+                    "--middleware",
+                    "qr_sampler.connectors.modal.health_entropy_middleware.health_entropy_middleware",
+                ]
+            )
+            log.info(
+                "iter-49 /health/entropy middleware enabled",
+                extra={"event": "qr.health_entropy.middleware_enabled"},
+            )
+        except Exception as err:
+            log.warning(
+                "iter-49 /health/entropy middleware NOT importable; skipping "
+                "--middleware (regenerate-banner will silently no-op): %r",
+                err,
+                extra={
+                    "event": "qr.health_entropy.middleware_skipped",
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
                 },
             )
 
