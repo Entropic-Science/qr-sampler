@@ -2621,29 +2621,33 @@ owui_data_volume = modal.Volume.from_name("qr-llm-chat-data", create_if_missing=
     secrets=[qr_sampler_prod_secret, qr_llm_chat_secret],
     volumes={"/data": owui_data_volume},
     enable_memory_snapshot=True,
-    # iter-39 (2026-05-25): scaledown_window at Modal's documented max
-    # (20 min = 1200 s). Modal 1.0 hard-caps scaledown_window at 1200 s
-    # per the cold-start / scale docs; the prior 1800 s value here was
-    # silently clamped. For the operator's requested "12 h warm
-    # period", we drive it via a scheduled cron keep-alive
-    # (see ``keep_owui_warm`` below) rather than trying to push
-    # scaledown_window past Modal's ceiling.
+    # iter-42 (2026-05-25): OWUI is kept perpetually warm via
+    # min_containers=1 — Modal guarantees AT LEAST one OWUI replica
+    # is alive at all times. scaledown_window=300 still applies to
+    # any EXTRA replicas Modal spawns under burst (capped at
+    # max_containers=1 below, so in practice there are never extras),
+    # but the floor of 1 means the donor demo's first click never
+    # pays the 30-60 s OWUI cold-restore.
     #
-    # ENDING SEMANTICS (Modal documentation, §lifecycle-functions):
-    # - On scaledown_window expiry Modal invokes ``@modal.exit()``
-    #   (no-op for OWUIService; the FastAPI lifespan ASGI shutdown
-    #   handles teardown). The exit handler has a 30 s grace period.
-    # - After exit returns the container is TERMINATED and the
-    #   CPU/RAM allocation is released — billing stops.
-    # - ``enable_memory_snapshot=True`` preserves the warm boot
-    #   image so the next request restores from snapshot in
-    #   ~30-60 s instead of doing a from-zero ``import open_webui``.
-    # - ``min_containers=0`` below ensures NO warm-pinned replica
-    #   sits idle racking up cost when the cron pauses (e.g.
-    #   overnight); max_containers=1 prevents fan-out.
-    scaledown_window=1200,  # 20 min = Modal-documented hard max.
+    # Cost: 1 vCPU + 2 GB RAM continuous = ~$43/month for OWUI's
+    # CPU container. Acceptable for the demo posture; the operator
+    # can drop this back to 0 (and pair with a scheduled cron from
+    # outside the qr_sampler package) if cost ever becomes a concern.
+    # iter-39/40/41 explored the cron approach — the in-app cron
+    # crash-looped on the qr_sampler/__init__.py pydantic import,
+    # and a standalone-app split added more deploy complexity than
+    # min_containers=1 saves in cost. Direct floor is simpler.
+    #
+    # ENDING SEMANTICS (Modal docs, §lifecycle-functions): if the
+    # operator runs ``modal app stop qr-llm-chat`` the floor is
+    # released and the container terminates gracefully via
+    # @modal.exit() (30 s grace) + ASGI lifespan shutdown.
+    # max_containers=1 below caps the per-class replica count;
+    # min_containers=1 sets the floor. The two together pin OWUI
+    # at exactly one replica.
+    scaledown_window=300,  # 5 min — only relevant for transient extras.
     timeout=60 * 60,
-    min_containers=0,  # NEVER set ≥1 — keep-warm cost is unacceptable (Q10).
+    min_containers=1,  # iter-42: keep OWUI warm 24/7 — see comment above.
     # Hard cap at 1 replica. OWUI keeps in-memory state (PersistentConfig
     # cache, session cookies, lazy admin-user check) that must be
     # authoritative; fan-out would create N caches racing against each
@@ -2696,30 +2700,3 @@ class OWUIService:
     @modal.asgi_app()
     def serve(self) -> Any:
         return self._asgi_app
-
-
-# ----- OWUI keep-warm cron — MOVED OUT (iter-41) ----------------------------
-#
-# iter-39/40 defined a ``keep_owui_warm`` Modal function in THIS module.
-# Modal's container for the cron crash-looped with
-# ``ModuleNotFoundError: No module named 'pydantic'`` because importing
-# the function's source module (``qr_sampler.connectors.modal.app``)
-# triggers ``qr_sampler/__init__.py``, which eagerly imports pydantic
-# (via ``qr_sampler.config``), vllm + torch (via ``qr_sampler.processor``),
-# and a dozen other heavy deps. A "slim" keepalive image with just
-# ``httpx`` couldn't satisfy that import chain, and adding all the
-# transitive deps would balloon the image to multiple GiB.
-#
-# Fix: the keep-warm function now lives in a STANDALONE Modal app at
-# ``qr-llm-chat/scripts/modal_keepalive.py``. That file is a top-level
-# script (no package ``__init__.py``), so importing it inside the
-# keepalive container only pulls in stdlib + httpx. Deployed alongside
-# this app by ``qr-llm-chat/scripts/deploy.ps1``:
-#
-#     modal deploy -m qr_sampler.connectors.modal.app    # main stack
-#     modal deploy scripts/modal_keepalive.py            # cron app
-#
-# The two apps share the ``qr-llm-chat-prod`` Modal Secret so the
-# cron has access to ``WEBUI_URL``. See the script's module docstring
-# for the schedule (every 15 min, 09:00-20:59 Pacific, DST-aware) and
-# the cost / ending-semantics rationale.
