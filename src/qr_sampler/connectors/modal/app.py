@@ -2698,108 +2698,28 @@ class OWUIService:
         return self._asgi_app
 
 
-# ----- OWUI keep-warm cron (iter-39) ----------------------------------------
+# ----- OWUI keep-warm cron — MOVED OUT (iter-41) ----------------------------
 #
-# Modal's ``scaledown_window`` is hard-capped at 20 min (per the cold-start +
-# scaling docs). The operator's spec is "OWUI stays warm for 12 hours" — too
-# long for scaledown_window alone. The Modal-documented pattern for >20 min
-# warm periods (https://modal.com/docs/guide/cold-start §Increase warm pool /
-# https://modal.com/docs/guide/scale §Container lifecycle) is a scheduled
-# function that pings the endpoint, which resets the scaledown_window timer
-# every period.
+# iter-39/40 defined a ``keep_owui_warm`` Modal function in THIS module.
+# Modal's container for the cron crash-looped with
+# ``ModuleNotFoundError: No module named 'pydantic'`` because importing
+# the function's source module (``qr_sampler.connectors.modal.app``)
+# triggers ``qr_sampler/__init__.py``, which eagerly imports pydantic
+# (via ``qr_sampler.config``), vllm + torch (via ``qr_sampler.processor``),
+# and a dozen other heavy deps. A "slim" keepalive image with just
+# ``httpx`` couldn't satisfy that import chain, and adding all the
+# transitive deps would balloon the image to multiple GiB.
 #
-# Schedule: ``*/15 9-20 * * *`` America/Los_Angeles fires every 15 min
-# during the 12-hour window 09:00-20:59 PT (Pacific Time, auto-handles
-# the PDT↔PST switchover via Modal's tzdata). That window aligns with
-# West-Coast working hours when the operator runs donor demos. Outside
-# it no pings arrive and OWUI's scaledown_window=1200 takes over —
-# the container terminates within 20 min of the last cron ping or
-# user request, whichever is later.
+# Fix: the keep-warm function now lives in a STANDALONE Modal app at
+# ``qr-llm-chat/scripts/modal_keepalive.py``. That file is a top-level
+# script (no package ``__init__.py``), so importing it inside the
+# keepalive container only pulls in stdlib + httpx. Deployed alongside
+# this app by ``qr-llm-chat/scripts/deploy.ps1``:
 #
-# 15 min interval stays comfortably below the 20-min scaledown so every
-# ping lands on a still-warm container. If a ping fails (Modal blip), the
-# next 15-min tick recovers; the worst case is one cold-cold restore.
+#     modal deploy -m qr_sampler.connectors.modal.app    # main stack
+#     modal deploy scripts/modal_keepalive.py            # cron app
 #
-# Cost: a single sub-second GET request every 15 min. The keep-warm
-# function itself runs on a sub-second cpu=0.125 container so its own
-# cost is negligible (~$0.00001/run × 48 runs/day = $0.0005/day). The
-# REAL cost is the OWUI container staying up for 12 h/day:
-#   1 vCPU × $0.000033/cpu-s × 43200 s/day = $1.43/day ≈ $43/mo.
-# Acceptable for the demo posture; document for the operator so they
-# can shrink the window (or kill this cron) if cost becomes a concern.
-#
-# Ending semantics: when the cron stops (e.g. operator removes this
-# function or changes the schedule) OWUI's normal scaledown_window=1200
-# is the safety net. There's no path where the container stays running
-# beyond 20 min past the last request or the last cron ping, whichever
-# is later.
-
-_KEEPALIVE_IMAGE = modal.Image.debian_slim(python_version="3.12").pip_install(
-    "httpx==0.27.2",
-)
-
-
-@app.function(
-    image=_KEEPALIVE_IMAGE,
-    cpu=0.125,
-    memory=128,
-    schedule=modal.Cron("*/15 9-20 * * *", timezone="America/Los_Angeles"),
-    timeout=60,
-    secrets=[qr_llm_chat_secret],
-)
-def keep_owui_warm() -> None:
-    """Ping OWUI's auth-free ``/api/qr-status`` to reset its scaledown_window.
-
-    iter-39 (2026-05-25). Fires every 15 minutes during the 12-hour
-    daytime window 06:00-17:59 UTC (08:00-19:59 CEST). See the comment
-    block above for the cost rationale and the operator-tuneable knobs.
-
-    The hostname is deterministic for our deploy. ``WEBUI_URL`` is set
-    in the qr-llm-chat-prod Modal Secret (OWUI uses it for OAuth /
-    redirect URLs), so prefer it; fall back to the hardcoded constant
-    for redundancy if the secret value ever drifts.
-
-    Failure handling: log + return cleanly. A single missed ping is
-    bounded by the next 15-min tick, which will land before the
-    20-min scaledown_window expires. We do NOT raise — a permanently
-    raising keep-warm would spam Modal's alerting without recovering
-    OWUI any faster than the natural scaledown + next-request cycle.
-    """
-    import logging
-    import os
-
-    import httpx
-
-    log = logging.getLogger("qr_sampler.modal.app.keep_owui_warm")
-
-    url = (os.environ.get("WEBUI_URL") or "").rstrip("/")
-    if not url:
-        url = "https://alchemystack--qr-llm-chat-owuiservice-serve.modal.run"
-    endpoint = f"{url}/api/qr-status"
-
-    try:
-        # 60 s timeout matches Modal's edge proxy: a cold OWUI returns
-        # 303 chains for ~30-60 s before settling on the 200 from the
-        # warmed-up container. Following with httpx.follow_redirects
-        # exercises the same chain the donor-demo user's browser walks.
-        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-            response = client.get(endpoint)
-        log.info(
-            "keep_owui_warm ping ok",
-            extra={
-                "event": "owui.keepalive.ok",
-                "url": endpoint,
-                "status_code": response.status_code,
-                "elapsed_ms": response.elapsed.total_seconds() * 1000.0,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001 -- never crash the schedule
-        log.warning(
-            "keep_owui_warm ping failed: %s",
-            exc,
-            extra={
-                "event": "owui.keepalive.fail",
-                "url": endpoint,
-                "error": str(exc),
-            },
-        )
+# The two apps share the ``qr-llm-chat-prod`` Modal Secret so the
+# cron has access to ``WEBUI_URL``. See the script's module docstring
+# for the schedule (every 15 min, 09:00-20:59 Pacific, DST-aware) and
+# the cost / ending-semantics rationale.
