@@ -24,8 +24,46 @@ quantum lane fell back to PRNG for at least one token, so the response
 is no longer purely quantum-random and the user is shown a banner
 suggesting they hit OWUI's existing Regenerate button.
 
-State wire-up
--------------
+KNOWN LIMITATION: vLLM cross-process module isolation
+-----------------------------------------------------
+This middleware lives in vLLM's **APIServer** process (FastAPI +
+request routing). ``VLLMAdapter`` — which calls ``set_fallback_source``
+— lives in vLLM's separate **EngineCore** process (scheduling, model
+execution, logits processors). The two processes have independent
+copies of every Python module, so ``_FALLBACK_SRC`` set in EngineCore
+stays ``None`` in APIServer for the container's lifetime. As a result
+the endpoint returns ``503 {"rpc_ok": null, "error": "not_initialised"}``
+on every request in production.
+
+This is deployed-but-non-functional ON PURPOSE. Two things make this
+acceptable:
+
+1. The qr-llm-chat side's ``_probe_entropy_health_snapshot`` treats
+   non-200 as ``None`` and the iter-49 banner gracefully no-ops — no
+   broken UX. The whole iter-49 chain (snapshot in inlet, compare in
+   outlet, append banner) sits dormant until a future iteration wires
+   up real cross-process state.
+2. The qr-sampler still emits ``entropy.degraded.alert`` structured
+   log events on every fallback (per-event WARNING + rate-limited
+   ERROR), so operators have full visibility even without the
+   user-facing banner.
+
+To actually populate the endpoint, a follow-up iteration needs a
+cross-process state channel. Options sketched:
+
+* File-based IPC: ``FallbackEntropySource.get_random_bytes`` writes
+  to ``/tmp/qr_fallback_status.json`` on state changes; middleware
+  reads on hit. ~30 LOC, lowest risk.
+* Unix-domain socket from APIServer to EngineCore.
+* Prometheus counter shared via vLLM's existing ``/metrics`` endpoint
+  (vLLM uses ``prometheus_client``'s global registry).
+
+The file-IPC variant is the obvious next step. The infrastructure on
+both sides (qr-llm-chat snapshot+compare, qr-sampler middleware) is
+already there; only the state-write+read pair is missing.
+
+State wire-up (intended; currently broken cross-process)
+--------------------------------------------------------
 The middleware reads from a module-level ``_FALLBACK_SRC`` reference
 populated by ``VLLMAdapter.__init__`` via ``set_fallback_source(...)``.
 Set late (after engine init), so the endpoint returns ``503`` with a
@@ -41,11 +79,19 @@ hot inference path is one path-string comparison per request.
 
 Wire-up location
 ----------------
-Add to the ``vllm serve`` argv block in
-``qr_sampler.connectors.modal.app`` for every active class::
+The qr-sampler-side ``app.py`` ``_start_and_sleep`` method imports
+this module on the deploy host BEFORE passing the flag to vllm serve;
+if the import fails, ``--middleware`` is skipped and the endpoint
+stays 404. The middleware FQN passed to vllm serve uses dots
+throughout (vLLM rsplits on the rightmost ``.``)::
 
     "--middleware",
-    "qr_sampler.connectors.modal.health_entropy_middleware:health_entropy_middleware",
+    "qr_sampler.connectors.modal.health_entropy_middleware.health_entropy_middleware"
+
+NOT the ``module:callable`` colon form that ``--logits-processors``
+uses — vLLM treats the entire post-rightmost-dot string as the
+attribute name, so a colon there yields an unfindable attribute
+``foo:foo`` and the container crashes AFTER engine init.
 """
 
 from __future__ import annotations
