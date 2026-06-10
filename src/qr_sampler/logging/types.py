@@ -93,3 +93,11 @@ class TokenSamplingRecord:
     entropy_nonce: str | None = field(default=None)
     entropy_echo_verified: bool | None = field(default=None)
     entropy_server_timestamp_ns: int | None = field(default=None)
+
+    # iter-55: per-stage timing breakdown of the sampling pipeline, used
+    # by the adapter's rolling perf aggregate (/health/entropy "perf"
+    # block) to attribute per-token cost. ``entropy_fetch_ms`` above
+    # remains the entropy stage's share.
+    temperature_ms: float | None = field(default=None)
+    amplify_ms: float | None = field(default=None)
+    select_ms: float | None = field(default=None)

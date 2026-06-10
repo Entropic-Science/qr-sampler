@@ -284,7 +284,9 @@ class SamplingPipeline:
         hash_str = config_hash_str if config_hash_str is not None else self._default_config_hash
 
         # --- 1. Compute temperature ---
+        t_stage = time.perf_counter_ns()
         temp_result = active_strategy.compute_temperature(logits, active_config)
+        temperature_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 
         # Per-token min-p: HVH-Drift publishes a value via diagnostics; other
         # strategies omit the key, so fall back to the config-level default.
@@ -314,9 +316,12 @@ class SamplingPipeline:
         entropy_fetch_ms = (t_fetch_end - t_fetch_start) / 1_000_000.0
 
         # --- 3. Amplify to uniform float ---
+        t_stage = time.perf_counter_ns()
         amp_result = active_amplifier.amplify(raw_bytes)
+        amplify_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 
         # --- 4. Select token via CDF ---
+        t_stage = time.perf_counter_ns()
         selection = self._selector.select(
             logits,
             temp_result.temperature,
@@ -325,6 +330,7 @@ class SamplingPipeline:
             amp_result.u,
             min_p=min_p,
         )
+        select_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 
         # --- 5. Commit-then-fetch: fire the NEXT token's entropy NOW ---
         # The selection event for this token just happened, so a request
@@ -392,6 +398,9 @@ class SamplingPipeline:
             entropy_nonce=f"{ticket_nonce:016x}" if ticket_nonce else None,
             entropy_echo_verified=echo_verified,
             entropy_server_timestamp_ns=server_ts_ns,
+            temperature_ms=temperature_ms,
+            amplify_ms=amplify_ms,
+            select_ms=select_ms,
         )
 
         # --- 8. Log ---

@@ -46,6 +46,22 @@ logger = logging.getLogger("qr_sampler")
 _STATUS_FILE_ENV_VAR = "QR_ENTROPY_STATUS_FILE"
 _DEFAULT_BASENAME = "qr_entropy_status.json"
 
+# iter-55: second channel on the same bridge — per-stage sampling
+# performance aggregates written by the VLLMAdapter (EngineCore) and
+# surfaced through /health/entropy's "perf" block (APIServer). Separate
+# file so the high-churn perf writes never race the load-bearing
+# degraded/recovered transitions in the entropy-status file.
+_PERF_FILE_ENV_VAR = "QR_SAMPLER_PERF_FILE"
+_PERF_DEFAULT_BASENAME = "qr_sampler_perf_status.json"
+
+
+def _resolve_path(env_var: str, default_basename: str) -> str | None:
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return os.path.join(tempfile.gettempdir(), default_basename)
+    raw = raw.strip()
+    return raw or None
+
 
 def status_file_path() -> str | None:
     """Resolve the status-file path from the environment.
@@ -54,21 +70,15 @@ def status_file_path() -> str | None:
     ``QR_ENTROPY_STATUS_FILE=""``. Resolved per-call (not cached at
     import) so tests can flip the env var without reloading the module.
     """
-    raw = os.environ.get(_STATUS_FILE_ENV_VAR)
-    if raw is None:
-        return os.path.join(tempfile.gettempdir(), _DEFAULT_BASENAME)
-    raw = raw.strip()
-    return raw or None
+    return _resolve_path(_STATUS_FILE_ENV_VAR, _DEFAULT_BASENAME)
 
 
-def write_entropy_status(payload: dict[str, Any]) -> bool:
-    """Atomically persist *payload* (plus an ``updated_at`` stamp).
+def perf_file_path() -> str | None:
+    """Resolve the perf-status path (``QR_SAMPLER_PERF_FILE``), or ``None``."""
+    return _resolve_path(_PERF_FILE_ENV_VAR, _PERF_DEFAULT_BASENAME)
 
-    Returns ``True`` on success, ``False`` when disabled or on any I/O
-    failure. Never raises — this sits on the per-token sampling hot
-    path's failure branch and must not add failure modes of its own.
-    """
-    path = status_file_path()
+
+def _write_json(path: str | None, payload: dict[str, Any]) -> bool:
     if path is None:
         return False
     record = dict(payload)
@@ -82,10 +92,31 @@ def write_entropy_status(payload: dict[str, Any]) -> bool:
     except OSError as exc:
         # Log at debug: a read-only tmpdir would otherwise emit one
         # warning per token during a degraded window.
-        logger.debug("entropy status write failed (%s): %s", path, exc)
+        logger.debug("status write failed (%s): %s", path, exc)
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         return False
+
+
+def _read_json(path: str | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_entropy_status(payload: dict[str, Any]) -> bool:
+    """Atomically persist *payload* (plus an ``updated_at`` stamp).
+
+    Returns ``True`` on success, ``False`` when disabled or on any I/O
+    failure. Never raises — this sits on the per-token sampling hot
+    path's failure branch and must not add failure modes of its own.
+    """
+    return _write_json(status_file_path(), payload)
 
 
 def read_entropy_status() -> dict[str, Any] | None:
@@ -96,12 +127,14 @@ def read_entropy_status() -> dict[str, Any] | None:
     content. Callers must treat ``None`` as "no sampler state available",
     NOT as "degraded".
     """
-    path = status_file_path()
-    if path is None:
-        return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _read_json(status_file_path())
+
+
+def write_perf_status(payload: dict[str, Any]) -> bool:
+    """Atomically persist the sampling-perf aggregate. Never raises."""
+    return _write_json(perf_file_path(), payload)
+
+
+def read_perf_status() -> dict[str, Any] | None:
+    """Read the last sampling-perf aggregate, or ``None`` (miss/disabled)."""
+    return _read_json(perf_file_path())

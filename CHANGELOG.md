@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (iter-55)
+
+- **Post-wake CUDA-graph recapture**: the Modal sleep → CRIU snapshot → restore →
+  wake cycle silently dropped the engine's captured CUDA graphs, leaving every
+  serving container ~14x slower than its pre-sleep self (~30 ms/token warmup vs
+  ~360-430 ms/token post-wake, iter-54 boot-log evidence). `_wake` now measures
+  decode speed, re-runs the worker's `compile_or_warm_up_model` via the dev
+  `/collective_rpc` endpoint, and measures again — events `vllm.wake.perf` /
+  `vllm.wake.recapture_ok` carry the per-boot A/B. Soft-fail; kill switch
+  `QR_WAKE_RECAPTURE=0`
+
+### Changed (iter-55)
+
+- `TokenSelector._cdf_select` fast path: O(n) `argpartition` of the top-512
+  head + O(K log K) head sort replaces the unconditional full `argsort` over
+  the entire vocabulary (~152k) per token; escalates to the exact full-sort
+  path whenever `u` is not strictly covered by the head's nonzero cumulative
+  mass, so selections are identical (equivalence-tested across distribution
+  shapes and u-draws)
+- `_stable_softmax` avoids the full-vocab boolean-mask copy on the hot path
+  (max over all logits equals max over finite logits whenever any finite
+  value exists)
+
+### Added (iter-55)
+
+- Per-stage sampling telemetry: `temperature_ms` / `amplify_ms` / `select_ms`
+  on `TokenSamplingRecord`; rolling-window aggregator in the vLLM adapter
+  publishing stage means/p95 + prefetch hit / echo-verified ratios through a
+  perf status file (surfaced as `/health/entropy`'s `"perf"` block) and a
+  rate-limited `qr.sampling.stats` WARNING log line (INFO from the qr_sampler
+  logger is invisible in the production EngineCore log stream)
+
 ### Added
 
 - **Pipelined commit-then-fetch entropy** (iter-54): the gRPC request for token *N+1*

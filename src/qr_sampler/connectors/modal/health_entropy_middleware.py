@@ -366,6 +366,18 @@ async def health_entropy_middleware(request: Request, call_next: Any) -> Any:
         sampler, sampler_source = _resolve_sampler_state()
         probe = await asyncio.to_thread(_live_probe_sync)
         rpc_ok = _combine_rpc_ok(probe.get("ok"), sampler)
+        # iter-55: per-stage sampling-perf aggregate from the EngineCore
+        # adapter (rolling-window means/p95 + prefetch hit / echo-verified
+        # ratios). Best-effort: absent file → null block, never an error.
+        perf: dict[str, Any] | None = None
+        try:
+            from qr_sampler.entropy.status_file import read_perf_status
+
+            perf = read_perf_status()
+            if perf is not None and isinstance(perf.get("updated_at"), (int, float)):
+                perf["age_s"] = round(time.time() - float(perf["updated_at"]), 1)
+        except Exception:
+            perf = None
         payload: dict[str, Any] = {
             "rpc_ok": rpc_ok,
             "tcp_ok": probe.get("tcp_ok"),
@@ -376,6 +388,7 @@ async def health_entropy_middleware(request: Request, call_next: Any) -> Any:
             "probe": probe,
             "sampler": sampler,
             "sampler_source": sampler_source,
+            "perf": perf,
         }
         if rpc_ok is None:
             payload["error"] = "not_initialised"

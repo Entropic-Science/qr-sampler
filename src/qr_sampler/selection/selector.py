@@ -16,6 +16,21 @@ import numpy as np
 from qr_sampler.exceptions import TokenSelectionError
 from qr_sampler.selection.types import SelectionResult
 
+# iter-55: CDF fast-path head size. The selection CDF concentrates its
+# mass in the head of the descending-probability order, so sorting the
+# top-_CDF_FAST_HEAD candidates (found via O(n) argpartition) almost
+# always suffices to locate the selected token — replacing the full
+# O(n log n) argsort over the whole vocabulary (~152k for Qwen3.6) that
+# previously ran on EVERY token. When ``u`` falls beyond the head's
+# nonzero cumulative mass the selector escalates to the original
+# full-sort path, so selection semantics are preserved exactly (tie
+# order among equal probabilities was already unspecified — np.argsort's
+# default quicksort is not stable).
+_CDF_FAST_HEAD = 512
+
+# Only engage the fast path when it meaningfully beats the full sort.
+_CDF_FAST_MIN_VOCAB = _CDF_FAST_HEAD * 4
+
 
 class TokenSelector:
     """Stateless CDF-based token selector.
@@ -177,13 +192,19 @@ class TokenSelector:
         Returns:
             Probability array of the same shape, summing to 1.0.
         """
-        finite_mask = np.isfinite(logits)
-        if not np.any(finite_mask):
-            # All masked -- return uniform over all tokens (degenerate case).
-            n = len(logits)
-            return np.full(n, 1.0 / n)
+        # iter-55: the max over ALL logits equals the max over finite
+        # logits whenever any finite value exists (-inf never wins), so
+        # the boolean-mask fancy-index copy of the full vocab is only
+        # needed on the all-masked degenerate branch.
+        max_logit = np.max(logits)
+        if not np.isfinite(max_logit):
+            finite_mask = np.isfinite(logits)
+            if not np.any(finite_mask):
+                # All masked -- return uniform over all tokens (degenerate case).
+                n = len(logits)
+                return np.full(n, 1.0 / n)
+            max_logit = np.max(logits[finite_mask])
 
-        max_logit = np.max(logits[finite_mask])
         shifted = logits - max_logit
         # -inf - max_logit is still -inf, exp(-inf) = 0.
         exp_shifted = np.exp(shifted)
@@ -256,16 +277,43 @@ class TokenSelector:
             TokenSelectionError: If no tokens have non-zero probability.
         """
         # Get non-zero probability tokens.
-        nonzero_mask = probs > 0
-        if not np.any(nonzero_mask):
+        num_candidates = int(np.count_nonzero(probs > 0))
+        if num_candidates == 0:
             raise TokenSelectionError("No tokens with non-zero probability for CDF selection")
+
+        # iter-55 fast path: locate the selection inside the top-K head
+        # (O(n) argpartition + O(K log K) sort) instead of full-sorting
+        # the whole vocabulary. Escalates to the full sort whenever ``u``
+        # is not strictly covered by the head's nonzero cumulative mass —
+        # including the u-beyond-total-mass clamp case — so every
+        # selection this path returns is identical to the full path's.
+        n = probs.size
+        if n >= _CDF_FAST_MIN_VOCAB:
+            head_count = min(_CDF_FAST_HEAD, n)
+            head_unsorted = np.argpartition(probs, n - head_count)[n - head_count :]
+            head_order = np.argsort(probs[head_unsorted])[::-1]
+            head_indices = head_unsorted[head_order]
+            head_probs = probs[head_indices]
+            head_nonzero = int(np.count_nonzero(head_probs > 0))
+            if head_nonzero > 0:
+                head_cdf = np.cumsum(head_probs[:head_nonzero])
+                if u < float(head_cdf[-1]):
+                    rank = int(np.searchsorted(head_cdf, u, side="left"))
+                    rank = min(rank, head_nonzero - 1)
+                    return (
+                        int(head_indices[rank]),
+                        rank,
+                        float(head_probs[rank]),
+                        num_candidates,
+                    )
+            # Fall through: selection lies beyond the head (rare tail
+            # draw) — take the exact full-sort path below.
 
         # Sort by descending probability.
         sorted_indices = np.argsort(probs)[::-1]
         sorted_probs = probs[sorted_indices]
 
         # Trim to non-zero candidates.
-        num_candidates = int(np.sum(nonzero_mask))
         candidate_indices = sorted_indices[:num_candidates]
         candidate_probs = sorted_probs[:num_candidates]
 

@@ -160,12 +160,179 @@ MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tig
 PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
 PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
 PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
-# iter-54: bumped for the commit-then-fetch entropy pipelining — the
-# prefetch ticket machinery lives in the snapshotted EngineCore process
-# (logits processor + QuantumGrpcSource), so the prior snapshot must be
-# re-materialised rather than restored over the new code.
-PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-54-001-prefetch-pipeline"
+# iter-55: bumped for the selector CDF fast path + per-stage perf
+# telemetry — both run inside the snapshotted EngineCore process during
+# pre-snapshot profiling/warmup, so the prior snapshot must be
+# re-materialised rather than restored over the new code. (iter-54:
+# commit-then-fetch prefetch machinery, same rationale.)
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-55-001-wake-recapture"
 PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
+
+# ---- iter-55: post-wake engine recapture --------------------------------
+# Root cause of the ~2.7 tok/s production floor (iter-54 investigation):
+# the pre-/sleep warmup ran at ~30 ms/token (3x8-token requests in 830 ms,
+# iter-54 boot log) while every post-wake chat ran at ~360-430 ms/token —
+# a ~14x regression introduced by the sleep -> CRIU snapshot -> restore ->
+# wake cycle. CUDA graphs captured at engine build are GPU-resident
+# objects; they do not survive the restore onto a fresh device/context,
+# and vLLM silently falls back to slow per-step execution. Since EVERY
+# serving container is post-wake by design, production never ran at the
+# engine's true speed.
+#
+# Fix: after /wake_up + /health, re-run the worker's
+# ``compile_or_warm_up_model`` via the dev ``/collective_rpc`` endpoint
+# (VLLM_SERVER_DEV_MODE=1 is already set for /sleep). That re-captures
+# the CUDA graphs in-place (~25-90 s, bounded by _SLEEP_WAKE_TIMEOUT_S).
+# The wake path measures decode ms/token BEFORE and AFTER so every boot
+# log carries its own A/B (events: vllm.wake.perf, vllm.wake.recapture).
+# Soft-fail throughout: any error logs and continues — worst case is
+# today's slow-but-correct behaviour. Kill switch: QR_WAKE_RECAPTURE=0.
+_WAKE_RECAPTURE_ENV_VAR = "QR_WAKE_RECAPTURE"
+_WAKE_PROBE_TOKENS = 8
+_WAKE_PROBE_RUNS = 2
+
+
+def _measure_decode_ms_per_token(
+    base_url: str,
+    model_name: str,
+    log: Any,
+    *,
+    phase: str,
+) -> float | None:
+    """Run small timed generations; log + return approximate decode ms/token.
+
+    Wall time over (runs x tokens) decode steps. Includes prefill + HTTP
+    overhead, so it slightly OVERSTATES per-token cost — fine for the
+    pre/post-recapture comparison, which spans an order of magnitude.
+    """
+    import httpx  # lazy: keeps the deploy-host module import light
+
+    url = f"{base_url}/v1/chat/completions"
+    body = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": _WAKE_PROBE_TOKENS,
+        "stream": False,
+    }
+    total_s = 0.0
+    ok = 0
+    for _ in range(_WAKE_PROBE_RUNS):
+        t0 = time.monotonic()
+        try:
+            r = httpx.post(url, json=body, timeout=120.0)
+            r.raise_for_status()
+        except Exception as exc:
+            log.warning(
+                "wake perf probe (%s) request failed: %s",
+                phase,
+                exc,
+                extra={
+                    "event": "vllm.wake.perf_probe_failed",
+                    "served_model_name": model_name,
+                    "phase": phase,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            continue
+        total_s += time.monotonic() - t0
+        ok += 1
+    if ok == 0:
+        return None
+    ms_per_token = (total_s / (ok * _WAKE_PROBE_TOKENS)) * 1000.0
+    log.info(
+        "post-wake decode probe (%s): %.0f ms/token over %d tokens",
+        phase,
+        ms_per_token,
+        ok * _WAKE_PROBE_TOKENS,
+        extra={
+            "event": "vllm.wake.perf",
+            "served_model_name": model_name,
+            "phase": phase,
+            "ms_per_token": round(ms_per_token, 1),
+            "tokens": ok * _WAKE_PROBE_TOKENS,
+        },
+    )
+    return ms_per_token
+
+
+def _post_wake_engine_recapture(
+    base_url: str,
+    model_name: str,
+    log: Any,
+    *,
+    timeout_s: float,
+) -> None:
+    """Measure post-wake decode speed; re-capture CUDA graphs; measure again.
+
+    Blocking by design: it runs inside ``@modal.enter`` before the
+    container is marked ready, so no user traffic can race the capture.
+    Adds the recapture duration (~25-90 s) to the cold start in exchange
+    for ~10x faster decode on every subsequent token — the right trade
+    while generation time dominates end-user latency.
+    """
+    import httpx  # lazy: keeps the deploy-host module import light
+
+    if os.environ.get(_WAKE_RECAPTURE_ENV_VAR, "1") == "0":
+        log.info(
+            "post-wake recapture disabled via %s=0",
+            _WAKE_RECAPTURE_ENV_VAR,
+            extra={
+                "event": "vllm.wake.recapture_disabled",
+                "served_model_name": model_name,
+            },
+        )
+        return
+
+    pre_ms = _measure_decode_ms_per_token(
+        base_url, model_name, log, phase="pre_recapture"
+    )
+
+    t0 = time.monotonic()
+    try:
+        r = httpx.post(
+            f"{base_url}/collective_rpc",
+            json={"method": "compile_or_warm_up_model"},
+            timeout=timeout_s,
+        )
+        r.raise_for_status()
+    except Exception as exc:
+        log.warning(
+            "post-wake CUDA-graph recapture failed (engine continues on the "
+            "slow path): %s",
+            exc,
+            extra={
+                "event": "vllm.wake.recapture_failed",
+                "served_model_name": model_name,
+                "duration_ms": (time.monotonic() - t0) * 1000.0,
+                "error_type": type(exc).__name__,
+                "error_msg": str(exc),
+            },
+        )
+        return
+    recapture_ms = (time.monotonic() - t0) * 1000.0
+
+    post_ms = _measure_decode_ms_per_token(
+        base_url, model_name, log, phase="post_recapture"
+    )
+    speedup = (
+        round(pre_ms / post_ms, 2) if (pre_ms and post_ms and post_ms > 0) else None
+    )
+    log.info(
+        "post-wake CUDA-graph recapture complete in %.0f ms (decode %s -> %s "
+        "ms/token, speedup=%s)",
+        recapture_ms,
+        f"{pre_ms:.0f}" if pre_ms else "?",
+        f"{post_ms:.0f}" if post_ms else "?",
+        speedup,
+        extra={
+            "event": "vllm.wake.recapture_ok",
+            "served_model_name": model_name,
+            "duration_ms": recapture_ms,
+            "pre_ms_per_token": round(pre_ms, 1) if pre_ms else None,
+            "post_ms_per_token": round(post_ms, 1) if post_ms else None,
+            "speedup": speedup,
+        },
+    )
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
 # module import (i.e. each Modal container's Python process boot). The
@@ -2354,6 +2521,16 @@ class VllmQrPrismaQuant:
                 "duration_ms": total_duration_ms,
                 "wake_post_duration_ms": wake_duration_ms,
             },
+        )
+
+        # iter-55: the engine wakes ~14x slower than it slept (CUDA graphs
+        # do not survive the snapshot restore). Probe, re-capture, probe —
+        # every boot log carries its own before/after. Soft-fail.
+        _post_wake_engine_recapture(
+            self._VLLM_BASE_URL,
+            self.SERVED_MODEL_NAME,
+            log,
+            timeout_s=self._SLEEP_WAKE_TIMEOUT_S,
         )
 
         # coldstart.complete + restore-class events.

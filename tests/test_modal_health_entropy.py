@@ -206,6 +206,56 @@ class TestEndpoint:
         assert body["probe"]["ok"] is True
         assert body["sampler_source"] == "status_file"
 
+    def test_perf_block_included_when_present(
+        self, client, monkeypatch, tmp_path
+    ) -> None:
+        """iter-55: the adapter's perf aggregate rides along when published."""
+        monkeypatch.setenv("QR_SAMPLER_PERF_FILE", str(tmp_path / "perf.json"))
+        monkeypatch.setattr(
+            mw,
+            "_live_probe_sync",
+            lambda: {"ok": True, "tcp_ok": True, "latency_ms": 42.0, "error": None},
+        )
+        write_entropy_status(
+            {
+                "primary_name": "quantum_grpc",
+                "last_source_used": "quantum_grpc",
+                "fallback_count": 0,
+                "currently_degraded": False,
+            }
+        )
+        from qr_sampler.entropy.status_file import write_perf_status
+
+        write_perf_status(
+            {
+                "window_tokens": 10,
+                "stage_ms": {"total": {"avg": 12.0, "p95": 20.0}},
+                "prefetch": {"hit_ratio": 1.0, "echo_verified_ratio": 0.0},
+            }
+        )
+        body = client.get("/health/entropy").json()
+        assert body["perf"]["window_tokens"] == 10
+        assert body["perf"]["stage_ms"]["total"]["avg"] == 12.0
+        assert isinstance(body["perf"]["age_s"], (int, float))
+
+    def test_perf_block_null_when_absent(self, client, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("QR_SAMPLER_PERF_FILE", str(tmp_path / "missing.json"))
+        monkeypatch.setattr(
+            mw,
+            "_live_probe_sync",
+            lambda: {"ok": True, "tcp_ok": True, "latency_ms": 42.0, "error": None},
+        )
+        write_entropy_status(
+            {
+                "primary_name": "quantum_grpc",
+                "last_source_used": "quantum_grpc",
+                "fallback_count": 0,
+                "currently_degraded": False,
+            }
+        )
+        body = client.get("/health/entropy").json()
+        assert body["perf"] is None
+
     def test_200_degraded_by_probe(self, client, monkeypatch) -> None:
         monkeypatch.setattr(
             mw,
