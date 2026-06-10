@@ -23,9 +23,13 @@ from qr_sampler.selection.types import SelectionResult
 # O(n log n) argsort over the whole vocabulary (~152k for Qwen3.6) that
 # previously ran on EVERY token. When ``u`` falls beyond the head's
 # nonzero cumulative mass the selector escalates to the original
-# full-sort path, so selection semantics are preserved exactly (tie
-# order among equal probabilities was already unspecified — np.argsort's
-# default quicksort is not stable).
+# full-sort path. Equivalence contract: for distributions with no
+# EXACTLY-equal float probabilities straddling the head boundary, the
+# fast path returns the identical (token, rank) to the full sort — the
+# head is the same descending prefix with the same partial sums. Ties
+# at the boundary may resolve to a different equal-probability token;
+# tie order was already unspecified (np.argsort's default quicksort is
+# not stable), so this widens no documented guarantee.
 _CDF_FAST_HEAD = 512
 
 # Only engage the fast path when it meaningfully beats the full sort.
@@ -211,10 +215,14 @@ class TokenSelector:
         total = np.sum(exp_shifted)
 
         if total == 0.0:
-            # Shouldn't happen after shift, but guard anyway.
-            n = int(np.sum(finite_mask))
+            # Unreachable after shift-by-max (the max element contributes
+            # exp(0)=1.0 whenever max_logit is finite) — kept as a
+            # defensive backstop. Compute the mask locally: the fast path
+            # above no longer materialises it (iter-55 review finding).
+            backstop_mask = np.isfinite(logits)
+            n = int(np.sum(backstop_mask))
             probs = np.zeros_like(logits, dtype=np.float64)
-            probs[finite_mask] = 1.0 / max(n, 1)
+            probs[backstop_mask] = 1.0 / max(n, 1)
             return probs
 
         result: np.ndarray = exp_shifted / total

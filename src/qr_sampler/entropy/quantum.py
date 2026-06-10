@@ -782,6 +782,13 @@ class QuantumGrpcSource(EntropySource):
         when the source is closed, the circuit breaker is open, the
         pre-probe backoff is active, or anything in the dispatch fails —
         the caller then degrades to the synchronous fetch path.
+
+        Deliberately skips the half-open window too (no elapsed-window
+        check on ``_circuit_open``): the dominant open-circuit cause is a
+        stale post-wake channel, and only the serial path performs the
+        half-open channel reset — a prefetch fired here would ride the
+        suspect channel and fail anyway. The cost is one serial fetch per
+        recovery cycle, after which prefetch re-engages on the next token.
         """
         if self._closed or self._circuit_open:
             return None

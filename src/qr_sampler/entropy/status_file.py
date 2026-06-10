@@ -89,9 +89,11 @@ def _write_json(path: str | None, payload: dict[str, Any]) -> bool:
             json.dump(record, fh, separators=(",", ":"))
         os.replace(tmp_path, path)
         return True
-    except OSError as exc:
-        # Log at debug: a read-only tmpdir would otherwise emit one
-        # warning per token during a degraded window.
+    except Exception as exc:
+        # Broad on purpose (iter-55 review): a non-OSError from json.dump
+        # (e.g. an unserializable payload value) must also clean up the
+        # tmp file and degrade silently. Log at debug: a read-only tmpdir
+        # would otherwise emit one warning per token during an outage.
         logger.debug("status write failed (%s): %s", path, exc)
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)

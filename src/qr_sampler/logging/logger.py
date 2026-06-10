@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,10 @@ if TYPE_CHECKING:
     from qr_sampler.logging.types import TokenSamplingRecord
 
 logger = logging.getLogger("qr_sampler")
+
+# Cap on in-memory diagnostic records (iter-55). ~300 bytes/record →
+# ~15 MB worst case. Oldest records are dropped once the cap is hit.
+_MAX_DIAGNOSTIC_RECORDS = 50_000
 
 
 class SamplingLogger:
@@ -43,7 +48,11 @@ class SamplingLogger:
         """
         self._log_level = config.log_level
         self._diagnostic_mode = config.diagnostic_mode
-        self._records: list[TokenSamplingRecord] = []
+        # iter-55: ring buffer instead of an unbounded list. A
+        # per-request ``qr_diagnostic_mode=True`` on a long generation
+        # previously accumulated records for the pipeline's lifetime
+        # with no cap and no drain. Keeps the most recent records.
+        self._records: deque[TokenSamplingRecord] = deque(maxlen=_MAX_DIAGNOSTIC_RECORDS)
 
     def log_token(self, record: TokenSamplingRecord) -> None:
         """Log a single token sampling event.
@@ -60,6 +69,12 @@ class SamplingLogger:
             return
 
         if self._log_level == "summary":
+            # isEnabledFor guard (iter-55): in the production EngineCore
+            # process this logger's effective level is WARNING, so the
+            # per-token INFO call would otherwise still evaluate all its
+            # arguments before being discarded.
+            if not logger.isEnabledFor(logging.INFO):
+                return
             logger.info(
                 "token=%d rank=%d prob=%.4f u=%.6f temp=%.3f entropy=%.3f "
                 "source=%s%s fetch=%.2fms total=%.2fms",

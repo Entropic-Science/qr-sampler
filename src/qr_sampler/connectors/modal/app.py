@@ -219,7 +219,10 @@ def _measure_decode_ms_per_token(
     for _ in range(_WAKE_PROBE_RUNS):
         t0 = time.monotonic()
         try:
-            r = httpx.post(url, json=body, timeout=120.0)
+            # 30 s: even the slow pre-recapture path finishes 8 tokens in
+            # ~4 s; a stuck engine should fail the probe fast rather than
+            # extend the @modal.enter blocking window (iter-55 review).
+            r = httpx.post(url, json=body, timeout=30.0)
             r.raise_for_status()
         except Exception as exc:
             log.warning(

@@ -85,10 +85,31 @@ class TemperatureStrategyRegistry:
             A fully constructed TemperatureStrategy instance.
         """
         klass = cls.get(config.temperature_strategy)
+        # iter-55: signature-based detection. The previous
+        # ``try: klass(vocab_size) except TypeError: klass()`` swallowed
+        # TypeErrors raised INSIDE a strategy's __init__ body, silently
+        # constructing a mis-initialised no-arg instance instead of
+        # surfacing the bug. Falls back to the legacy probe only when the
+        # signature itself is unintrospectable (exotic C extensions).
         try:
-            return klass(vocab_size)  # type: ignore[call-arg]
-        except TypeError:
-            return klass()
+            import inspect
+
+            params = inspect.signature(klass).parameters
+            takes_arg = any(
+                p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                )
+                for p in params.values()
+            )
+        except (ValueError, TypeError):
+            try:
+                return klass(vocab_size)  # type: ignore[call-arg]
+            except TypeError:
+                return klass()
+        return klass(vocab_size) if takes_arg else klass()  # type: ignore[call-arg]
 
     @classmethod
     def list_registered(cls) -> list[str]:

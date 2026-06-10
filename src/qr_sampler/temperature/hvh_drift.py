@@ -78,11 +78,17 @@ class HVHDriftStrategy(TemperatureStrategy):
             diagnostics containing ``min_p``, ``varentropy``, ``h_ema``,
             ``vh_ema``, ``d_h``, ``d_vh``.
         """
-        # Stable softmax: shift by max, then log-normalize.
+        # Stable softmax: shift by max, then log-normalize. iter-55: one
+        # exp pass over the vocab instead of two — ``probs`` is derived
+        # from the already-computed ``exp_shifted`` rather than
+        # re-exponentiating ``log_probs`` (~0.7 ms/token saved at 152k
+        # vocab). ``log_probs`` keeps the exact prior formula; ``probs``
+        # is mathematically identical (may differ in the last ulp).
         shifted = logits - np.max(logits)
-        log_sum_exp = float(np.log(np.sum(np.exp(shifted))))
-        log_probs = shifted - log_sum_exp
-        probs = np.exp(log_probs)
+        exp_shifted = np.exp(shifted)
+        sum_exp = float(np.sum(exp_shifted))
+        log_probs = shifted - np.log(sum_exp)
+        probs = exp_shifted / sum_exp
 
         # H = -sum(p * log p); VH = sum(p * (-log p - H)^2).
         h = float(-np.sum(probs * log_probs))
