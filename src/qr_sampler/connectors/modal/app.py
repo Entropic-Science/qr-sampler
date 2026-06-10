@@ -160,12 +160,10 @@ MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tig
 PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
 PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
 PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
-# iter-55: bumped for the selector CDF fast path + per-stage perf
-# telemetry — both run inside the snapshotted EngineCore process during
-# pre-snapshot profiling/warmup, so the prior snapshot must be
-# re-materialised rather than restored over the new code. (iter-54:
-# commit-then-fetch prefetch machinery, same rationale.)
-PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-55-001-wake-recapture"
+# iter-56: bumped for the review-fix batch (hvh single-exp pass runs in
+# the snapshotted EngineCore) + the usage-counted sleep/wake perf probes.
+# (iter-55: selector fast path + perf telemetry; iter-54: prefetch.)
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-56-001-honest-probes"
 PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
 
 # ---- iter-55: post-wake engine recapture --------------------------------
@@ -212,10 +210,17 @@ def _measure_decode_ms_per_token(
         "model": model_name,
         "messages": [{"role": "user", "content": "Hi"}],
         "max_tokens": _WAKE_PROBE_TOKENS,
+        # iter-56: force exactly max_tokens decode steps. Without this a
+        # greedy "Hi" reply can EOS after 2-3 tokens while the divisor
+        # assumes 8 — the iter-55 probes (and the original pre-sleep
+        # warmup numbers that suggested a 14x sleep/wake penalty) were
+        # inflated by exactly this. ignore_eos is a vLLM extension field
+        # accepted at the top level of the chat-completions body.
+        "ignore_eos": True,
         "stream": False,
     }
     total_s = 0.0
-    ok = 0
+    tokens_generated = 0
     for _ in range(_WAKE_PROBE_RUNS):
         t0 = time.monotonic()
         try:
@@ -238,21 +243,27 @@ def _measure_decode_ms_per_token(
             )
             continue
         total_s += time.monotonic() - t0
-        ok += 1
-    if ok == 0:
+        # iter-56: divide by the TRUE completion-token count from usage,
+        # not the requested max_tokens.
+        try:
+            usage_tokens = int(r.json()["usage"]["completion_tokens"])
+        except Exception:
+            usage_tokens = _WAKE_PROBE_TOKENS
+        tokens_generated += max(usage_tokens, 1)
+    if tokens_generated == 0:
         return None
-    ms_per_token = (total_s / (ok * _WAKE_PROBE_TOKENS)) * 1000.0
+    ms_per_token = (total_s / tokens_generated) * 1000.0
     log.info(
         "post-wake decode probe (%s): %.0f ms/token over %d tokens",
         phase,
         ms_per_token,
-        ok * _WAKE_PROBE_TOKENS,
+        tokens_generated,
         extra={
             "event": "vllm.wake.perf",
             "served_model_name": model_name,
             "phase": phase,
             "ms_per_token": round(ms_per_token, 1),
-            "tokens": ok * _WAKE_PROBE_TOKENS,
+            "tokens": tokens_generated,
         },
     )
     return ms_per_token
@@ -2290,6 +2301,16 @@ class VllmQrPrismaQuant:
                 "successful": warmup_ok,
                 "duration_ms": warmup_duration_ms,
             },
+        )
+
+        # iter-56: measure TRUE pre-sleep decode speed with the same
+        # usage-counted, EOS-proof probe the post-wake path uses, so the
+        # boot log carries an apples-to-apples sleep/wake comparison.
+        # The iter-54 inference of a ~14x post-wake penalty rested on
+        # the 3x8-token warmup above, whose actual completion-token
+        # counts were never recorded — this settles it per boot.
+        _measure_decode_ms_per_token(
+            self._VLLM_BASE_URL, self.SERVED_MODEL_NAME, log, phase="pre_sleep"
         )
 
         # iter-18 (2026-05-24): Persist torch.compile artefacts to the
