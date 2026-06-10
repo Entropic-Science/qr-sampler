@@ -43,6 +43,10 @@ _PER_REQUEST_FIELDS: frozenset[str] = frozenset(
         # engine adapter additionally constrains the allowed values at startup
         # to the set of entropy sources it has pre-initialised.
         "entropy_source_type",
+        # Timing-only switch (does not affect the sampled distribution):
+        # per-request override lets an operator A/B the pipelined vs serial
+        # fetch latency on a live deployment.
+        "entropy_prefetch",
         # HVH-Drift hyperparameters (V6_HVD_R01_01 winner from createmp-evalsuite).
         "hvh_t_base",
         "hvh_alpha_h",
@@ -148,6 +152,22 @@ class QRSamplerConfig(BaseSettings):
     entropy_source_type: str = Field(
         default="system",
         description="Primary entropy source identifier",
+    )
+
+    entropy_prefetch: bool = Field(
+        default=True,
+        description=(
+            "Pipeline the per-token entropy fetch (commit-then-fetch): the "
+            "gRPC request for token N+1 is fired the instant token N is "
+            "selected, so the network round trip overlaps the engine's next "
+            "forward pass instead of serializing behind it. The causal "
+            "contract is preserved — physical generation still happens "
+            "strictly AFTER the previous token's selection, and the request "
+            "carries a commitment nonce derived from that token (echoed by "
+            "the server via sequence_id) so the ordering is externally "
+            "verifiable. Set QR_ENTROPY_PREFETCH=0 to restore the "
+            "strictly-serial fetch-after-logits timing."
+        ),
     )
 
     # --- Circuit Breaker (NOT per-request overridable) ---

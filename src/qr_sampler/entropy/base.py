@@ -22,6 +22,21 @@ class EntropySource(ABC):
     Implementations must provide random bytes on demand.
     The ``get_random_bytes()`` call must satisfy the just-in-time constraint:
     physical entropy generation occurs only when this method is called.
+
+    Pipelined (commit-then-fetch) extension
+    ---------------------------------------
+    ``prefetch()`` / ``get_random_bytes_with_ticket()`` let a caller *fire*
+    the fetch for the NEXT token immediately after the previous token has
+    been selected, so the network round-trip overlaps the engine's forward
+    pass instead of serializing behind it. The causal contract is preserved
+    — generation still happens strictly AFTER the previous selection event,
+    because the request itself is not sent until that selection exists (and
+    carries a commitment nonce derived from it, see
+    ``qr_sampler.core.pipeline.derive_commit_nonce``).
+
+    Both hooks have safe defaults: sources without an async transport
+    return ``None`` from ``prefetch()`` and fall through to the plain
+    synchronous fetch, so callers can treat the capability as optional.
     """
 
     @property
@@ -78,6 +93,52 @@ class EntropySource(ABC):
             np.copyto(out, values.reshape(shape))
             return out
         return values.reshape(shape)
+
+    def prefetch(self, n: int, nonce: int | None = None) -> Any | None:
+        """Begin an asynchronous fetch of *n* bytes; return an opaque ticket.
+
+        Fire-and-return: the call must NOT block on the network. The caller
+        later redeems the ticket via ``get_random_bytes_with_ticket()``.
+
+        The optional *nonce* is a 63-bit commitment value carried in the
+        request's ``sequence_id`` field. Servers that echo ``sequence_id``
+        (per the ``qr_entropy.EntropyService`` contract) thereby bind the
+        response to a request that could only have been constructed after
+        the previous token's selection — making the post-selection
+        generation ordering externally verifiable.
+
+        Default: returns ``None`` (no async transport). Implementations
+        must never raise — any failure should be swallowed and reported
+        as ``None`` so the caller degrades to the synchronous path.
+
+        Args:
+            n: Number of random bytes to fetch.
+            nonce: Optional 63-bit commitment nonce (``None``/0 = omit).
+
+        Returns:
+            An opaque ticket object with a ``cancel()`` method, or ``None``
+            when async prefetch is unsupported or currently unavailable.
+        """
+        return None
+
+    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
+        """Redeem a ``prefetch()`` ticket, or fetch synchronously.
+
+        Default implementation ignores the ticket and delegates to
+        ``get_random_bytes()`` — correct for sources whose ``prefetch()``
+        returns ``None``.
+
+        Args:
+            n: Number of random bytes expected.
+            ticket: Ticket from a prior ``prefetch()`` call, or ``None``.
+
+        Returns:
+            Exactly *n* bytes of entropy.
+
+        Raises:
+            EntropyUnavailableError: If the source cannot provide bytes.
+        """
+        return self.get_random_bytes(n)
 
     @abstractmethod
     def close(self) -> None:

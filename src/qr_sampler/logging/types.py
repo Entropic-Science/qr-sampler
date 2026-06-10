@@ -34,6 +34,21 @@ class TokenSamplingRecord:
         preset_active: Name of the active preset (env-var derived), if any.
         h_ema: Smoothed entropy EMA after the current update (HVH-Drift only).
         vh_ema: Smoothed varentropy EMA after the current update (HVH-Drift only).
+        entropy_prefetch_hit: ``True`` when this token's entropy arrived via
+            a pipelined prefetch fired at the previous token's selection
+            (round trip overlapped the forward pass); ``False`` when a
+            prefetch was attempted but redeemed via the serial fallback;
+            ``None`` when no prefetch was in play (serial mode / non-async
+            source).
+        entropy_nonce: Hex form of the 63-bit commitment nonce carried in
+            the request's ``sequence_id`` field (pipelined path only).
+            Derived from the previously selected token — see
+            ``qr_sampler.core.pipeline.derive_commit_nonce``.
+        entropy_echo_verified: ``True`` when the server echoed the nonce
+            back, cryptographically binding this entropy to a request that
+            could only exist after the previous token's selection.
+        entropy_server_timestamp_ns: Server-reported physical generation
+            timestamp (``generation_timestamp_ns``), when provided.
     """
 
     # Timing
@@ -71,3 +86,10 @@ class TokenSamplingRecord:
     preset_active: str | None = field(default=None)
     h_ema: float | None = field(default=None)
     vh_ema: float | None = field(default=None)
+
+    # Pipelined-entropy verification diagnostics. ``None`` on the serial
+    # path so existing consumers stay backward-compatible.
+    entropy_prefetch_hit: bool | None = field(default=None)
+    entropy_nonce: str | None = field(default=None)
+    entropy_echo_verified: bool | None = field(default=None)
+    entropy_server_timestamp_ns: int | None = field(default=None)

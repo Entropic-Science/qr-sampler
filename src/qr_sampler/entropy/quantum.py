@@ -14,8 +14,18 @@ allows it to connect to any gRPC entropy server (e.g. ``qr_entropy.EntropyServic
 byte count as protobuf field 1 (varint) and the response returns data as
 protobuf field 1 (length-delimited bytes).
 
-All modes satisfy the just-in-time constraint: the gRPC request is sent
-only when ``get_random_bytes()`` is called (i.e., after logits are available).
+All modes satisfy the post-selection just-in-time constraint: the gRPC
+request for token *N* is sent only after token *N-1* has been selected.
+Two request timings implement that contract:
+
+- **Serial** (``get_random_bytes()``): request fired after the next
+  token's logits are computed — the engine blocks for the full round trip.
+- **Pipelined** (``prefetch()`` + ``get_random_bytes_with_ticket()``):
+  request fired the instant the previous token is selected, so the round
+  trip overlaps the engine's forward pass. The request carries a 63-bit
+  commitment nonce (derived from the just-selected token) in the proto's
+  ``sequence_id`` field; servers that echo ``sequence_id`` make the
+  post-selection ordering externally verifiable with zero server changes.
 
 Includes an adaptive circuit breaker that tracks rolling P99 latency and
 falls back to a secondary source when the server is slow or unreachable.
@@ -58,6 +68,16 @@ logger = logging.getLogger("qr_sampler")
 _PREPROBE_TIMEOUT_S = 0.5
 _PREPROBE_BACKOFF_S = 5.0
 _PREPROBE_ENABLED_ENV_VAR = "QR_GRPC_PREPROBE_ENABLED"
+
+# Healthy-path pre-probe suppression. A successful gRPC fetch within this
+# window is strictly stronger evidence of reachability than a fresh TCP
+# connect, so the pre-probe is skipped entirely while fetches keep
+# succeeding. This removes one connect()/close() syscall pair + loopback
+# handshake from EVERY steady-state token (the pre-probe previously ran
+# unconditionally per fetch). The probe re-engages automatically once no
+# fetch has succeeded for the window — i.e. exactly when its fast-fail
+# behaviour is actually useful.
+_PREPROBE_HEALTHY_WINDOW_S = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -104,23 +124,86 @@ def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
     return result, offset
 
 
-def _encode_varint_request(n: int) -> bytes:
-    """Encode a generic protobuf request with field 1 = varint *n*.
+def _encode_varint_request(n: int, sequence_id: int = 0) -> bytes:
+    """Encode a generic protobuf request: field 1 = varint *n*, field 2 = seq.
 
     This produces valid protobuf wire bytes for any message where the
     byte count is field 1 (varint), e.g. both ``EntropyRequest(bytes_needed=n)``
-    and ``RandomRequest(num_bytes=n)``.
+    and ``RandomRequest(num_bytes=n)``. When *sequence_id* is non-zero it is
+    appended as field 2 (varint) — matching ``EntropyRequest.sequence_id``.
+    The pipelined fetch path uses this field as a commitment nonce derived
+    from the previously selected token; per proto3 semantics a zero value
+    is omitted, so legacy serial fetches produce byte-identical requests
+    to the previous encoder.
 
     Args:
         n: Number of bytes to request (encoded as field 1, wire type 0).
+        sequence_id: Optional non-zero correlation/commitment nonce
+            (encoded as field 2, wire type 0).
 
     Returns:
         Serialized protobuf bytes.
     """
-    if n == 0:
-        return b""
-    # Tag: field 1, wire type 0 (varint) = (1 << 3) | 0 = 0x08
-    return b"\x08" + _encode_varint(n)
+    out = b""
+    if n != 0:
+        # Tag: field 1, wire type 0 (varint) = (1 << 3) | 0 = 0x08
+        out += b"\x08" + _encode_varint(n)
+    if sequence_id:
+        # Tag: field 2, wire type 0 (varint) = (2 << 3) | 0 = 0x10
+        out += b"\x10" + _encode_varint(sequence_id)
+    return out
+
+
+def _decode_entropy_response(data: bytes) -> tuple[bytes, int, int]:
+    """Decode a generic entropy response into (payload, sequence_id, gen_ts).
+
+    Scans protobuf wire-format bytes for field 1 (length-delimited data
+    payload), field 2 (varint ``sequence_id`` echo), and field 3 (varint
+    ``generation_timestamp_ns``). Unknown fields are skipped. Absent
+    varint fields decode as 0 — proto3 default semantics, so servers that
+    do not echo ``sequence_id`` simply yield ``(payload, 0, 0)``.
+
+    Args:
+        data: Raw protobuf wire-format bytes.
+
+    Returns:
+        Tuple of (payload_bytes, sequence_id, generation_timestamp_ns).
+
+    Raises:
+        EntropyUnavailableError: If field 1 is not found or the wire
+            format is invalid.
+    """
+    payload: bytes | None = None
+    sequence_id = 0
+    generation_ts = 0
+    offset = 0
+    while offset < len(data):
+        tag, offset = _decode_varint(data, offset)
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:
+            value, offset = _decode_varint(data, offset)
+            if field_number == 2:
+                sequence_id = value
+            elif field_number == 3:
+                generation_ts = value
+        elif wire_type == 2:
+            length, offset = _decode_varint(data, offset)
+            chunk = data[offset : offset + length]
+            offset += length
+            if field_number == 1 and payload is None:
+                payload = chunk
+        elif wire_type == 5:
+            offset += 4  # 32-bit fixed
+        elif wire_type == 1:
+            offset += 8  # 64-bit fixed
+        else:
+            break
+    if payload is None:
+        raise EntropyUnavailableError(
+            "Failed to decode gRPC response: field 1 (bytes) not found"
+        )
+    return payload, sequence_id, generation_ts
 
 
 def _decode_bytes_field1(data: bytes) -> bytes:
@@ -142,28 +225,8 @@ def _decode_bytes_field1(data: bytes) -> bytes:
         EntropyUnavailableError: If field 1 is not found or the wire
             format is invalid.
     """
-    offset = 0
-    while offset < len(data):
-        tag, offset = _decode_varint(data, offset)
-        field_number = tag >> 3
-        wire_type = tag & 0x07
-        if wire_type == 0:
-            # Varint — consume and skip.
-            _, offset = _decode_varint(data, offset)
-        elif wire_type == 2:
-            # Length-delimited.
-            length, offset = _decode_varint(data, offset)
-            payload = data[offset : offset + length]
-            offset += length
-            if field_number == 1:
-                return payload
-        elif wire_type == 5:
-            offset += 4  # 32-bit fixed
-        elif wire_type == 1:
-            offset += 8  # 64-bit fixed
-        else:
-            break
-    raise EntropyUnavailableError("Failed to decode gRPC response: field 1 (bytes) not found")
+    payload, _, _ = _decode_entropy_response(data)
+    return payload
 
 
 def _generic_request_serializer(request: bytes) -> bytes:
@@ -182,6 +245,154 @@ def _generic_response_deserializer(data: bytes) -> bytes:
     receiving the raw wire-format bytes.
     """
     return data
+
+
+# ---------------------------------------------------------------------------
+# Pipelined-fetch support objects
+# ---------------------------------------------------------------------------
+
+
+class _FetchReply:
+    """Decoded result of one entropy fetch, with true call latency.
+
+    ``elapsed_ms`` is measured inside the background-loop coroutine —
+    request write to response decode — so it reflects actual network +
+    server time regardless of how long the engine later blocks waiting
+    for it (which, on the pipelined path, is ideally ~0).
+    """
+
+    __slots__ = ("elapsed_ms", "generation_timestamp_ns", "payload", "sequence_id")
+
+    def __init__(
+        self,
+        payload: bytes,
+        sequence_id: int,
+        generation_timestamp_ns: int,
+        elapsed_ms: float,
+    ) -> None:
+        self.payload = payload
+        self.sequence_id = sequence_id
+        self.generation_timestamp_ns = generation_timestamp_ns
+        self.elapsed_ms = elapsed_ms
+
+
+class PrefetchTicket:
+    """Handle for an in-flight pipelined entropy fetch.
+
+    Returned by ``QuantumGrpcSource.prefetch()`` and redeemed by
+    ``get_random_bytes_with_ticket()``. After redemption the diagnostic
+    attributes (``hit``, ``wait_ms``, ``echo_verified``,
+    ``server_timestamp_ns``) are populated so the sampling pipeline can
+    record per-token verification + overlap telemetry.
+    """
+
+    __slots__ = (
+        "echo_verified",
+        "future",
+        "hit",
+        "n",
+        "nonce",
+        "server_timestamp_ns",
+        "t_fire_monotonic",
+        "wait_ms",
+    )
+
+    def __init__(self, future: Any, nonce: int, n: int) -> None:
+        self.future = future
+        self.nonce = nonce
+        self.n = n
+        self.t_fire_monotonic = time.monotonic()
+        # Populated at redemption time.
+        self.hit: bool | None = None
+        self.wait_ms: float | None = None
+        self.echo_verified: bool | None = None
+        self.server_timestamp_ns: int | None = None
+
+    def cancel(self) -> None:
+        """Best-effort cancellation of the in-flight fetch."""
+        with contextlib.suppress(Exception):
+            self.future.cancel()
+
+
+class _BidiSession:
+    """One persistent bidirectional stream with response correlation.
+
+    All methods run on the source's background asyncio loop (single
+    thread), so no locking is needed beyond the write serializer.
+
+    A dedicated reader task drains the stream and resolves pending
+    futures. Responses are matched by ``sequence_id`` echo when the
+    server provides one; servers that do not echo (``sequence_id == 0``)
+    fall back to FIFO matching, which is sound because HTTP/2 preserves
+    per-stream ordering. This replaces the previous write-then-read
+    pattern, which interleaved incorrectly when more than one fetch was
+    in flight (a state the pipelined prefetch path makes routine).
+    """
+
+    def __init__(self, call: Any, loop: asyncio.AbstractEventLoop) -> None:
+        self._call = call
+        self._loop = loop
+        self._write_lock = asyncio.Lock()
+        # Insertion-ordered: doubles as the FIFO queue for no-echo servers.
+        self._pending: dict[int, asyncio.Future[tuple[bytes, int, int]]] = {}
+        self._fifo_counter = 0  # synthetic keys for nonce-less requests
+        self.dead = False
+        self._reader_task = loop.create_task(self._read_loop())
+
+    async def request(self, n: int, nonce: int) -> tuple[bytes, int, int]:
+        """Send one entropy request and await its correlated response."""
+        if self.dead:
+            raise EntropyUnavailableError("Bidi stream is closed")
+        key = nonce
+        if key == 0:
+            # Negative synthetic keys can never collide with real nonces
+            # (which are positive 63-bit values).
+            self._fifo_counter -= 1
+            key = self._fifo_counter
+        fut: asyncio.Future[tuple[bytes, int, int]] = self._loop.create_future()
+        self._pending[key] = fut
+        try:
+            async with self._write_lock:
+                await self._call.write(_encode_varint_request(n, nonce))
+        except Exception:
+            self._pending.pop(key, None)
+            raise
+        return await fut
+
+    async def _read_loop(self) -> None:
+        error: Exception
+        try:
+            while True:
+                raw = await self._call.read()
+                if raw is None:
+                    error = EntropyUnavailableError("Bidi stream ended unexpectedly")
+                    break
+                payload, seq, gen_ts = _decode_entropy_response(raw)
+                fut = self._pending.pop(seq, None) if seq else None
+                if fut is None and self._pending:
+                    # No echo (or unknown echo): FIFO-match oldest pending.
+                    oldest_key = next(iter(self._pending))
+                    fut = self._pending.pop(oldest_key)
+                if fut is not None and not fut.done():
+                    fut.set_result((payload, seq, gen_ts))
+                # else: response for a cancelled/unknown request — drop.
+        except Exception as exc:  # reader died — fail everything pending
+            error = exc
+        self.dead = True
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(
+                    EntropyUnavailableError(f"Bidi stream failed: {error}")
+                )
+        self._pending.clear()
+
+    def close(self) -> None:
+        """Cancel the reader task and the underlying call. Loop-thread only."""
+        self.dead = True
+        with contextlib.suppress(Exception):
+            self._reader_task.cancel()
+        with contextlib.suppress(Exception):
+            self._call.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -271,13 +482,23 @@ class QuantumGrpcSource(EntropySource):
         self._channel_init_lock = threading.Lock()
 
         # Streaming state (lazily initialized).
-        self._bidi_call: Any | None = None
+        self._bidi_session: _BidiSession | None = None
 
         # TCP pre-probe state. Tracks the monotonic timestamp of the most
         # recent failed pre-probe so we can short-circuit subsequent calls
         # within the backoff window without re-touching the socket.
         self._last_preprobe_fail_monotonic: float = 0.0
         self._preprobe_enabled: bool = os.environ.get(_PREPROBE_ENABLED_ENV_VAR, "1") != "0"
+
+        # Healthy-path bookkeeping: timestamp of the most recent successful
+        # fetch (serial or pipelined). Suppresses the per-token TCP
+        # pre-probe while the channel is demonstrably healthy.
+        self._last_success_monotonic: float = 0.0
+
+        # Pipelined-fetch telemetry (exposed via health_check()).
+        self._prefetch_fired: int = 0
+        self._prefetch_hits: int = 0
+        self._prefetch_misses: int = 0
 
     def _run_loop(self) -> None:
         """Run the asyncio event loop in a background thread."""
@@ -396,6 +617,8 @@ class QuantumGrpcSource(EntropySource):
             self._channel_initialized = False
             self._loop = None
             self._thread = None
+            # Any bidi session is bound to the torn-down loop + call.
+            self._bidi_session = None
 
     async def _init_channel(self) -> None:
         """Create the gRPC async channel and generic method handles."""
@@ -502,12 +725,11 @@ class QuantumGrpcSource(EntropySource):
         last_error: Exception | None = None
         for attempt in range(1 + self._retry_count):
             try:
-                t0 = time.perf_counter()
-                data = self._fetch_sync(n)
-                elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                self._update_latency(elapsed_ms)
+                reply = self._fetch_sync(n)
+                self._update_latency(reply.elapsed_ms)
                 self._consecutive_failures = 0
-                return data
+                self._last_success_monotonic = time.monotonic()
+                return reply.payload
             except Exception as exc:
                 last_error = exc
                 logger.warning(
@@ -545,7 +767,85 @@ class QuantumGrpcSource(EntropySource):
             f"gRPC entropy fetch failed after {1 + self._retry_count} attempts: {last_error}"
         ) from last_error
 
-    def _fetch_sync(self, n: int) -> bytes:
+    def prefetch(self, n: int, nonce: int | None = None) -> PrefetchTicket | None:
+        """Fire an asynchronous entropy fetch; return a redeemable ticket.
+
+        Called by the sampling pipeline the instant the previous token is
+        selected, so the gRPC round trip overlaps the engine's next
+        forward pass. The *nonce* (a 63-bit commitment derived from the
+        just-selected token) rides in the request's ``sequence_id`` field;
+        the server's echo binds the response to a request that could only
+        exist after that selection — the post-selection ordering is
+        thereby verifiable from the response stream alone.
+
+        Never raises and never blocks on the network. Returns ``None``
+        when the source is closed, the circuit breaker is open, the
+        pre-probe backoff is active, or anything in the dispatch fails —
+        the caller then degrades to the synchronous fetch path.
+        """
+        if self._closed or self._circuit_open:
+            return None
+        if (
+            self._preprobe_enabled
+            and (time.monotonic() - self._last_preprobe_fail_monotonic)
+            < _PREPROBE_BACKOFF_S
+        ):
+            return None
+        try:
+            self._ensure_channel()
+            assert self._loop is not None
+            future = asyncio.run_coroutine_threadsafe(
+                self._fetch_async(n, nonce or 0), self._loop
+            )
+        except Exception as exc:
+            logger.debug("prefetch dispatch failed: %s", exc)
+            return None
+        self._prefetch_fired += 1
+        return PrefetchTicket(future=future, nonce=nonce or 0, n=n)
+
+    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
+        """Redeem a prefetched fetch, falling back to the serial path.
+
+        On the happy path the response is already in flight (or already
+        arrived) and the engine blocks only for the residual wait — the
+        portion of the round trip the forward pass didn't cover. On any
+        ticket failure (timeout, stream break, server error) this degrades
+        to ``get_random_bytes()``, which carries the full retry, pre-probe
+        and circuit-breaker machinery — so the pipelined path is never
+        less robust than the serial one.
+        """
+        if ticket is None:
+            return self.get_random_bytes(n)
+        if self._closed:
+            ticket.cancel()
+            raise EntropyUnavailableError("QuantumGrpcSource is closed")
+
+        timeout_s = self._get_timeout() / 1000.0
+        t0 = time.perf_counter()
+        already_done = ticket.future.done()
+        try:
+            reply: _FetchReply = ticket.future.result(timeout=timeout_s)
+        except Exception as exc:
+            ticket.cancel()
+            ticket.hit = False
+            self._prefetch_misses += 1
+            logger.debug(
+                "prefetch redeem failed (%s); falling back to serial fetch", exc
+            )
+            return self.get_random_bytes(n)
+
+        # Success bookkeeping mirrors the serial path.
+        ticket.hit = True
+        ticket.wait_ms = 0.0 if already_done else (time.perf_counter() - t0) * 1000.0
+        ticket.echo_verified = bool(ticket.nonce) and reply.sequence_id == ticket.nonce
+        ticket.server_timestamp_ns = reply.generation_timestamp_ns or None
+        self._prefetch_hits += 1
+        self._update_latency(reply.elapsed_ms)
+        self._consecutive_failures = 0
+        self._last_success_monotonic = time.monotonic()
+        return reply.payload
+
+    def _fetch_sync(self, n: int) -> _FetchReply:
         """Dispatch an async fetch to the background loop and block.
 
         Fronts the dispatch with a bounded-time TCP-connect pre-probe so
@@ -619,6 +919,16 @@ class QuantumGrpcSource(EntropySource):
             return
 
         now = time.monotonic()
+
+        # Healthy-path suppression: a fetch succeeded recently, so the
+        # endpoint is reachable by construction — skip the probe and its
+        # per-token connect()/close() syscall pair entirely.
+        if (
+            self._last_success_monotonic
+            and (now - self._last_success_monotonic) < _PREPROBE_HEALTHY_WINDOW_S
+        ):
+            return
+
         if (now - self._last_preprobe_fail_monotonic) < _PREPROBE_BACKOFF_S:
             raise EntropyUnavailableError(
                 "QRNG host unreachable (TCP pre-probe failed within last "
@@ -655,35 +965,45 @@ class QuantumGrpcSource(EntropySource):
                 f"QRNG host {host}:{port} unreachable: {type(exc).__name__}: {exc}"
             ) from exc
 
-    async def _fetch_async(self, n: int) -> bytes:
-        """Route to the appropriate transport mode."""
+    async def _fetch_async(self, n: int, nonce: int = 0) -> _FetchReply:
+        """Route to the appropriate transport mode; measure true call time.
+
+        Elapsed time is captured here, on the background loop, so it
+        reflects network + server latency for the call itself — not how
+        long a (possibly much later) redeemer blocked waiting for it.
+        """
+        t0 = time.perf_counter()
         if self._mode == "unary":
-            return await self._fetch_unary(n)
+            payload, seq, gen_ts = await self._fetch_unary(n, nonce)
         elif self._mode == "server_streaming":
-            return await self._fetch_server_streaming(n)
+            payload, seq, gen_ts = await self._fetch_server_streaming(n, nonce)
         elif self._mode == "bidi_streaming":
-            return await self._fetch_bidi_streaming(n)
+            payload, seq, gen_ts = await self._fetch_bidi_streaming(n, nonce)
         else:
             raise EntropyUnavailableError(f"Unknown gRPC mode: {self._mode!r}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return _FetchReply(payload, seq, gen_ts, elapsed_ms)
 
-    async def _fetch_unary(self, n: int) -> bytes:
+    async def _fetch_unary(self, n: int, nonce: int = 0) -> tuple[bytes, int, int]:
         """Single request-response per call. Simplest. Higher overhead."""
-        request_bytes = _encode_varint_request(n)
+        request_bytes = _encode_varint_request(n, nonce)
         timeout_s = self._get_timeout() / 1000.0
         raw_response: bytes = await self._unary_method(
             request_bytes,
             timeout=timeout_s,
             metadata=self._metadata or None,
         )
-        return _decode_bytes_field1(raw_response)
+        return _decode_entropy_response(raw_response)
 
-    async def _fetch_server_streaming(self, n: int) -> bytes:
+    async def _fetch_server_streaming(
+        self, n: int, nonce: int = 0
+    ) -> tuple[bytes, int, int]:
         """Use the streaming RPC in a request/response style.
 
         Sends one request and reads one response from the stream.
         The stream is re-established on each call for server-streaming semantics.
         """
-        request_bytes = _encode_varint_request(n)
+        request_bytes = _encode_varint_request(n, nonce)
 
         async def request_iterator() -> Any:
             yield request_bytes
@@ -695,36 +1015,36 @@ class QuantumGrpcSource(EntropySource):
         if raw_response is None:
             raise EntropyUnavailableError("Server stream ended unexpectedly")
         call.cancel()
-        return _decode_bytes_field1(raw_response)
+        return _decode_entropy_response(raw_response)
 
-    async def _fetch_bidi_streaming(self, n: int) -> bytes:
-        """Use a persistent bidirectional stream for lowest latency.
+    async def _fetch_bidi_streaming(
+        self, n: int, nonce: int = 0
+    ) -> tuple[bytes, int, int]:
+        """Fetch over one persistent, correlation-safe bidirectional stream.
 
-        The stream is lazily initialized on first call and reused thereafter.
-        If the stream breaks, it is re-established on the next call.
+        The ``_BidiSession`` is lazily created on first call and reused;
+        its reader task matches responses to requests by ``sequence_id``
+        echo (FIFO for servers that don't echo), which makes concurrent
+        in-flight fetches — routine on the pipelined prefetch path — safe.
+        If the stream breaks, the session is discarded and re-established
+        on the next call.
         """
-        request_bytes = _encode_varint_request(n)
-
         try:
-            if self._bidi_call is None:
+            session = self._bidi_session
+            if session is None or session.dead:
                 if self._stream_method is None:  # pragma: no cover — validated in __init__
                     raise EntropyUnavailableError("Stream method not initialized")
-                self._bidi_call = self._stream_method(
-                    metadata=self._metadata or None,
-                )
-
-            await self._bidi_call.write(request_bytes)
-            raw_response: bytes | None = await self._bidi_call.read()
-            if raw_response is None:
-                # Stream ended — reset and retry.
-                self._bidi_call = None
-                raise EntropyUnavailableError("Bidi stream ended unexpectedly")
-            return _decode_bytes_field1(raw_response)
+                call = self._stream_method(metadata=self._metadata or None)
+                assert self._loop is not None  # running on the loop already
+                session = _BidiSession(call, self._loop)
+                self._bidi_session = session
+            return await session.request(n, nonce)
         except EntropyUnavailableError:
+            self._bidi_session = None
             raise
         except Exception:
             # Stream broken — reset for next call.
-            self._bidi_call = None
+            self._bidi_session = None
             raise
 
     # --- Circuit breaker ---
@@ -774,9 +1094,9 @@ class QuantumGrpcSource(EntropySource):
         assert loop is not None and thread is not None  # _ensure_channel set both
 
         async def _shutdown() -> None:
-            if self._bidi_call is not None:
-                self._bidi_call.cancel()
-                self._bidi_call = None
+            if self._bidi_session is not None:
+                self._bidi_session.close()
+                self._bidi_session = None
             await self._channel.close()
 
         try:
@@ -809,4 +1129,7 @@ class QuantumGrpcSource(EntropySource):
             "p99_ms": round(self._p99_ms, 2),
             "consecutive_failures": self._consecutive_failures,
             "latency_samples": len(self._latency_window),
+            "prefetch_fired": self._prefetch_fired,
+            "prefetch_hits": self._prefetch_hits,
+            "prefetch_misses": self._prefetch_misses,
         }

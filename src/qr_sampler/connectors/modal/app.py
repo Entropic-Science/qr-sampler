@@ -160,7 +160,11 @@ MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tig
 PRISMAQUANT_MODEL_HF_REPO_ID = "rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm"
 PRISMAQUANT_MODEL_SERVED_NAME = "qwen3.6-27b-prismaquant"
 PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a719"
-PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-18-002-prismaquant-b200"
+# iter-54: bumped for the commit-then-fetch entropy pipelining — the
+# prefetch ticket machinery lives in the snapshotted EngineCore process
+# (logits processor + QuantumGrpcSource), so the prior snapshot must be
+# re-materialised rather than restored over the new code.
+PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-54-001-prefetch-pipeline"
 PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at

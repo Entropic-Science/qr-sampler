@@ -10,8 +10,10 @@ import pytest
 
 from qr_sampler.entropy.quantum import (
     _decode_bytes_field1,
+    _decode_entropy_response,
     _encode_varint,
     _encode_varint_request,
+    _FetchReply,
 )
 from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
 
@@ -299,7 +301,7 @@ class TestQuantumGrpcSourceCircuitBreaker:
         source._circuit_open_until = time.monotonic() - 1.0
 
         source._reset_channel = lambda: None
-        source._fetch_sync = lambda n: b"\x00" * n
+        source._fetch_sync = lambda n: _FetchReply(b"\x00" * n, 0, 0, 1.0)
         assert source.get_random_bytes(10) == b"\x00" * 10
         assert source._circuit_open is False
         assert source._consecutive_failures == 0
@@ -585,6 +587,87 @@ class TestQuantumGrpcSourceServerStreaming:
 # ---------------------------------------------------------------------------
 
 
+class _FakeBidiCall:
+    """Write-driven fake bidi call.
+
+    Each ``write()`` enqueues one response; ``read()`` blocks until a
+    response is available. This models real stream semantics (the
+    ``_BidiSession`` reader task must block between responses, not spin)
+    in a way ``AsyncMock(return_value=...)`` cannot.
+    """
+
+    def __init__(self, payload: bytes | None, echo_sequence: bool = True) -> None:
+        import asyncio
+
+        self._payload = payload
+        self._echo_sequence = echo_sequence
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.write_count = 0
+        self.cancelled = False
+
+    async def write(self, request: bytes) -> None:
+        self.write_count += 1
+        if self._payload is None:
+            await self._queue.put(None)  # stream end
+            return
+        response = _encode_mock_response(self._payload)
+        if self._echo_sequence:
+            # Echo the request's field-2 sequence_id, if present (the
+            # response decoder can't parse requests — field 1 is a varint
+            # there — so a minimal request parser does it).
+            seq = _extract_request_sequence(request)
+            if seq:
+                response += b"\x10" + _encode_varint(seq)
+        await self._queue.put(response)
+
+    async def read(self) -> bytes | None:
+        return await self._queue.get()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def _extract_request_sequence(request: bytes) -> int:
+    """Parse field 2 (varint) from a generic entropy request."""
+    offset = 0
+    while offset < len(request):
+        tag = request[offset]
+        offset += 1
+        field_number = tag >> 3
+        value = 0
+        shift = 0
+        while True:
+            b = request[offset]
+            value |= (b & 0x7F) << shift
+            offset += 1
+            if not (b & 0x80):
+                break
+            shift += 7
+        if field_number == 2:
+            return value
+    return 0
+
+
+def _make_bidi_source(payload: bytes | None, **config_overrides: Any) -> tuple[Any, Any]:
+    """Build a bidi-mode source whose stream is a ``_FakeBidiCall``."""
+    config = _make_config(grpc_mode="bidi_streaming", **config_overrides)
+
+    with patch("grpc.aio.insecure_channel") as mock_channel_fn:
+        mock_channel = MagicMock()
+        mock_channel_fn.return_value = mock_channel
+        mock_channel.unary_unary = MagicMock(return_value=MagicMock())
+
+        fake_call = _FakeBidiCall(payload)
+        mock_stream_handle = MagicMock(return_value=fake_call)
+        mock_channel.stream_stream = MagicMock(return_value=mock_stream_handle)
+
+        from qr_sampler.entropy.quantum import QuantumGrpcSource
+
+        source = QuantumGrpcSource(config)
+        source._ensure_channel()
+        return source, mock_stream_handle
+
+
 class TestQuantumGrpcSourceBidiStreaming:
     """Tests for bidi_streaming transport mode."""
 
@@ -596,28 +679,10 @@ class TestQuantumGrpcSourceBidiStreaming:
         except ImportError:
             pytest.skip("grpcio not installed")
 
-        config = _make_config(grpc_mode="bidi_streaming")
-
-        with patch("grpc.aio.insecure_channel") as mock_channel_fn:
-            mock_channel = MagicMock()
-            mock_channel_fn.return_value = mock_channel
-            mock_channel.unary_unary = MagicMock(return_value=MagicMock())
-
-            # Mock channel.stream_stream() -> returns a callable that produces
-            # a bidi call object with .write() and .read().
-            mock_bidi_call = AsyncMock()
-            mock_bidi_call.write = AsyncMock()
-            mock_bidi_call.read = AsyncMock(return_value=_encode_mock_response(b"\xcc" * 64))
-            mock_stream_handle = MagicMock(return_value=mock_bidi_call)
-            mock_channel.stream_stream = MagicMock(return_value=mock_stream_handle)
-
-            from qr_sampler.entropy.quantum import QuantumGrpcSource
-
-            source = QuantumGrpcSource(config)
-            source._ensure_channel()
-            source._mock_stream_handle = mock_stream_handle  # type: ignore[attr-defined]
-            yield source
-            source.close()
+        source, mock_stream_handle = _make_bidi_source(b"\xcc" * 64)
+        source._mock_stream_handle = mock_stream_handle  # type: ignore[attr-defined]
+        yield source
+        source.close()
 
     def test_fetch_returns_correct_bytes(self, source: Any) -> None:
         """Bidi streaming should return data from the persistent stream."""
@@ -630,37 +695,240 @@ class TestQuantumGrpcSourceBidiStreaming:
         source.get_random_bytes(64)
         source.get_random_bytes(64)
         # The stream_method (from channel.stream_stream) should only be called
-        # once (the bidi call is reused).
+        # once (the bidi session is reused).
         assert source._mock_stream_handle.call_count == 1
 
+    def test_concurrent_prefetches_correlate_by_nonce(self, source: Any) -> None:
+        """Two in-flight prefetches must each get their own response."""
+        t1 = source.prefetch(64, nonce=1111)
+        t2 = source.prefetch(64, nonce=2222)
+        assert t1 is not None and t2 is not None
+        # Redeem out of order: correlation must not mix them up.
+        data2 = source.get_random_bytes_with_ticket(64, t2)
+        data1 = source.get_random_bytes_with_ticket(64, t1)
+        assert data1 == b"\xcc" * 64
+        assert data2 == b"\xcc" * 64
+        assert t1.echo_verified is True
+        assert t2.echo_verified is True
+
     def test_bidi_stream_end_resets(self) -> None:
-        """If bidi stream ends (read returns None), call should reset."""
+        """If bidi stream ends (read returns None), the session resets."""
         try:
             import grpc.aio  # noqa: F401
         except ImportError:
             pytest.skip("grpcio not installed")
 
-        config = _make_config(grpc_mode="bidi_streaming", grpc_retry_count=0)
+        source, _ = _make_bidi_source(None, grpc_retry_count=0)
+        try:
+            with pytest.raises(EntropyUnavailableError):
+                source.get_random_bytes(10)
+            # The bidi session should have been reset to None.
+            assert source._bidi_session is None
+        finally:
+            source.close()
 
+
+# ---------------------------------------------------------------------------
+# Commitment-nonce wire format tests
+# ---------------------------------------------------------------------------
+
+
+class TestCommitmentNonceWireFormat:
+    """Tests for sequence_id (field 2) encoding and response decoding."""
+
+    def test_encode_with_sequence_id(self) -> None:
+        """Non-zero sequence_id appends field 2 (varint)."""
+        wire = _encode_varint_request(100, sequence_id=42)
+        assert wire == b"\x08\x64\x10\x2a"
+
+    def test_encode_zero_sequence_id_is_byte_identical_to_legacy(self) -> None:
+        """Zero nonce must produce the exact legacy request bytes."""
+        assert _encode_varint_request(100) == b"\x08\x64"
+        assert _encode_varint_request(100, sequence_id=0) == b"\x08\x64"
+
+    def test_encode_roundtrips_through_message_class(self) -> None:
+        """Generic encoder with nonce must match EntropyRequest serialization."""
+        from qr_sampler.proto.entropy_service_pb2 import EntropyRequest
+
+        for n, seq in ((256, 1), (10000, 2**62), (64, 0x7FFFFFFFFFFFFFFF)):
+            wire = _encode_varint_request(n, sequence_id=seq)
+            msg = EntropyRequest.FromString(wire)
+            assert msg.bytes_needed == n
+            assert msg.sequence_id == seq
+
+    def test_decode_response_extracts_all_fields(self) -> None:
+        """Decoder returns (payload, sequence_id echo, generation_ts)."""
+        from qr_sampler.proto.entropy_service_pb2 import EntropyResponse
+
+        msg = EntropyResponse(
+            data=b"\xab" * 8,
+            sequence_id=777,
+            generation_timestamp_ns=123456789,
+        )
+        payload, seq, gen_ts = _decode_entropy_response(msg.SerializeToString())
+        assert payload == b"\xab" * 8
+        assert seq == 777
+        assert gen_ts == 123456789
+
+    def test_decode_response_defaults_absent_fields_to_zero(self) -> None:
+        """Servers that don't echo sequence_id yield (payload, 0, 0)."""
+        payload, seq, gen_ts = _decode_entropy_response(
+            _encode_mock_response(b"\x01\x02")
+        )
+        assert payload == b"\x01\x02"
+        assert seq == 0
+        assert gen_ts == 0
+
+
+# ---------------------------------------------------------------------------
+# Pipelined prefetch tests (unary transport)
+# ---------------------------------------------------------------------------
+
+
+def _encode_mock_response_with_echo(data: bytes, sequence_id: int) -> bytes:
+    """Mock response with field 1 payload + field 2 sequence echo."""
+    return _encode_mock_response(data) + b"\x10" + _encode_varint(sequence_id)
+
+
+class TestQuantumGrpcSourcePrefetch:
+    """Tests for the commit-then-fetch prefetch/redeem path."""
+
+    def _make_source(self, unary_handle: Any) -> Any:
+        try:
+            import grpc.aio  # noqa: F401
+        except ImportError:
+            pytest.skip("grpcio not installed")
+
+        config = _make_config(grpc_mode="unary", grpc_retry_count=0)
         with patch("grpc.aio.insecure_channel") as mock_channel_fn:
             mock_channel = MagicMock()
             mock_channel_fn.return_value = mock_channel
-            mock_channel.unary_unary = MagicMock(return_value=MagicMock())
-
-            mock_bidi_call = AsyncMock()
-            mock_bidi_call.write = AsyncMock()
-            mock_bidi_call.read = AsyncMock(return_value=None)
-            mock_stream_handle = MagicMock(return_value=mock_bidi_call)
-            mock_channel.stream_stream = MagicMock(return_value=mock_stream_handle)
+            mock_channel.unary_unary = MagicMock(return_value=unary_handle)
+            mock_channel.stream_stream = MagicMock(return_value=MagicMock())
 
             from qr_sampler.entropy.quantum import QuantumGrpcSource
 
             source = QuantumGrpcSource(config)
+            source._ensure_channel()
+            return source
+
+    def test_prefetch_and_redeem_with_echo(self) -> None:
+        """Happy path: ticket redeems to payload, echo verifies the nonce."""
+        nonce = 987654321
+
+        async def echoing_handle(request: bytes, **kwargs: Any) -> bytes:
+            seq = _extract_request_sequence(request)
+            return _encode_mock_response_with_echo(b"\x55" * 32, seq)
+
+        source = self._make_source(echoing_handle)
+        try:
+            ticket = source.prefetch(32, nonce=nonce)
+            assert ticket is not None
+            data = source.get_random_bytes_with_ticket(32, ticket)
+            assert data == b"\x55" * 32
+            assert ticket.hit is True
+            assert ticket.echo_verified is True
+            assert source._prefetch_hits == 1
+            health = source.health_check()
+            assert health["prefetch_fired"] == 1
+        finally:
+            source.close()
+
+    def test_prefetch_without_echo_is_unverified_but_served(self) -> None:
+        """A server that doesn't echo still serves bytes; echo flag False."""
+        handle = AsyncMock(return_value=_encode_mock_response(b"\x66" * 16))
+        source = self._make_source(handle)
+        try:
+            ticket = source.prefetch(16, nonce=12345)
+            data = source.get_random_bytes_with_ticket(16, ticket)
+            assert data == b"\x66" * 16
+            assert ticket.echo_verified is False
+        finally:
+            source.close()
+
+    def test_failed_prefetch_falls_back_to_serial_fetch(self) -> None:
+        """A broken in-flight fetch degrades to the synchronous path."""
+        calls: list[str] = []
+
+        async def flaky_handle(request: bytes, **kwargs: Any) -> bytes:
+            if not calls:
+                calls.append("prefetch")
+                raise RuntimeError("stream reset mid-flight")
+            calls.append("serial")
+            return _encode_mock_response(b"\x77" * 8)
+
+        source = self._make_source(flaky_handle)
+        try:
+            ticket = source.prefetch(8, nonce=1)
+            assert ticket is not None
+            data = source.get_random_bytes_with_ticket(8, ticket)
+            assert data == b"\x77" * 8
+            assert ticket.hit is False
+            assert calls == ["prefetch", "serial"]
+            assert source._prefetch_misses == 1
+        finally:
+            source.close()
+
+    def test_prefetch_returns_none_when_circuit_open(self) -> None:
+        """No speculative dispatch while the breaker is open."""
+        handle = AsyncMock(return_value=_encode_mock_response(b"\x00" * 8))
+        source = self._make_source(handle)
+        try:
+            source._circuit_open = True
+            source._circuit_open_until = time.monotonic() + 100.0
+            assert source.prefetch(8, nonce=1) is None
+        finally:
+            source.close()
+
+    def test_redeem_none_ticket_uses_serial_path(self) -> None:
+        """A None ticket is exactly get_random_bytes()."""
+        handle = AsyncMock(return_value=_encode_mock_response(b"\x11" * 4))
+        source = self._make_source(handle)
+        try:
+            assert source.get_random_bytes_with_ticket(4, None) == b"\x11" * 4
+        finally:
+            source.close()
+
+
+class TestPreprobeHealthySuppression:
+    """A recent successful fetch suppresses the per-token TCP pre-probe."""
+
+    def test_preprobe_skipped_within_healthy_window(self, monkeypatch: Any) -> None:
+        try:
+            import grpc.aio  # noqa: F401
+        except ImportError:
+            pytest.skip("grpcio not installed")
+
+        # Re-enable the pre-probe (module autouse fixture disables it).
+        monkeypatch.setenv("QR_GRPC_PREPROBE_ENABLED", "1")
+
+        handle = AsyncMock(return_value=_encode_mock_response(b"\x22" * 4))
+        config = _make_config(grpc_mode="unary")
+        with patch("grpc.aio.insecure_channel") as mock_channel_fn:
+            mock_channel = MagicMock()
+            mock_channel_fn.return_value = mock_channel
+            mock_channel.unary_unary = MagicMock(return_value=handle)
+            mock_channel.stream_stream = MagicMock(return_value=MagicMock())
+
+            from qr_sampler.entropy.quantum import QuantumGrpcSource
+
+            source = QuantumGrpcSource(config)
+            source._ensure_channel()
             try:
-                with pytest.raises(EntropyUnavailableError):
-                    source.get_random_bytes(10)
-                # The bidi call should have been reset to None.
-                assert source._bidi_call is None
+                probes: list[None] = []
+
+                def counting_connect(*args: Any, **kwargs: Any) -> Any:
+                    probes.append(None)
+                    return MagicMock()
+
+                monkeypatch.setattr(
+                    "socket.create_connection", counting_connect
+                )
+                source.get_random_bytes(4)  # first fetch: probe runs
+                assert len(probes) == 1
+                source.get_random_bytes(4)  # healthy: probe suppressed
+                source.get_random_bytes(4)
+                assert len(probes) == 1
             finally:
                 source.close()
 

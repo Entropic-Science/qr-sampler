@@ -147,8 +147,39 @@ class FallbackEntropySource(EntropySource):
         Raises:
             EntropyUnavailableError: If **both** primary and fallback fail.
         """
+        return self._fetch_via(n, lambda: self._primary.get_random_bytes(n))
+
+    def prefetch(self, n: int, nonce: int | None = None) -> Any | None:
+        """Delegate prefetch to the primary source.
+
+        Never raises: a primary without async support (or one that fails
+        to dispatch) yields ``None``, and the redeem path then takes the
+        ordinary synchronous fetch-with-fallback route.
+        """
         try:
-            data = self._primary.get_random_bytes(n)
+            return self._primary.prefetch(n, nonce)
+        except Exception:
+            return None
+
+    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
+        """Redeem a prefetch ticket with identical failover semantics.
+
+        The primary's redeem already degrades internally (failed ticket →
+        primary serial retry); only when the primary is *truly* unavailable
+        does ``EntropyUnavailableError`` surface here and engage the
+        fallback source — with exactly the same degradation telemetry,
+        status-file writes, and recovery transitions as the serial path.
+        """
+        if ticket is None:
+            return self.get_random_bytes(n)
+        return self._fetch_via(
+            n, lambda: self._primary.get_random_bytes_with_ticket(n, ticket)
+        )
+
+    def _fetch_via(self, n: int, fetch_fn: Any) -> bytes:
+        """Shared primary-then-fallback flow for serial and ticket fetches."""
+        try:
+            data = fetch_fn()
             recovered = self._currently_degraded
             if recovered:
                 # Transition back to primary — emit a single all-clear event.

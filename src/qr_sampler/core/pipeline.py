@@ -24,7 +24,7 @@ import numpy as np
 
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig
-from qr_sampler.core.types import SamplingResult
+from qr_sampler.core.types import PrefetchContext, SamplingResult
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.entropy.registry import EntropySourceRegistry
 from qr_sampler.logging.logger import SamplingLogger
@@ -38,6 +38,37 @@ if TYPE_CHECKING:
     from qr_sampler.temperature.base import TemperatureStrategy
 
 logger = logging.getLogger("qr_sampler")
+
+
+def derive_commit_nonce(salt: bytes, step: int, prev_token_id: int) -> int:
+    """Derive the 63-bit commitment nonce for one pipelined entropy fetch.
+
+    The nonce for fetch *step* commits to the token selected at
+    ``step - 1``: ``SHA-256(salt || step || prev_token_id)`` truncated to
+    63 bits (never 0, since 0 means "no nonce" on the wire). Because the
+    request carrying this nonce cannot be constructed before
+    ``prev_token_id`` exists, a server that echoes the nonce back proves
+    its entropy was generated strictly AFTER the previous token's
+    selection — an auditor holding the per-token records (salt, step,
+    token ids, nonces, echoes) can re-derive and verify the whole chain.
+
+    Args:
+        salt: Per-request random salt (from the engine adapter).
+        step: 0-based index of the token this fetch will be used for.
+        prev_token_id: Token selected at ``step - 1``; ``-1`` sentinel for
+            the first fetch of a request (no previous token — the request
+            itself post-dates prompt commitment).
+
+    Returns:
+        A non-zero 63-bit integer nonce.
+    """
+    digest = hashlib.sha256(
+        salt
+        + step.to_bytes(8, "little", signed=False)
+        + prev_token_id.to_bytes(8, "little", signed=True)
+    ).digest()
+    nonce = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+    return nonce or 1
 
 
 def config_hash(config: QRSamplerConfig) -> str:
@@ -214,11 +245,13 @@ class SamplingPipeline:
         amplifier: SignalAmplifier | None = None,
         strategy: TemperatureStrategy | None = None,
         config_hash_str: str | None = None,
+        prefetch_ctx: PrefetchContext | None = None,
+        build_onehot: bool = True,
     ) -> SamplingResult:
         """Sample a single token from a 1-D logit array.
 
         Runs the full pipeline: temperature -> entropy -> amplify -> select
-        -> one-hot numpy -> diagnostic record -> log.
+        -> fire next prefetch -> one-hot numpy -> diagnostic record -> log.
 
         Args:
             logits: 1-D numpy array of shape ``(vocab_size,)``.
@@ -226,10 +259,21 @@ class SamplingPipeline:
             amplifier: Per-request amplifier override (``None`` = use default).
             strategy: Per-request strategy override (``None`` = use default).
             config_hash_str: Pre-computed hash (``None`` = compute from config).
+            prefetch_ctx: Per-request pipelined-entropy context. When its
+                ``ticket`` is set, this token's entropy was already fired
+                at the previous token's selection and is redeemed here
+                (blocking only for the residual wait). After selection a
+                new prefetch is fired for the NEXT token and returned via
+                ``SamplingResult.next_ticket``. ``None`` = fully serial.
+            build_onehot: When ``False``, skip building the numpy one-hot
+                array (``SamplingResult.one_hot`` is ``None``). Engine
+                adapters that write the one-hot directly into their own
+                tensors pass ``False`` to avoid a vocab-size allocation +
+                fill per token.
 
         Returns:
-            SamplingResult with ``token_id``, ``one_hot`` numpy array,
-            and ``record`` for diagnostics.
+            SamplingResult with ``token_id``, optional ``one_hot`` numpy
+            array, ``record`` for diagnostics, and ``next_ticket``.
         """
         t_start_ns = time.perf_counter_ns()
 
@@ -246,12 +290,18 @@ class SamplingPipeline:
         # strategies omit the key, so fall back to the config-level default.
         min_p = float(temp_result.diagnostics.get("min_p", active_config.min_p_base))
 
-        # --- 2. Fetch entropy just-in-time ---
+        # --- 2. Collect entropy (pipelined redeem or serial just-in-time) ---
         t_fetch_start = time.perf_counter_ns()
         entropy_is_fallback = False
         entropy_source_name = self._entropy_source.name
+        ticket = prefetch_ctx.ticket if prefetch_ctx is not None else None
 
-        raw_bytes = self._entropy_source.get_random_bytes(active_config.sample_count)
+        if ticket is not None:
+            raw_bytes = self._entropy_source.get_random_bytes_with_ticket(
+                active_config.sample_count, ticket
+            )
+        else:
+            raw_bytes = self._entropy_source.get_random_bytes(active_config.sample_count)
 
         # Detect if fallback was used.
         if isinstance(self._entropy_source, FallbackEntropySource):
@@ -276,14 +326,42 @@ class SamplingPipeline:
             min_p=min_p,
         )
 
-        # --- 5. Build one-hot numpy array ---
-        vocab_size = len(logits)
-        one_hot = np.full(vocab_size, float("-inf"), dtype=np.float32)
-        one_hot[selection.token_id] = 0.0
+        # --- 5. Commit-then-fetch: fire the NEXT token's entropy NOW ---
+        # The selection event for this token just happened, so a request
+        # fired here is causally after it — and overlaps the engine's next
+        # forward pass instead of stalling it. The nonce commits to the
+        # token id selected above, making the ordering verifiable from the
+        # server's sequence_id echo.
+        next_ticket = None
+        if prefetch_ctx is not None and active_config.entropy_prefetch:
+            next_nonce = derive_commit_nonce(
+                prefetch_ctx.salt, prefetch_ctx.step + 1, selection.token_id
+            )
+            next_ticket = self._entropy_source.prefetch(
+                active_config.sample_count, next_nonce
+            )
 
-        # --- 6. Build diagnostic record ---
+        # --- 6. Build one-hot numpy array (optional) ---
+        one_hot: np.ndarray | None = None
+        if build_onehot:
+            vocab_size = len(logits)
+            one_hot = np.full(vocab_size, float("-inf"), dtype=np.float32)
+            one_hot[selection.token_id] = 0.0
+
+        # --- 7. Build diagnostic record ---
         t_end_ns = time.perf_counter_ns()
         total_sampling_ms = (t_end_ns - t_start_ns) / 1_000_000.0
+
+        # Pipelined-entropy verification diagnostics, populated by the
+        # source at redemption time (None on the serial path).
+        prefetch_hit = getattr(ticket, "hit", None) if ticket is not None else None
+        ticket_nonce = getattr(ticket, "nonce", 0) if ticket is not None else 0
+        echo_verified = (
+            getattr(ticket, "echo_verified", None) if ticket is not None else None
+        )
+        server_ts_ns = (
+            getattr(ticket, "server_timestamp_ns", None) if ticket is not None else None
+        )
 
         # Optional HVH-Drift / preset diagnostics. ``.get`` returns ``None``
         # for non-HVH strategies and pre-Step-2 selectors that omit min_p_used.
@@ -310,15 +388,20 @@ class SamplingPipeline:
             preset_active=active_config.preset,
             h_ema=temp_diag.get("h_ema"),
             vh_ema=temp_diag.get("vh_ema"),
+            entropy_prefetch_hit=prefetch_hit,
+            entropy_nonce=f"{ticket_nonce:016x}" if ticket_nonce else None,
+            entropy_echo_verified=echo_verified,
+            entropy_server_timestamp_ns=server_ts_ns,
         )
 
-        # --- 7. Log ---
+        # --- 8. Log ---
         self._sampling_logger.log_token(record)
 
         return SamplingResult(
             token_id=selection.token_id,
             one_hot=one_hot,
             record=record,
+            next_ticket=next_ticket,
         )
 
     @property

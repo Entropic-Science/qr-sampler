@@ -20,6 +20,7 @@ separate instances for different sampling strategies.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from typing import TYPE_CHECKING, Any
@@ -28,7 +29,13 @@ import numpy as np
 
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig, resolve_config, validate_extra_args
-from qr_sampler.core.pipeline import SamplingPipeline, build_pipeline, config_hash
+from qr_sampler.core.pipeline import (
+    SamplingPipeline,
+    build_pipeline,
+    config_hash,
+    derive_commit_nonce,
+)
+from qr_sampler.core.types import PrefetchContext
 from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.engines.registry import EngineAdapterRegistry
 from qr_sampler.exceptions import ConfigValidationError
@@ -90,6 +97,12 @@ class _RequestState:
             actual source used; if a future change switches sources
             mid-request, this becomes the routing-time hint and the
             completion event should record the observed dominant.
+        prefetch_salt: Per-request random salt for commitment-nonce
+            derivation (commit-then-fetch entropy pipelining).
+        entropy_ticket: In-flight prefetch ticket for this request's next
+            token, or ``None``. Fired at the previous token's selection
+            (or at request-add time for the first token, which overlaps
+            the entire prefill) and redeemed on the next ``apply()``.
     """
 
     __slots__ = (
@@ -97,7 +110,9 @@ class _RequestState:
         "config",
         "config_hash_str",
         "dominant_source_name",
+        "entropy_ticket",
         "pipeline",
+        "prefetch_salt",
         "source",
         "strategy",
         "tokens_generated",
@@ -119,6 +134,8 @@ class _RequestState:
         self.source = pipeline.entropy_source
         self.tokens_generated = 0
         self.dominant_source_name = pipeline.entropy_source.name
+        self.prefetch_salt = os.urandom(16)
+        self.entropy_ticket: Any | None = None
 
 
 @EngineAdapterRegistry.register("vllm")
@@ -404,6 +421,13 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             if req_idx is not None:
                 state = self._request_states.pop(req_idx, None)
                 if state is not None:
+                    # The speculative prefetch for the never-sampled next
+                    # token is abandoned — cancel best-effort so the
+                    # background loop drops it on arrival.
+                    if state.entropy_ticket is not None:
+                        with contextlib.suppress(Exception):
+                            state.entropy_ticket.cancel()
+                        state.entropy_ticket = None
                     # Emit a request-boundary event so an operator can spot
                     # the K-5 failure mode (Modal-reported success with zero
                     # output) directly from the log stream.
@@ -480,13 +504,27 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                     amplifier.calibrate(target_pipeline.entropy_source, req_config)
                 hash_str = config_hash(req_config)
 
-            self._request_states[req_idx] = _RequestState(
+            state = _RequestState(
                 pipeline=target_pipeline,
                 config=req_config,
                 amplifier=amplifier,
                 strategy=strategy,
                 config_hash_str=hash_str,
             )
+            self._request_states[req_idx] = state
+
+            # Commit-then-fetch, step 0: fire the FIRST token's entropy
+            # request now, at request-add time. There is no previous token
+            # to wait for (the -1 sentinel commits to that fact), and the
+            # round trip overlaps the entire prefill instead of stalling
+            # the first sampling step. ``prefetch()`` never raises and
+            # returns None for non-async sources (e.g. the system/PRNG
+            # comparison lane), which keeps that path untouched.
+            if req_config.entropy_prefetch:
+                first_nonce = derive_commit_nonce(state.prefetch_salt, 0, -1)
+                state.entropy_ticket = target_pipeline.entropy_source.prefetch(
+                    req_config.sample_count, first_nonce
+                )
 
             # Emit a single per-request routing event so an operator can
             # confirm the comparison pipe's per-column extra_args
@@ -544,12 +582,21 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         for i in range(num_requests):
             # Get per-request state or fall back to defaults.
             state = self._request_states.get(i)
+            prefetch_ctx: PrefetchContext | None = None
             if state is not None:
                 pipeline = state.pipeline
                 req_config: QRSamplerConfig | None = state.config
                 amplifier: SignalAmplifier | None = state.amplifier
                 strategy: TemperatureStrategy | None = state.strategy
                 hash_str: str | None = state.config_hash_str
+                # Step index BEFORE increment: 0-based token index, the
+                # same convention derive_commit_nonce documents.
+                prefetch_ctx = PrefetchContext(
+                    salt=state.prefetch_salt,
+                    step=state.tokens_generated,
+                    ticket=state.entropy_ticket,
+                )
+                state.entropy_ticket = None  # consumed below, one way or another
                 state.tokens_generated += 1
             else:
                 pipeline = self._pipeline
@@ -565,13 +612,23 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 row = logits[i] if is_numpy else self._to_numpy(logits[i])
 
             # --- Delegate to pipeline (routed by entropy source) ---
+            # build_onehot=False: the one-hot is forced directly on the
+            # engine tensor below, so the pipeline's vocab-size numpy
+            # allocation + fill per token would be pure dead weight.
             result = pipeline.sample_token(
                 row,
                 config=req_config,
                 amplifier=amplifier,
                 strategy=strategy,
                 config_hash_str=hash_str,
+                prefetch_ctx=prefetch_ctx,
+                build_onehot=False,
             )
+
+            # Store the in-flight ticket for this request's NEXT token
+            # (fired inside sample_token immediately after selection).
+            if state is not None:
+                state.entropy_ticket = result.next_ticket
 
             # --- Force one-hot logits using engine tensor ---
             if is_1d:
