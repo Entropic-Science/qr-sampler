@@ -2885,6 +2885,28 @@ _OWUI_IMAGE = (
             "PYTHONUNBUFFERED": "1",
         }
     )
+    # cloudflared sidecar binary for the contseq thought engine's QRNG
+    # reachability (qr-llm-chat contseq spec §4.2). Mirrors the install
+    # block in Dockerfile.vllm ("cloudflared sidecar for QRNG
+    # reachability", lines ~204-243), including the iter-14 decision to
+    # use `/releases/latest/download/` while CAPTURING the version + SHA
+    # in the build log (`cloudflared.version` / `cloudflared.sha256`
+    # lines) so the exact bytes in each image build stay auditable even
+    # without an enforced pin. Lifecycle is owned by
+    # `qr_llm_chat.contseq` (soft-fail: a missing/failed sidecar means
+    # the engine runs on labeled system-entropy fallback, never a
+    # crash), so this layer is purely additive — classic OWUI paths
+    # never exec the binary.
+    .run_commands(
+        "set -eux"
+        " && curl -fsSL"
+        " https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+        " -o /tmp/cloudflared.deb"
+        " && echo \"cloudflared.sha256 $(sha256sum /tmp/cloudflared.deb | cut -d' ' -f1)\""
+        " && dpkg -i /tmp/cloudflared.deb"
+        " && echo \"cloudflared.version $(cloudflared --version 2>&1 | head -1)\""
+        " && rm /tmp/cloudflared.deb"
+    )
     .add_local_python_source("qr_sampler", copy=True)
     .add_local_python_source("qr_llm_chat", copy=True)
     # `obs` is a top-level package living at qr-llm-chat's repo root
