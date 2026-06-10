@@ -134,3 +134,42 @@ def test_contseq_preset_registered() -> None:
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
     }
+
+
+def test_ensure_source_importable_registers_quantum() -> None:
+    """quantum_grpc resolves even when nothing else imported quantum.py.
+
+    Regression for the OWUI-container 500 (iter-57): the registry is
+    populated by import side effects, and the OWUI process never imports
+    ``qr_sampler.entropy.quantum`` on its own.
+    """
+    from qr_sampler.contseq import _ensure_source_importable
+    from qr_sampler.entropy.registry import EntropySourceRegistry
+
+    config = QRSamplerConfig(entropy_source_type="quantum_grpc")
+    result = _ensure_source_importable(config)
+
+    assert result.entropy_source_type == "quantum_grpc"
+    assert EntropySourceRegistry.get("quantum_grpc") is not None
+
+
+def test_ensure_source_importable_degrades_on_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """grpcio genuinely absent → roller degrades to fallback_mode, no crash."""
+    import sys
+
+    from qr_sampler.contseq import _ensure_source_importable
+
+    # None in sys.modules makes `import qr_sampler.entropy.quantum`
+    # raise ImportError without touching the real module machinery.
+    monkeypatch.setitem(sys.modules, "qr_sampler.entropy.quantum", None)
+
+    config = QRSamplerConfig(entropy_source_type="quantum_grpc", fallback_mode="system")
+    result = _ensure_source_importable(config)
+    assert result.entropy_source_type == "system"
+
+    # fallback_mode="error" still must not crash — degrade to system.
+    config = QRSamplerConfig(entropy_source_type="quantum_grpc", fallback_mode="error")
+    result = _ensure_source_importable(config)
+    assert result.entropy_source_type == "system"

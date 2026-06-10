@@ -55,6 +55,38 @@ class RollResult:
     """Wall-clock duration of fetch + amplify + map."""
 
 
+def _ensure_source_importable(config: QRSamplerConfig) -> QRSamplerConfig:
+    """Trigger the lazy import that registers ``quantum_grpc``, or degrade.
+
+    ``EntropySourceRegistry`` is populated by module-import side effects:
+    ``qr_sampler.entropy.quantum`` self-registers via decorator, but
+    ``qr_sampler.entropy.__init__`` deliberately does NOT import it so
+    grpcio stays an optional dependency. The vLLM containers import it
+    through the serving stack; the OWUI container (where the contseq
+    engine lives) does not — without this nudge, building a roller there
+    dies with ``KeyError: Unknown entropy source: 'quantum_grpc'``.
+
+    If the import itself fails (grpcio genuinely absent), swap the
+    config to the fallback source instead of crashing: a thought engine
+    on labeled system entropy beats no thought engine at all, and the
+    ``is_fallback``/source labels keep the degradation honest downstream.
+    """
+    if config.entropy_source_type != "quantum_grpc":
+        return config
+    try:
+        import qr_sampler.entropy.quantum  # noqa: F401 — registers "quantum_grpc"
+    except ImportError as exc:
+        degraded = config.fallback_mode if config.fallback_mode != "error" else "system"
+        logger.warning(
+            "contseq.entropy.import_failed: quantum_grpc unavailable (%s); degrading to %s entropy",
+            exc,
+            degraded,
+            extra={"event": "contseq.entropy.import_failed", "degraded_to": degraded},
+        )
+        return config.model_copy(update={"entropy_source_type": degraded})
+    return config
+
+
 class ContseqRoller:
     """Rolls byte codes from the entropy stack, token-sampling style.
 
@@ -78,6 +110,7 @@ class ContseqRoller:
         """
         if config is None:
             config = resolve_config(QRSamplerConfig(preset="contseq"), None)
+        config = _ensure_source_importable(config)
         self._config = config
         self._config_hash = config_hash(config)
         self._source: EntropySource = build_entropy_source(config)
