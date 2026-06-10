@@ -60,6 +60,16 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "top_k": 0,
         "top_p": 1.0,
     },
+    # Contseq thought-engine roller (qr_sampler.contseq.ContseqRoller).
+    # Not a GPU sampling lane: the consumer makes TWO full-size entropy
+    # fetches per engine tick (word roll + action roll), each reduced to
+    # a byte code via the amplifier — same shape as one token-sampling
+    # step's entropy half. Pins the quantum source + zscore_mean so the
+    # lineage is explicit in config_hash logs.
+    "contseq": {
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "zscore_mean",
+    },
 }
 
 
