@@ -24,6 +24,7 @@ falls back to a secondary source when the server is slow or unreachable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import socket
@@ -307,6 +308,95 @@ class QuantumGrpcSource(EntropySource):
             future.result(timeout=self._timeout_ms / 1000.0)
             self._channel_initialized = True
 
+    def warmup(self) -> None:
+        """Eagerly open the gRPC channel + verify the server is reachable.
+
+        Called by the engine adapter once at startup (after the
+        cloudflared sidecar has had a chance to come up) so that
+        per-token ``get_random_bytes()`` calls land on an already-open,
+        already-verified channel — no first-fetch connect cost.
+
+        Soft-fail: if the channel can't open or the verification fetch
+        fails, log a warning and return cleanly. ``FallbackEntropySource``
+        will engage on subsequent fetches and the circuit breaker /
+        TCP pre-probe will keep the system serving via system PRNG
+        until the QRNG backend recovers.
+
+        Idempotent and snapshot-safe: if a previous warmup left a
+        captured-stale channel (e.g. across a Modal /sleep + /wake_up),
+        the verification fetch surfaces the stale state and we reset
+        the channel before declaring warmup complete.
+        """
+        try:
+            self._ensure_channel()
+        except Exception as exc:
+            logger.warning(
+                "QuantumGrpcSource.warmup: channel init failed (%s); "
+                "falling back to lazy init on first fetch",
+                exc,
+                extra={"event": "qrng.warmup.channel_init_failed"},
+            )
+            return
+
+        # Tiny verification fetch on the freshly-opened channel. Small
+        # n=8 keeps the bandwidth cost negligible and the round-trip
+        # short. We use a snug timeout (2x the adaptive minimum) so a
+        # stale channel from a prior snapshot surfaces fast rather than
+        # blocking startup.
+        try:
+            self.get_random_bytes(8)
+            logger.info(
+                "QuantumGrpcSource.warmup: channel ready (%s)",
+                self._address,
+                extra={"event": "qrng.warmup.ok"},
+            )
+        except EntropyUnavailableError as exc:
+            # First fetch failed — could be a stale post-snapshot
+            # channel, or genuinely unreachable backend. Reset the
+            # channel state so the next fetch re-initializes cleanly,
+            # then return. Fallback handles the remaining requests
+            # until QRNG recovers.
+            logger.warning(
+                "QuantumGrpcSource.warmup: verification fetch failed (%s); "
+                "resetting channel for clean lazy re-init",
+                exc,
+                extra={"event": "qrng.warmup.verify_failed"},
+            )
+            self._reset_channel()
+        except Exception as exc:
+            logger.warning(
+                "QuantumGrpcSource.warmup: unexpected verification error (%s)",
+                exc,
+                extra={"event": "qrng.warmup.verify_unexpected"},
+            )
+            self._reset_channel()
+
+    def _reset_channel(self) -> None:
+        """Tear down the channel + loop so the next call re-inits cleanly.
+
+        Used by ``warmup()`` when verification surfaces a stale
+        post-snapshot channel. Best-effort: errors during teardown are
+        swallowed since the goal is just to flip ``_channel_initialized``
+        back to False.
+        """
+        with self._channel_init_lock:
+            if not self._channel_initialized:
+                return
+            loop = self._loop
+            channel = getattr(self, "_channel", None)
+            if loop is not None and channel is not None:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(channel.close(), loop)
+                    fut.result(timeout=2.0)
+                except Exception:
+                    pass
+            if loop is not None:
+                with contextlib.suppress(Exception):
+                    loop.call_soon_threadsafe(loop.stop)
+            self._channel_initialized = False
+            self._loop = None
+            self._thread = None
+
     async def _init_channel(self) -> None:
         """Create the gRPC async channel and generic method handles."""
         import grpc.aio
@@ -388,6 +478,22 @@ class QuantumGrpcSource(EntropySource):
                 # Half-open: try one request.
                 self._circuit_open = False
                 logger.info("Circuit breaker half-open, attempting reconnection")
+                # iter-53 (2026-06-09): reset the channel BEFORE the
+                # half-open attempt. The dominant open-circuit cause in
+                # the Modal deploy is a stale post-/sleep channel (the
+                # cloudflared sidecar restarts on _wake underneath the
+                # snapshot-frozen HTTP/2 state); testing recovery on the
+                # suspect channel wastes the whole half-open cycle —
+                # observed as a 2-cycle (~20 s, ~22 PRNG tokens) recovery
+                # crawl on the first post-wake generation. A reset costs
+                # one loopback reconnect (~ms) per half-open, negligible
+                # against the recovery-window cadence.
+                try:
+                    self._reset_channel()
+                except Exception as reset_exc:
+                    logger.warning(
+                        "half-open channel reset failed: %s", reset_exc
+                    )
             else:
                 raise EntropyUnavailableError(
                     "Circuit breaker open: too many consecutive gRPC failures"
@@ -421,6 +527,20 @@ class QuantumGrpcSource(EntropySource):
                 self._consecutive_failures,
             )
 
+        # iter-52d (2026-05-25): when every retry on an established
+        # channel fails, the channel itself is likely stale — most
+        # commonly because of a Modal /sleep + /wake_up snapshot cycle
+        # that froze the gRPC channel state while the cloudflared
+        # sidecar was restarted underneath us. Reset the channel so the
+        # next call re-initialises cleanly against the freshly-spawned
+        # sidecar. Best-effort: errors during teardown are swallowed.
+        try:
+            self._reset_channel()
+        except Exception as reset_exc:
+            logger.warning(
+                "channel reset after retry-exhaust failed: %s", reset_exc
+            )
+
         raise EntropyUnavailableError(
             f"gRPC entropy fetch failed after {1 + self._retry_count} attempts: {last_error}"
         ) from last_error
@@ -446,14 +566,40 @@ class QuantumGrpcSource(EntropySource):
         timeout_s = self._get_timeout() / 1000.0
         coro = self._fetch_async(n)
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        t0 = time.perf_counter()
         try:
             return future.result(timeout=timeout_s)
         except TimeoutError as exc:
+            self._record_timeout_sample(time.perf_counter() - t0, timeout_s)
             raise EntropyUnavailableError(
                 f"gRPC entropy fetch timed out after {timeout_s * 1000:.0f}ms"
             ) from exc
         except Exception as exc:
+            self._record_timeout_sample(time.perf_counter() - t0, timeout_s)
             raise EntropyUnavailableError(f"gRPC entropy fetch failed: {exc}") from exc
+
+    def _record_timeout_sample(self, elapsed_s: float, timeout_s: float) -> None:
+        """Feed timeout-shaped failures into the adaptive-latency window.
+
+        iter-53 (2026-06-09): only successful fetches used to call
+        ``_update_latency``, which made the adaptive timeout a one-way
+        ratchet — once P99 converged on a fast window (observed ~96 ms
+        through the cloudflared tunnel → ~145 ms ceiling), any genuine
+        upward drift in backend latency could NEVER be re-learned: every
+        slower fetch was cut off at the old ceiling and discarded, so the
+        window stayed frozen and the source flapped between timeout and
+        fallback indefinitely.
+
+        Recording the cut-off duration as a latency sample lets P99 climb
+        toward the observed (censored) latency, raising the next adaptive
+        timeout by up to ``cb_timeout_multiplier`` per re-learn round,
+        hard-capped by ``grpc_timeout_ms``. Fast failures (connection
+        refused, channel teardown) are excluded — they say nothing about
+        latency and would wrongly DEFLATE the window.
+        """
+        elapsed_ms = elapsed_s * 1000.0
+        if elapsed_ms >= 0.8 * timeout_s * 1000.0:
+            self._update_latency(elapsed_ms)
 
     def _tcp_preprobe(self) -> None:
         """One-shot TCP-connect probe of the gRPC endpoint.

@@ -315,9 +315,14 @@ The gRPC client is **protocol-agnostic**. It uses configurable method paths and 
 
 The gRPC client includes an adaptive circuit breaker:
 
-- Tracks rolling P99 latency over the last 100 requests
-- Sets timeout to `max(5ms, P99 * 1.5)` (configurable via `QR_CB_*` env vars)
-- Opens after 3 consecutive failures, enters half-open state after 10s
+- Tracks rolling P99 latency over the last 100 requests; timed-out
+  fetches also feed the window, so the ceiling re-learns upward when
+  the backend genuinely slows
+- Sets timeout to `max(5ms, P99 * 1.5)` (configurable via `QR_CB_*`
+  env vars; raise `QR_CB_MIN_TIMEOUT_MS` for tunnelled/remote backends)
+- Opens after 3 consecutive failures, enters half-open state after 10s;
+  the half-open attempt resets the channel first so a stale connection
+  can't waste the recovery cycle
 - Falls back to `QR_FALLBACK_MODE` when the circuit is open
 
 ### OpenEntropy
@@ -562,6 +567,7 @@ All configuration is done via environment variables with the `QR_` prefix. Per-r
 | `QR_CB_TIMEOUT_MULTIPLIER` | `1.5` | Multiplier applied to P99 latency for adaptive timeout |
 | `QR_CB_RECOVERY_WINDOW_S` | `10.0` | Seconds before half-open retry after circuit opens |
 | `QR_CB_MAX_CONSECUTIVE_FAILURES` | `3` | Consecutive failures before circuit breaker opens |
+| `QR_ENTROPY_STATUS_FILE` | `<tempdir>/qr_entropy_status.json` | Cross-process entropy-status file (powers `/health/entropy` in split-process engines like vLLM); empty string disables |
 
 ### Sampling parameters (per-request overridable)
 

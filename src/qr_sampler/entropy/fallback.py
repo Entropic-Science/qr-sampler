@@ -48,6 +48,7 @@ import time
 from typing import Any
 
 from qr_sampler.entropy.base import EntropySource
+from qr_sampler.entropy.status_file import write_entropy_status
 from qr_sampler.exceptions import EntropyUnavailableError
 
 logger = logging.getLogger("qr_sampler")
@@ -57,6 +58,14 @@ logger = logging.getLogger("qr_sampler")
 # an operator paging on it sees it within a minute, quiet enough that a hot
 # inference loop (one fetch per token) does not generate one alert per token.
 _ALERT_THROTTLE_S: float = 60.0
+
+# Minimum seconds between non-transition status-file refreshes. Transitions
+# (ok→degraded, degraded→ok) always write immediately; mid-outage count
+# refreshes are throttled so a hot sampling loop costs at most one tmpfs
+# write per second instead of one per token. The /health/entropy banner
+# compare only needs "did the count grow across this multi-second request",
+# so 1 s of staleness is invisible to it.
+_STATUS_REFRESH_MIN_INTERVAL_S: float = 1.0
 
 
 class FallbackEntropySource(EntropySource):
@@ -79,6 +88,15 @@ class FallbackEntropySource(EntropySource):
         self._fallback_count: int = 0
         self._last_alert_monotonic: float = 0.0
         self._currently_degraded: bool = False
+        # iter-53: cross-process status channel for /health/entropy (see
+        # ``status_file`` module docstring). OPT-IN via
+        # ``enable_status_publishing()`` because the vLLM adapter builds
+        # one FallbackEntropySource per pre-init pipeline (quantum_grpc
+        # AND system) — only the default/quantum lane may own the file,
+        # else the system-primary wrapper overwrites it with its own
+        # (always-healthy) state.
+        self._publish_status: bool = False
+        self._last_status_write_monotonic: float = 0.0
 
     @property
     def name(self) -> str:
@@ -105,6 +123,15 @@ class FallbackEntropySource(EntropySource):
         """Total number of fallbacks since process start. Test introspection."""
         return self._fallback_count
 
+    @property
+    def currently_degraded(self) -> bool:
+        """True while the most recent fetch came from the fallback source.
+
+        Flips back to False on the first successful primary fetch (the
+        ``entropy.recovered`` transition).
+        """
+        return self._currently_degraded
+
     def get_random_bytes(self, n: int) -> bytes:
         """Fetch bytes from the primary source, falling back if unavailable.
 
@@ -122,7 +149,8 @@ class FallbackEntropySource(EntropySource):
         """
         try:
             data = self._primary.get_random_bytes(n)
-            if self._currently_degraded:
+            recovered = self._currently_degraded
+            if recovered:
                 # Transition back to primary — emit a single all-clear event.
                 logger.warning(
                     "entropy.recovered: primary source %r is healthy again "
@@ -138,12 +166,16 @@ class FallbackEntropySource(EntropySource):
                 )
                 self._currently_degraded = False
             self._last_source_used = self._primary.name
+            if recovered:
+                self._write_status(force=True)
             return data
         except EntropyUnavailableError as exc:
             self._fallback_count += 1
+            first_fallback = not self._currently_degraded
             self._log_degraded(exc, n)
             data = self._fallback.get_random_bytes(n)
             self._last_source_used = self._fallback.name
+            self._write_status(force=first_fallback)
             return data
 
     def _log_degraded(self, exc: EntropyUnavailableError, n: int) -> None:
@@ -205,10 +237,77 @@ class FallbackEntropySource(EntropySource):
                 },
             )
 
+    def enable_status_publishing(self) -> None:
+        """Mark this wrapper as the owner of the cross-process status file.
+
+        Called by the engine adapter on the DEFAULT pipeline's source
+        only. The initial write publishes "no fallbacks yet" so the
+        APIServer-side middleware can tell "EngineCore is up, all
+        quantum" apart from "EngineCore not initialised yet" (file
+        absent). Idempotent.
+        """
+        self._publish_status = True
+        self._write_status(force=True)
+
+    def _write_status(self, *, force: bool) -> None:
+        """Publish current state to the cross-process status file.
+
+        No-op unless ``enable_status_publishing()`` was called.
+        ``force=True`` on state transitions (and init) writes
+        unconditionally; ``force=False`` (mid-outage count refresh) is
+        throttled to one write per ``_STATUS_REFRESH_MIN_INTERVAL_S``.
+        Best-effort: ``write_entropy_status`` never raises, and the
+        throttle timestamp advances even on failed writes so a broken
+        tmpdir costs at most one syscall per second, not one per token.
+        """
+        if not self._publish_status:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_status_write_monotonic) < (
+            _STATUS_REFRESH_MIN_INTERVAL_S
+        ):
+            return
+        self._last_status_write_monotonic = now
+        write_entropy_status(
+            {
+                "primary_name": self._primary.name,
+                "fallback_name": self._fallback.name,
+                "last_source_used": self._last_source_used,
+                "fallback_count": self._fallback_count,
+                "currently_degraded": self._currently_degraded,
+            }
+        )
+
     def close(self) -> None:
         """Close both primary and fallback sources."""
         self._primary.close()
         self._fallback.close()
+
+    def warmup(self) -> None:
+        """Forward warmup to both primary and fallback (both no-op for
+        sources without a connection lifecycle).
+
+        The primary's warmup is what matters for the QRNG case — it
+        eagerly opens the gRPC channel + verifies reachability. The
+        fallback's warmup is a no-op for system PRNG. Both are called
+        so any future source with its own connection (e.g. a future
+        secondary HTTP-based QRNG) gets the same eager treatment.
+        """
+        try:
+            self._primary.warmup()
+        except Exception as exc:
+            logger.warning(
+                "FallbackEntropySource: primary warmup raised (%s); "
+                "fallback path will engage on first fetch",
+                exc,
+            )
+        try:
+            self._fallback.warmup()
+        except Exception as exc:
+            logger.warning(
+                "FallbackEntropySource: fallback warmup raised (%s)",
+                exc,
+            )
 
     def health_check(self) -> dict[str, Any]:
         """Return health status for both sources.

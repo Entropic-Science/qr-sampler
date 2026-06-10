@@ -831,6 +831,23 @@ class VllmQrQwen:
         # forgot the env var.
         env.setdefault("PYTHONUNBUFFERED", "1")
 
+        # iter-53 (2026-06-09): raise the adaptive-timeout floor for the
+        # tunnel reality. The library default (5 ms) is tuned for a
+        # localhost QRNG; here every fetch crosses the cloudflared
+        # tunnel, where the observed steady-state P99 is ~96 ms with
+        # tail spikes past 200 ms. With the old floor the adaptive
+        # ceiling converged to ~145 ms and killed every tail fetch
+        # (all observed flap timeouts were 144-229 ms — a 300 ms floor
+        # prevents the entire class). setdefault so the qr-sampler-prod
+        # Modal Secret can still override per-deploy.
+        env.setdefault("QR_CB_MIN_TIMEOUT_MS", "300")
+        # iter-53b: shorten the breaker's half-open cadence. The library
+        # default (10 s) assumes remote-outage recovery is slow; here the
+        # common cause is the post-wake stale channel, which the
+        # half-open path now fixes in one cycle — at ~2.6 tok/s a 10 s
+        # window still costs ~26 PRNG tokens, a 3 s window costs ~8.
+        env.setdefault("QR_CB_RECOVERY_WINDOW_S", "3")
+
         # iter-09 (2026-05-21): iter-02's QR_ENTROPY_SOURCE_TYPE=system /
         # QR_PREINIT_ENTROPY_SOURCES=system overrides REMOVED. They were an
         # isolation workaround for the snapshot /wake_up 500, which iter-08
@@ -1837,6 +1854,11 @@ class VllmQrPrismaQuant:
 
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
+        # iter-53/53b: tunnel-aware adaptive-timeout floor + fast
+        # half-open cadence — see the twin comments in the Qwen class's
+        # _start_and_sleep above.
+        env.setdefault("QR_CB_MIN_TIMEOUT_MS", "300")
+        env.setdefault("QR_CB_RECOVERY_WINDOW_S", "3")
 
         cmd = [
             "vllm",

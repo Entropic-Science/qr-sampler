@@ -176,12 +176,56 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # --- Default pipeline (used when no per-request state exists) ---
         self._pipeline = self._pipelines[self._default_config.entropy_source_type]
 
+        # iter-52d (2026-05-25): eagerly establish each entropy source's
+        # connection NOW, so per-token ``get_random_bytes()`` calls land
+        # on already-open, already-verified channels. The default
+        # ``EntropySource.warmup()`` is a no-op; ``QuantumGrpcSource``
+        # overrides it to open the gRPC channel + do a single tiny
+        # verification fetch. Soft-fail by design: if QRNG is
+        # unreachable at startup, ``FallbackEntropySource`` engages
+        # transparently for subsequent fetches.
+        for source_type, pipeline in self._pipelines.items():
+            try:
+                pipeline.entropy_source.warmup()
+            except Exception as exc:
+                logger.warning(
+                    "Entropy-source warmup for %s raised (%s); fallback will engage",
+                    source_type,
+                    exc,
+                    extra={
+                        "event": "entropy.warmup.failed",
+                        "source_type": source_type,
+                    },
+                )
+
+        # iter-53 (2026-06-09): designate the DEFAULT pipeline's source as
+        # the owner of the cross-process entropy-status file. This is the
+        # channel that actually reaches the /health/entropy middleware in
+        # production — vLLM keeps this LogitsProcessor in the EngineCore
+        # process while the middleware lives in APIServer, so module
+        # globals (the iter-49 set_fallback_source below) never cross.
+        # Only the default pipeline publishes: the pre-init loop also
+        # builds a system-primary wrapper whose always-healthy state must
+        # not clobber the quantum lane's file.
+        try:
+            enable = getattr(
+                self._pipeline.entropy_source, "enable_status_publishing", None
+            )
+            if callable(enable):
+                enable()
+        except Exception:
+            # Telemetry plumbing must never break the LogitsProcessor.
+            pass
+
         # iter-49 (2026-05-25): publish the active FallbackEntropySource
         # to the /health/entropy middleware so the qr-llm-chat OWUI side
         # can snapshot fallback_count before/after a request and emit
         # the regenerate-banner when QRNG degraded mid-request. The
         # middleware module is imported lazily so a non-Modal dev/test
         # context (no fastapi installed) does not break adapter import.
+        # iter-53: in the split-process vLLM layout this only serves
+        # same-process consumers (unit tests); the status file above is
+        # the production channel.
         try:
             from qr_sampler.connectors.modal.health_entropy_middleware import (
                 set_fallback_source as _qr_set_fallback_source,

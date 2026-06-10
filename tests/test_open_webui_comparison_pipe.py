@@ -317,10 +317,12 @@ class TestStreamingFanOut:
         )
 
         assert chunks, "Pipe yielded nothing"
-        # Every yield carries the dual-column table header.
+        # Every yield carries the dual-column table header. (The old
+        # "Comparison mode is on" preamble moved to a one-shot status
+        # event — _COMPARISON_STATUS_DESCRIPTION — and no longer renders
+        # inside the streamed markdown.)
         for c in chunks:
             assert "| Quantum | Pseudo-random |" in c
-            assert "Comparison mode is on" in c
         # The final yield carries the cumulative content from both sides.
         final = chunks[-1]
         assert "Quantum bit two." in final

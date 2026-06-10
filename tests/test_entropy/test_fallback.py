@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from qr_sampler.entropy import fallback as fallback_module
+from qr_sampler.entropy import status_file
 from qr_sampler.entropy.base import EntropySource
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.exceptions import EntropyUnavailableError
@@ -188,3 +190,107 @@ class TestFallbackEntropySource:
         assert "primary" in health
         assert "fallback" in health
         assert "last_source_used" in health
+
+
+class _FlakySource(EntropySource):
+    """Test double: fails when ``should_fail`` is set, else fixed bytes."""
+
+    def __init__(self) -> None:
+        self.should_fail = False
+
+    @property
+    def name(self) -> str:
+        return "flaky"
+
+    @property
+    def is_available(self) -> bool:
+        return not self.should_fail
+
+    def get_random_bytes(self, n: int) -> bytes:
+        if self.should_fail:
+            raise EntropyUnavailableError("flaking")
+        return b"\xaa" * n
+
+    def close(self) -> None:
+        pass
+
+
+class TestStatusPublishing:
+    """iter-53: cross-process status-file writes (see entropy/status_file.py)."""
+
+    @pytest.fixture()
+    def status_path(self, tmp_path, monkeypatch):
+        path = tmp_path / "qr_entropy_status.json"
+        monkeypatch.setenv("QR_ENTROPY_STATUS_FILE", str(path))
+        return path
+
+    def test_no_writes_unless_enabled(self, status_path) -> None:
+        source = FallbackEntropySource(_AlwaysFailSource(), _FixedBytesSource(0xBB))
+        source.get_random_bytes(4)
+        assert not status_path.exists()
+
+    def test_enable_writes_initial_state(self, status_path) -> None:
+        primary = _FixedBytesSource(0xAA)
+        source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
+        source.enable_status_publishing()
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["primary_name"] == primary.name
+        assert data["last_source_used"] == primary.name
+        assert data["fallback_count"] == 0
+        assert data["currently_degraded"] is False
+
+    def test_fallback_writes_degraded_state(self, status_path) -> None:
+        primary = _AlwaysFailSource()
+        fallback = _FixedBytesSource(0xBB)
+        source = FallbackEntropySource(primary, fallback)
+        source.enable_status_publishing()
+
+        source.get_random_bytes(4)
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["currently_degraded"] is True
+        assert data["fallback_count"] == 1
+        assert data["last_source_used"] == fallback.name
+
+    def test_recovery_writes_all_clear(self, status_path) -> None:
+        primary = _FlakySource()
+        source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
+        source.enable_status_publishing()
+
+        primary.should_fail = True
+        source.get_random_bytes(4)
+        primary.should_fail = False
+        source.get_random_bytes(4)
+
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["currently_degraded"] is False
+        assert data["fallback_count"] == 1
+        assert data["last_source_used"] == primary.name
+
+    def test_mid_outage_refresh_is_throttled(self, status_path) -> None:
+        primary = _AlwaysFailSource()
+        source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
+        source.enable_status_publishing()
+
+        # First fallback is a transition (forced write); the second lands
+        # inside the refresh window and must NOT rewrite the file.
+        source.get_random_bytes(4)
+        source.get_random_bytes(4)
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["fallback_count"] == 1
+        assert source.fallback_count == 2
+
+    def test_mid_outage_refresh_after_interval(self, status_path, monkeypatch) -> None:
+        monkeypatch.setattr(fallback_module, "_STATUS_REFRESH_MIN_INTERVAL_S", 0.0)
+        primary = _AlwaysFailSource()
+        source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
+        source.enable_status_publishing()
+
+        source.get_random_bytes(4)
+        source.get_random_bytes(4)
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["fallback_count"] == 2

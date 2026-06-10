@@ -271,6 +271,39 @@ class TestQuantumGrpcSourceCircuitBreaker:
         with pytest.raises(EntropyUnavailableError, match="Circuit breaker open"):
             source.get_random_bytes(10)
 
+    def test_half_open_resets_channel_before_attempt(self, source: Any) -> None:
+        """iter-53: the half-open attempt must run on a freshly-reset channel.
+
+        The dominant open-circuit cause in the Modal deploy is a stale
+        post-/sleep channel; testing recovery on the suspect channel
+        wastes the whole half-open cycle.
+        """
+        source._circuit_open = True
+        source._circuit_open_until = time.monotonic() - 1.0  # window elapsed
+
+        events: list[str] = []
+        source._reset_channel = lambda: events.append("reset")
+
+        def fake_fetch(n: int) -> bytes:
+            events.append("fetch")
+            raise EntropyUnavailableError("still down")
+
+        source._fetch_sync = fake_fetch
+        with pytest.raises(EntropyUnavailableError):
+            source.get_random_bytes(10)
+        assert events[0] == "reset"
+        assert events[1] == "fetch"
+
+    def test_half_open_success_closes_circuit(self, source: Any) -> None:
+        source._circuit_open = True
+        source._circuit_open_until = time.monotonic() - 1.0
+
+        source._reset_channel = lambda: None
+        source._fetch_sync = lambda n: b"\x00" * n
+        assert source.get_random_bytes(10) == b"\x00" * 10
+        assert source._circuit_open is False
+        assert source._consecutive_failures == 0
+
 
 # ---------------------------------------------------------------------------
 # Address parsing tests

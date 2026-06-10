@@ -223,6 +223,43 @@ tunable, or NVIDIA ships a cuda-checkpoint with faster enumeration
 for FP8 + custom-ops workloads, revisit and consider re-enabling
 larger `--max-num-seqs` for higher concurrency.
 
+### /health/entropy cross-process wiring — CLOSED iter-53 (2026-06-09, auto-memory `iter53_entropy_health_ipc`)
+
+vLLM runs APIServer (middlewares) and EngineCore (LogitsProcessor,
+where fallbacks happen) as separate processes; module globals don't
+cross, so iter-49's `set_fallback_source` channel left `/health/entropy`
+503ing unconditionally. iter-53 closes it with two signals folded in
+`health_entropy_middleware`:
+
+1. **Status file** — `FallbackEntropySource` writes
+   `<tempdir>/qr_entropy_status.json` (atomic tmp+`os.replace`) on
+   degraded/recovered transitions + 1 s-throttled count refreshes.
+   Publishing is opt-in (`enable_status_publishing()`, called by
+   `VLLMAdapter` on the DEFAULT pipeline only — the preinit `system`
+   wrapper must not clobber the quantum lane's file).
+2. **Live probe** — APIServer-local `QuantumGrpcSource` (retry 0,
+   ≤1 s timeout), 8-byte fetch per poll, 5 s verdict cache, run via
+   `asyncio.to_thread`.
+
+`rpc_ok=false` ⇔ probe failed OR degraded window <30 s old. Payload
+also carries `tcp_ok`/`summary` (deploy-guard contract) and a
+`sampler` block (`currently_degraded`, `age_s`) the OWUI banner uses
+to catch PRNG responses even when its inlet snapshot failed.
+
+### QRNG adaptive-timeout ratchet — iter-53 (auto-memory `qrng_adaptive_timeout_ratchet`)
+
+Only successful fetches fed the adaptive-timeout P99 window, so once
+P99 converged fast (~96 ms via the tunnel → ~145 ms ceiling) every
+tail fetch was cut off and discarded — the ceiling could never
+re-learn upward and the source flapped timeout↔fallback indefinitely.
+Fixes: timeout-shaped failures (≥0.8× the budget) now count as
+latency samples; `app.py` floors the deploy at
+`QR_CB_MIN_TIMEOUT_MS=300` (library default 5 ms is a localhost
+assumption); the circuit-breaker half-open attempt resets the gRPC
+channel first (the dominant open cause is a stale post-/sleep channel
+— testing recovery on the suspect channel wasted whole 10 s cycles)
+and `QR_CB_RECOVERY_WINDOW_S=3` tightens the cadence.
+
 ### vLLM CLI flag churn (auto-memory `vllm_cli_flag_churn`)
 
 vLLM removes CLI flags between minor releases (PR #21739 dropped

@@ -83,6 +83,23 @@ class EntropySource(ABC):
     def close(self) -> None:
         """Release resources (channels, connections, file handles)."""
 
+    def warmup(self) -> None:  # noqa: B027 -- deliberate optional hook, not a forgotten abstractmethod
+        """Eagerly establish any expensive connections this source needs.
+
+        Default no-op — sources that don't have a connection lifecycle
+        (system entropy, mock sources) inherit this and do nothing.
+
+        Sources that DO have a connection (e.g. ``QuantumGrpcSource``)
+        override this to open the channel + verify reachability *before*
+        the first ``get_random_bytes()`` call. The engine adapter calls
+        ``warmup()`` after pipeline construction so that per-token
+        fetches never pay the channel-establishment cost.
+
+        Idempotent: safe to call multiple times. Should not raise on
+        unreachable backends — fallback wrappers handle that case
+        transparently at fetch time.
+        """
+
     def health_check(self) -> dict[str, Any]:
         """Return a status dictionary for this source.
 

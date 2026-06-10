@@ -51,7 +51,9 @@ class TestDefaults:
 
     def test_temperature_defaults(self, default_config: QRSamplerConfig) -> None:
         assert default_config.temperature_strategy == "fixed"
-        assert default_config.fixed_temperature == 0.7
+        # 1.0 = the true no-scaling quantum baseline (see config.py — the
+        # earlier 0.7 default sharpened the distribution).
+        assert default_config.fixed_temperature == 1.0
         assert default_config.edt_base_temp == 0.8
         assert default_config.edt_exponent == 0.5
         assert default_config.edt_min_temp == 0.1
