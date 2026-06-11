@@ -1201,3 +1201,138 @@ class TestCustomMethodPath:
                 assert call_args[0][0] == "/custom.Service/StreamData"
             finally:
                 source.close()
+
+
+# ---------------------------------------------------------------------------
+# Quota (RESOURCE_EXHAUSTED) classification — QRNG team limits, 2026-06-10
+# ---------------------------------------------------------------------------
+
+
+class _FakeStatusCode:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeRpcError(Exception):
+    """Duck-types grpc.aio.AioRpcError's .code() without importing grpc."""
+
+    def __init__(self, code_name: str) -> None:
+        super().__init__(f"fake rpc error ({code_name})")
+        self._code = _FakeStatusCode(code_name)
+
+    def code(self) -> _FakeStatusCode:
+        return self._code
+
+
+class TestQuotaExhaustedClassification:
+    def test_classifier_direct_and_cause_chain(self) -> None:
+        from qr_sampler.entropy.quantum import _is_quota_exhausted
+
+        assert _is_quota_exhausted(_FakeRpcError("RESOURCE_EXHAUSTED")) is True
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = _FakeRpcError("RESOURCE_EXHAUSTED")
+        assert _is_quota_exhausted(wrapper) is True
+        assert _is_quota_exhausted(_FakeRpcError("UNAVAILABLE")) is False
+        assert _is_quota_exhausted(RuntimeError("no code attr")) is False
+        assert _is_quota_exhausted(None) is False
+
+    def test_quota_error_surfaces_distinct_message_and_event(self, caplog: Any) -> None:
+        """A RESOURCE_EXHAUSTED unary failure must say 'quota', not 'tunnel'."""
+        try:
+            import grpc.aio  # noqa: F401
+        except ImportError:
+            pytest.skip("grpcio not installed")
+
+        config = _make_config(grpc_mode="unary", grpc_retry_count=0)
+
+        with patch("grpc.aio.insecure_channel") as mock_channel_fn:
+            mock_channel = MagicMock()
+            mock_channel_fn.return_value = mock_channel
+            mock_unary_handle = AsyncMock(
+                side_effect=_FakeRpcError("RESOURCE_EXHAUSTED")
+            )
+            mock_channel.unary_unary = MagicMock(return_value=mock_unary_handle)
+
+            from qr_sampler.entropy.quantum import QuantumGrpcSource
+
+            source = QuantumGrpcSource(config)
+            try:
+                with (
+                    caplog.at_level("ERROR", logger="qr_sampler"),
+                    pytest.raises(EntropyUnavailableError) as exc_info,
+                ):
+                    source.get_random_bytes(100)
+                assert "quota exhausted" in str(exc_info.value)
+                assert "connectivity is fine" in str(exc_info.value)
+                events = [r.__dict__.get("event") for r in caplog.records]
+                assert "qrng.quota_exhausted" in events
+            finally:
+                source.close()
+
+    def test_sample_count_above_request_cap_warns_at_init(self, caplog: Any) -> None:
+        try:
+            import grpc.aio  # noqa: F401
+        except ImportError:
+            pytest.skip("grpcio not installed")
+
+        from qr_sampler.entropy.quantum import (
+            _QRNG_MAX_BYTES_PER_REQUEST,
+            QuantumGrpcSource,
+        )
+
+        config = _make_config(sample_count=_QRNG_MAX_BYTES_PER_REQUEST + 1)
+        with caplog.at_level("WARNING", logger="qr_sampler"):
+            source = QuantumGrpcSource(config)
+        source.close()
+        events = [r.__dict__.get("event") for r in caplog.records]
+        assert "qrng.sample_count_exceeds_request_cap" in events
+
+    def test_sample_count_at_cap_is_silent(self, caplog: Any) -> None:
+        try:
+            import grpc.aio  # noqa: F401
+        except ImportError:
+            pytest.skip("grpcio not installed")
+
+        from qr_sampler.entropy.quantum import (
+            _QRNG_MAX_BYTES_PER_REQUEST,
+            QuantumGrpcSource,
+        )
+
+        config = _make_config(sample_count=_QRNG_MAX_BYTES_PER_REQUEST)
+        with caplog.at_level("WARNING", logger="qr_sampler"):
+            source = QuantumGrpcSource(config)
+        source.close()
+        events = [r.__dict__.get("event") for r in caplog.records]
+        assert "qrng.sample_count_exceeds_request_cap" not in events
+
+
+class TestQbertResponseShape:
+    """Pin decode behaviour against the production qbert qrng.proto.
+
+    RandomResponse: field 1 = bytes data, field 2 = uint64 timestamp
+    (epoch MICROseconds), field 3 = string device_id. The decoder reads
+    field 2 into its sequence_id slot (documented collision — can never
+    match a nonce) and must skip the wire-type-2 device_id cleanly.
+    """
+
+    def test_qbert_response_decodes_payload_and_skips_device_id(self) -> None:
+        payload = b"\xaa" * 16
+        timestamp_us = 1_781_159_892_384_000
+        device_id = b"qbert-device-01"
+        wire = (
+            b"\x0a" + _encode_varint(len(payload)) + payload  # field 1, bytes
+            + b"\x10" + _encode_varint(timestamp_us)  # field 2, varint
+            + b"\x1a" + _encode_varint(len(device_id)) + device_id  # field 3, str
+        )
+        decoded_payload, seq, gen_ts = _decode_entropy_response(wire)
+        assert decoded_payload == payload
+        # The documented collision: field 2 lands in the sequence_id slot.
+        assert seq == timestamp_us
+        # device_id is wire-type 2 at field 3 — skipped, not misread as ts.
+        assert gen_ts == 0
+
+    def test_qbert_timestamp_never_verifies_as_echo(self) -> None:
+        """A 63-bit nonce can't collide with an epoch-us timestamp here."""
+        nonce = 0x7FEDCBA987654321
+        timestamp_us = 1_781_159_892_384_000
+        assert nonce != timestamp_us

@@ -79,6 +79,52 @@ _PREPROBE_ENABLED_ENV_VAR = "QR_GRPC_PREPROBE_ENABLED"
 # behaviour is actually useful.
 _PREPROBE_HEALTHY_WINDOW_S = 30.0
 
+# Documented limits of the qbert/Cipherstone QRNG service for our API key
+# (QRNG team README, 2026-06-10; adjustable on request to the QRNG team).
+# Exceeding any of them returns gRPC RESOURCE_EXHAUSTED — a quota verdict,
+# not a connectivity one, which is why ``_is_quota_exhausted`` gives it a
+# distinct telemetry event: the operator response is "lower sample_count /
+# concurrency or ask for a bigger quota", never "go check the tunnel".
+#
+# Request-rate math worth keeping in view: the just-in-time post-selection
+# contract pins entropy fetches at exactly ONE request per generated token
+# (coalescing N tokens' bytes into one request would fetch token N+1's
+# entropy before token N is committed — breaking the experiment's causal
+# ordering, so it is deliberately not an optimisation we will ever take).
+# At 500 requests/minute that caps aggregate decode throughput at ~8.3
+# tokens/sec across ALL concurrent sequences (max_num_seqs=4 can exceed
+# this under load).
+_QRNG_MAX_BYTES_PER_REQUEST = 35_200
+_QRNG_MAX_REQUESTS_PER_MINUTE = 500
+_QRNG_MAX_BYTES_PER_DAY = 500 * 1024 * 1024
+
+# Minimum seconds between consecutive ``qrng.quota_exhausted`` log events.
+# A quota storm fails once per token; one structured event per minute is
+# enough for the operator while keeping ``modal app logs`` readable.
+_QUOTA_LOG_THROTTLE_S = 60.0
+
+
+def _is_quota_exhausted(exc: BaseException | None) -> bool:
+    """True when *exc* (or its cause chain) is a gRPC RESOURCE_EXHAUSTED.
+
+    String-compares the status-code name instead of importing ``grpc`` at
+    module level (the module must import cleanly without grpcio for the
+    registry's lazy-availability check). Walks ``__cause__`` so wrapped
+    AioRpcErrors classify correctly.
+    """
+    seen = 0
+    while exc is not None and seen < 8:  # bounded: defensive vs cause cycles
+        code = getattr(exc, "code", None)
+        if callable(code):
+            try:
+                if getattr(code(), "name", "") == "RESOURCE_EXHAUSTED":
+                    return True
+            except Exception:  # classification is best-effort
+                pass
+        exc = exc.__cause__
+        seen += 1
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Generic protobuf wire-format helpers
@@ -162,6 +208,18 @@ def _decode_entropy_response(data: bytes) -> tuple[bytes, int, int]:
     ``generation_timestamp_ns``). Unknown fields are skipped. Absent
     varint fields decode as 0 — proto3 default semantics, so servers that
     do not echo ``sequence_id`` simply yield ``(payload, 0, 0)``.
+
+    Field-number collision with the production qbert server (its
+    ``qrng.proto``, 2026-06-10): ``RandomResponse`` defines field 2 as
+    ``uint64 timestamp`` (epoch MICROSECONDS) and field 3 as ``string
+    device_id``. Against that server, the value this decoder returns in
+    the ``sequence_id`` slot is actually the server timestamp — it can
+    never equal a commitment nonce, so ``echo_verified`` stays False by
+    construction, and the bidi pool's unknown-echo branch FIFO-matches
+    (unary responses correlate by HTTP/2 stream regardless). ``device_id``
+    is wire-type 2 and falls through the varint branch, so field 3 decodes
+    as 0. All of this is benign — do NOT "fix" echo verification by
+    trusting field 2 against this server; the field is occupied.
 
     Args:
         data: Raw protobuf wire-format bytes.
@@ -453,6 +511,24 @@ class QuantumGrpcSource(EntropySource):
         self._cb_timeout_multiplier = config.cb_timeout_multiplier
         self._cb_recovery_window_s = config.cb_recovery_window_s
         self._cb_max_consecutive_failures = config.cb_max_consecutive_failures
+
+        # Quota telemetry state (see _is_quota_exhausted / _QUOTA_LOG_THROTTLE_S).
+        self._last_quota_log_monotonic: float = 0.0
+        if config.sample_count > _QRNG_MAX_BYTES_PER_REQUEST:
+            logger.warning(
+                "sample_count=%d exceeds the QRNG service's documented "
+                "per-request limit of %d bytes — every per-token fetch will "
+                "return RESOURCE_EXHAUSTED and sampling will run entirely on "
+                "the fallback source. Lower QR_SAMPLE_COUNT or request a "
+                "larger per-request quota.",
+                config.sample_count,
+                _QRNG_MAX_BYTES_PER_REQUEST,
+                extra={
+                    "event": "qrng.sample_count_exceeds_request_cap",
+                    "sample_count": config.sample_count,
+                    "max_bytes_per_request": _QRNG_MAX_BYTES_PER_REQUEST,
+                },
+            )
 
         # Circuit breaker state.
         self._latency_window: deque[float] = deque(maxlen=config.cb_window_size)
@@ -883,6 +959,34 @@ class QuantumGrpcSource(EntropySource):
             ) from exc
         except Exception as exc:
             self._record_timeout_sample(time.perf_counter() - t0, timeout_s)
+            if _is_quota_exhausted(exc):
+                now = time.monotonic()
+                if (now - self._last_quota_log_monotonic) >= _QUOTA_LOG_THROTTLE_S:
+                    self._last_quota_log_monotonic = now
+                    logger.error(
+                        "QRNG QUOTA EXHAUSTED: the server returned "
+                        "RESOURCE_EXHAUSTED for n=%d. This is a rate/byte "
+                        "limit verdict, NOT a connectivity failure — the "
+                        "tunnel and channel are fine. Documented limits: "
+                        "%d bytes/request, %d requests/minute, %d bytes/day. "
+                        "Operator action: lower sample_count or concurrent "
+                        "sequences, or request a larger quota from the QRNG "
+                        "team.",
+                        n,
+                        _QRNG_MAX_BYTES_PER_REQUEST,
+                        _QRNG_MAX_REQUESTS_PER_MINUTE,
+                        _QRNG_MAX_BYTES_PER_DAY,
+                        extra={
+                            "event": "qrng.quota_exhausted",
+                            "bytes_requested": n,
+                            "max_bytes_per_request": _QRNG_MAX_BYTES_PER_REQUEST,
+                            "max_requests_per_minute": _QRNG_MAX_REQUESTS_PER_MINUTE,
+                        },
+                    )
+                raise EntropyUnavailableError(
+                    f"QRNG quota exhausted (RESOURCE_EXHAUSTED) for n={n}; "
+                    "rate/byte limit hit, connectivity is fine"
+                ) from exc
             raise EntropyUnavailableError(f"gRPC entropy fetch failed: {exc}") from exc
 
     def _record_timeout_sample(self, elapsed_s: float, timeout_s: float) -> None:
