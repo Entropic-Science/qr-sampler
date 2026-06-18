@@ -8,12 +8,14 @@ recoverable condition.
 
 Operator-visible logging
 ------------------------
-Every fallback emits a structured ``entropy.degraded`` warning, and a louder
-``entropy.degraded.alert`` is rate-limited to once per minute. The two-tier
-shape is important: a noisy primary outage produces one entropy fetch *per
-token*, so an unconditional warn-per-fallback would drown ``modal app logs``.
-The per-minute alert is the human-readable signal; the per-event warning
-gives the diagnostic count when you grep for it.
+A fallback emits a structured ``entropy.degraded`` warning plus a louder
+human-readable ``entropy.degraded.alert``, BOTH rate-limited together to the
+first fallback of a degraded window and at most once per minute thereafter.
+This throttle is load-bearing: a sustained primary outage produces one entropy
+fetch *per token*, so the previous unconditional warn-per-fallback emitted
+hundreds of identical lines per request and drowned ``modal app logs``. The
+running fallback count rides on every emitted record (and the status file +
+``/health/entropy`` carry the exact live count) so nothing is lost.
 
 The transition back from fallback->primary also emits a structured
 ``entropy.recovered`` event so the operator sees the all-clear in the
@@ -210,22 +212,31 @@ class FallbackEntropySource(EntropySource):
             return data
 
     def _log_degraded(self, exc: EntropyUnavailableError, n: int) -> None:
-        """Emit per-event + rate-limited-alert structured warnings.
+        """Emit rate-limited structured warning + alert for a fallback.
 
-        Per-event ``entropy.degraded`` lands at WARNING and carries enough
-        structured context for downstream filtering (primary name, fallback
-        name, byte count, error stringification, monotonic count). The
-        per-event log lets the operator confirm the EXACT request that
-        degraded; the alert below makes sure they notice in the first place.
+        BOTH the structured ``entropy.degraded`` WARNING and the louder
+        ``entropy.degraded.alert`` ERROR are throttled together: they fire
+        (a) immediately on the FIRST fallback of a degraded window (so the
+        operator sees it without waiting up to a minute) and (b) at most once
+        per ``_ALERT_THROTTLE_S`` thereafter.
 
-        ``entropy.degraded.alert`` is throttled to once per ``_ALERT_THROTTLE_S``
-        seconds so a sustained outage (one fallback per generated token) does
-        not flood ``modal app logs``. The alert message is intentionally more
-        human-readable so it grabs attention in a paging dashboard.
+        Why throttle the WARNING too: a sustained primary outage produces one
+        fallback PER GENERATED TOKEN, so an unconditional warn-per-fallback
+        (the previous behaviour) emitted hundreds of identical
+        ``entropy.degraded`` lines per request and drowned ``modal app logs``
+        — the operator-flagged spam. The ``fallback_count`` carried on each
+        emitted record still lets a grep recover the running total, and the
+        status file + ``/health/entropy`` carry the exact live count for
+        anything that needs per-request precision.
         """
         now = time.monotonic()
         first_time = not self._currently_degraded
         self._currently_degraded = True
+
+        if not (first_time or (now - self._last_alert_monotonic) >= _ALERT_THROTTLE_S):
+            return
+
+        self._last_alert_monotonic = now
 
         logger.warning(
             "entropy.degraded: primary source %r unavailable (n=%d, err=%r); falling back to %r",
@@ -243,30 +254,25 @@ class FallbackEntropySource(EntropySource):
             },
         )
 
-        # Emit the louder alert (a) immediately on the FIRST fallback of a
-        # degraded window (so the operator sees it without waiting up to a
-        # minute) and (b) at most once per throttle window thereafter.
-        if first_time or (now - self._last_alert_monotonic) >= _ALERT_THROTTLE_S:
-            self._last_alert_monotonic = now
-            logger.error(
-                "ENTROPY DEGRADED: quantum source %r is unavailable; "
-                "serving %r (urandom-class) for sampling. "
-                "Total fallbacks since process start: %d. "
-                "Last error: %s. Operator action: check the cloudflared "
-                "sidecar (qr_sampler.cloudflared logs) and the QRNG service "
-                "health.",
-                self._primary.name,
-                self._fallback.name,
-                self._fallback_count,
-                str(exc),
-                extra={
-                    "event": "entropy.degraded.alert",
-                    "primary": self._primary.name,
-                    "fallback": self._fallback.name,
-                    "fallback_count": self._fallback_count,
-                    "error": str(exc),
-                },
-            )
+        logger.error(
+            "ENTROPY DEGRADED: quantum source %r is unavailable; "
+            "serving %r (urandom-class) for sampling. "
+            "Total fallbacks since process start: %d. "
+            "Last error: %s. Operator action: check the cloudflared "
+            "sidecar (qr_sampler.cloudflared logs) and the QRNG service "
+            "health.",
+            self._primary.name,
+            self._fallback.name,
+            self._fallback_count,
+            str(exc),
+            extra={
+                "event": "entropy.degraded.alert",
+                "primary": self._primary.name,
+                "fallback": self._fallback.name,
+                "fallback_count": self._fallback_count,
+                "error": str(exc),
+            },
+        )
 
     def enable_status_publishing(self) -> None:
         """Mark this wrapper as the owner of the cross-process status file.

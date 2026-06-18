@@ -223,28 +223,55 @@ tunable, or NVIDIA ships a cuda-checkpoint with faster enumeration
 for FP8 + custom-ops workloads, revisit and consider re-enabling
 larger `--max-num-seqs` for higher concurrency.
 
-### /health/entropy cross-process wiring — CLOSED iter-53 (2026-06-09, auto-memory `iter53_entropy_health_ipc`)
+### /health/entropy is PASSIVE — iter-57 (2026-06-17, auto-memory `iter53_entropy_health_ipc`)
 
 vLLM runs APIServer (middlewares) and EngineCore (LogitsProcessor,
 where fallbacks happen) as separate processes; module globals don't
 cross, so iter-49's `set_fallback_source` channel left `/health/entropy`
-503ing unconditionally. iter-53 closes it with two signals folded in
-`health_entropy_middleware`:
+503ing unconditionally. iter-53 closed that gap by folding a status
+file with a per-poll live gRPC probe. **iter-57 then removed the live
+probe entirely** — the endpoint is now PASSIVE:
 
-1. **Status file** — `FallbackEntropySource` writes
+1. **Status file (the only source)** — `FallbackEntropySource` writes
    `<tempdir>/qr_entropy_status.json` (atomic tmp+`os.replace`) on
    degraded/recovered transitions + 1 s-throttled count refreshes.
    Publishing is opt-in (`enable_status_publishing()`, called by
    `VLLMAdapter` on the DEFAULT pipeline only — the preinit `system`
-   wrapper must not clobber the quantum lane's file).
-2. **Live probe** — APIServer-local `QuantumGrpcSource` (retry 0,
-   ≤1 s timeout), 8-byte fetch per poll, 5 s verdict cache, run via
-   `asyncio.to_thread`.
+   wrapper must not clobber the quantum lane's file). The middleware
+   reads this file (or an in-process `FallbackEntropySource` ref in
+   single-process tests) and reports `rpc_ok = not currently_degraded`;
+   `null`+503 only when no state exists yet.
 
-`rpc_ok=false` ⇔ probe failed OR degraded window <30 s old. Payload
-also carries `tcp_ok`/`summary` (deploy-guard contract) and a
-`sampler` block (`currently_degraded`, `age_s`) the OWUI banner uses
-to catch PRNG responses even when its inlet snapshot failed.
+**Why passive (the cost lesson):** every `GET /health/entropy` is an
+external request that resets Modal's idle-scaledown timer — an
+always-on OWUI status chip polling it kept an idle H100 warm 24/7. The
+old design *also* fired an 8-byte gRPC round-trip at the QRNG on every
+poll. A status chip needs neither. The one-and-only gRPC liveness check
+is `QuantumGrpcSource.warmup()` at container start (verify → log → fall
+back); after that we "just go" and report what real token-sampling
+observed. `tcp_ok` is now always `null` (no live TCP probe) and the
+`probe` block was dropped; the `fallback_count` regenerate-banner
+already read the status file, not the probe, so consumers are
+unaffected. **Do not re-add a live probe or recurring poll to this
+path.** The chat side was fixed in lockstep: `qr_status.py` no longer
+probes upstreams (`/api/qr-status` is a local preset read) and the
+OWUI chip polls once instead of every 30 s.
+
+### Circuit-breaker recovery backs off exponentially — iter-57
+
+A short fixed recovery window (`QR_CB_RECOVERY_WINDOW_S=3`) was tuned
+for the post-wake stale-channel case (recover in one half-open cycle),
+but against a genuinely-down QRNG it re-probed every 3 s forever — each
+half-open tears down + rebuilds the gRPC channel and fires fresh
+connects, i.e. it hammers a dead server. `QuantumGrpcSource` now treats
+that value as the BASE only: consecutive opens without an intervening
+success double the wait (`base × 2^opens`) up to
+`QR_CB_RECOVERY_WINDOW_MAX_S=60`, reset to base on the first success.
+Paired with `QR_GRPC_RETRY_COUNT=0` (no per-token retries — each retry
+is another connect against a dead server) and the throttled
+`entropy.degraded` WARNING (first-of-window + once/min, was per-token),
+a sustained outage now settles at ~1 probe/min and a handful of log
+lines instead of a connect-storm + log flood.
 
 ### QRNG adaptive-timeout ratchet — iter-53 (auto-memory `qrng_adaptive_timeout_ratchet`)
 

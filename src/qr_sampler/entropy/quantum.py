@@ -510,6 +510,7 @@ class QuantumGrpcSource(EntropySource):
         self._cb_min_timeout_ms = config.cb_min_timeout_ms
         self._cb_timeout_multiplier = config.cb_timeout_multiplier
         self._cb_recovery_window_s = config.cb_recovery_window_s
+        self._cb_recovery_window_max_s = config.cb_recovery_window_max_s
         self._cb_max_consecutive_failures = config.cb_max_consecutive_failures
 
         # Quota telemetry state (see _is_quota_exhausted / _QUOTA_LOG_THROTTLE_S).
@@ -536,6 +537,12 @@ class QuantumGrpcSource(EntropySource):
         self._consecutive_failures: int = 0
         self._circuit_open: bool = False
         self._circuit_open_until: float = 0.0
+        # Number of consecutive circuit opens WITHOUT an intervening
+        # successful fetch. Drives the exponential backoff on the recovery
+        # window (see get_random_bytes) so a sustained outage is probed ever
+        # less often instead of every base-window seconds. Reset to 0 on the
+        # first successful fetch.
+        self._circuit_open_count: int = 0
 
         # Background event loop + gRPC channel are LAZILY initialized
         # on the first ``get_random_bytes()`` call. Phase 2 (2026-05-21):
@@ -804,6 +811,7 @@ class QuantumGrpcSource(EntropySource):
                 reply = self._fetch_sync(n)
                 self._update_latency(reply.elapsed_ms)
                 self._consecutive_failures = 0
+                self._circuit_open_count = 0
                 self._last_success_monotonic = time.monotonic()
                 return reply.payload
             except Exception as exc:
@@ -818,11 +826,29 @@ class QuantumGrpcSource(EntropySource):
         # All retries exhausted.
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._cb_max_consecutive_failures:
+            # Exponential backoff on the recovery window. The FIRST open uses
+            # the base window (short — so a transient post-wake stale channel
+            # recovers in one half-open cycle); each subsequent open without
+            # an intervening success doubles the wait, capped at
+            # cb_recovery_window_max_s. This is what stops a genuine QRNG
+            # outage from being re-probed every few seconds — each half-open
+            # tears down + rebuilds the channel and fires fresh connects, so a
+            # fixed short cadence hammers a dead server. open_count resets to 0
+            # on the next successful fetch (see the try block above).
+            window = min(
+                self._cb_recovery_window_s * (2 ** self._circuit_open_count),
+                self._cb_recovery_window_max_s,
+            )
             self._circuit_open = True
-            self._circuit_open_until = time.monotonic() + self._cb_recovery_window_s
+            self._circuit_open_until = time.monotonic() + window
+            self._circuit_open_count += 1
             logger.warning(
-                "Circuit breaker opened after %d consecutive failures",
+                "Circuit breaker opened after %d consecutive failures; "
+                "next half-open in %.0fs (open #%d, backing off to max %.0fs)",
                 self._consecutive_failures,
+                window,
+                self._circuit_open_count,
+                self._cb_recovery_window_max_s,
             )
 
         # iter-52d (2026-05-25): when every retry on an established
@@ -925,6 +951,7 @@ class QuantumGrpcSource(EntropySource):
         self._prefetch_hits += 1
         self._update_latency(reply.elapsed_ms)
         self._consecutive_failures = 0
+        self._circuit_open_count = 0
         self._last_success_monotonic = time.monotonic()
         return reply.payload
 

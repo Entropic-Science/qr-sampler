@@ -1031,7 +1031,19 @@ class VllmQrQwen:
         # common cause is the post-wake stale channel, which the
         # half-open path now fixes in one cycle — at ~2.6 tok/s a 10 s
         # window still costs ~26 PRNG tokens, a 3 s window costs ~8.
+        #
+        # iter-57: this is now the BASE window only. QuantumGrpcSource backs
+        # the recovery window off exponentially (base x 2^opens, capped at
+        # QR_CB_RECOVERY_WINDOW_MAX_S = 60 s) so the 3 s cadence applies ONLY
+        # to the first recovery attempt (the post-wake stale-channel case it
+        # was tuned for); a genuine multi-minute QRNG outage settles at ~1
+        # half-open/minute instead of hammering the dead server every 3 s.
         env.setdefault("QR_CB_RECOVERY_WINDOW_S", "3")
+        # iter-57: no per-token gRPC retries (1 attempt instead of 3). When
+        # the QRNG is down each retry is another connect against a dead
+        # server; the circuit breaker + system-PRNG fallback are the right
+        # resilience layering. See the PrismaQuant class for the full note.
+        env.setdefault("QR_GRPC_RETRY_COUNT", "0")
 
         # iter-09 (2026-05-21): iter-02's QR_ENTROPY_SOURCE_TYPE=system /
         # QR_PREINIT_ENTROPY_SOURCES=system overrides REMOVED. They were an
@@ -2043,7 +2055,18 @@ class VllmQrPrismaQuant:
         # half-open cadence — see the twin comments in the Qwen class's
         # _start_and_sleep above.
         env.setdefault("QR_CB_MIN_TIMEOUT_MS", "300")
+        # Recovery-window BASE stays short so a transient post-wake stale
+        # channel still recovers in one half-open. The exponential backoff
+        # in QuantumGrpcSource (capped at QR_CB_RECOVERY_WINDOW_MAX_S, default
+        # 60 s) stops a sustained QRNG outage from being re-probed every 3 s.
         env.setdefault("QR_CB_RECOVERY_WINDOW_S", "3")
+        # iter-57: no per-token gRPC retries. When the QRNG is down, each
+        # retry is another connect against a dead server (3 attempts/token =
+        # 3x the hammering before the breaker even opens). One attempt + the
+        # circuit breaker + system-PRNG fallback is the right resilience
+        # layering; retries only ever helped a flaky-but-up server, and the
+        # cost there (one extra PRNG token) is negligible.
+        env.setdefault("QR_GRPC_RETRY_COUNT", "0")
 
         cmd = [
             "vllm",

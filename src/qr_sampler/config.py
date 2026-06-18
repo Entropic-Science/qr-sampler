@@ -186,7 +186,26 @@ class QRSamplerConfig(BaseSettings):
     )
     cb_recovery_window_s: float = Field(
         default=10.0,
-        description="Seconds to wait before half-open retry after circuit opens",
+        description=(
+            "BASE seconds to wait before the FIRST half-open retry after the "
+            "circuit opens. Subsequent opens without an intervening success "
+            "back off exponentially (base x 2^opens) up to "
+            "cb_recovery_window_max_s. Keeping the base short lets a transient "
+            "post-wake stale channel recover in one cycle; the backoff stops a "
+            "sustained outage (QRNG origin down for minutes) from being probed "
+            "every base-seconds, which would hammer a dead server with channel "
+            "resets + reconnects."
+        ),
+    )
+    cb_recovery_window_max_s: float = Field(
+        default=60.0,
+        description=(
+            "Ceiling for the exponentially-backed-off recovery window. Caps "
+            "half-open reconnect attempts at ~one per this many seconds during "
+            "a sustained QRNG outage. Trade-off: once the QRNG recovers, the "
+            "circuit can stay open for up to this long before the next "
+            "half-open re-engages the primary (bounded extra PRNG fallback)."
+        ),
     )
     cb_max_consecutive_failures: int = Field(
         default=3,

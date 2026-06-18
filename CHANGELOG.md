@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (iter-57) — stop hammering the QRNG gRPC
+
+- **`/health/entropy` is now PASSIVE**: the middleware reports last-known
+  entropy health from the cross-process status file (written by EngineCore
+  during real token-sampling) and never opens a gRPC channel on poll. The
+  per-poll live 8-byte probe, the lazily-built APIServer `QuantumGrpcSource`,
+  the TCP pre-probe, and the `_combine_rpc_ok`/`_live_probe_sync` machinery
+  are removed. `rpc_ok = not currently_degraded` when state is known,
+  `null`+503 otherwise. `tcp_ok` is always `null`; the `probe` block is gone.
+  Rationale: every external `GET` resets Modal's idle-scaledown timer (an
+  always-on OWUI chip polling it kept an idle H100 warm), and the live probe
+  poked the QRNG just to tint a status chip. The one-time gRPC verification
+  stays in `QuantumGrpcSource.warmup()` at container start.
+- **Circuit-breaker recovery window backs off exponentially**: new
+  `cb_recovery_window_max_s` (default 60 s, env `QR_CB_RECOVERY_WINDOW_MAX_S`).
+  `QR_CB_RECOVERY_WINDOW_S=3` is now the BASE; consecutive opens without an
+  intervening success double the wait (`base × 2^opens`, capped at the max),
+  reset on first success. A sustained QRNG outage settles at ~1 half-open
+  reconnect/min instead of a channel-reset storm every 3 s.
+- **No per-token gRPC retries**: `QR_GRPC_RETRY_COUNT` default set to `0` for
+  both vLLM classes. When the QRNG is down each retry is another connect
+  against a dead server; the circuit breaker + system-PRNG fallback are the
+  correct resilience layer.
+- **Throttled degraded logging**: the structured `entropy.degraded` WARNING is
+  now rate-limited together with the `entropy.degraded.alert` ERROR (first
+  fallback of a window + at most once/min), instead of one WARNING per
+  generated token. The running `fallback_count` rides every record and the
+  status file carries the exact live count, so nothing is lost.
+
 ### Fixed (iter-55)
 
 - **Post-wake CUDA-graph recapture**: the Modal sleep → CRIU snapshot → restore →
