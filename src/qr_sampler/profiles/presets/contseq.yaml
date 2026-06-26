@@ -18,3 +18,6 @@ origin: null
 overrides:
   entropy_source_type: quantum_grpc
   signal_amplifier_type: zscore_mean
+  # Pin 10000 so each contseq roll is fixed regardless of the prod
+  # QR_SAMPLE_COUNT (12800) that the OWUI container's Modal Secret mounts.
+  sample_count: 10000

@@ -69,6 +69,11 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     "contseq": {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        # Pin 10000 so each contseq roll is fixed regardless of the prod
+        # QR_SAMPLE_COUNT (12800 GPU-token bandwidth value) that the OWUI
+        # container's Modal Secret happens to mount — decouples the
+        # thought-engine rolls from the GPU sampling lane's env var.
+        "sample_count": 10000,
     },
     # Qthought decode lane (qr_sampler.qthought.QthoughtRoller). The grammar
     # makes one full-size entropy fetch per case-frame decision, each reduced to

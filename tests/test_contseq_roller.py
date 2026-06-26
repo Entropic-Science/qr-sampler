@@ -129,10 +129,12 @@ def test_status_without_fallback_wrapper(mock_config: QRSamplerConfig) -> None:
 
 
 def test_contseq_preset_registered() -> None:
-    """The contseq preset pins the quantum source + zscore amplifier."""
+    """The contseq preset pins the quantum source, zscore amplifier, and
+    a fixed 10000 sample_count (decoupled from the prod QR_SAMPLE_COUNT)."""
     assert BUILTIN_PRESETS["contseq"] == {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "sample_count": 10000,
     }
 
 
