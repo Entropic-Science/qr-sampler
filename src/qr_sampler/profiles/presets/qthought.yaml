@@ -1,0 +1,24 @@
+id: qthought
+name: "Qthought decode lane"
+description: |
+  Entropy profile for the qthought roller
+  (``qr_sampler.qthought.QthoughtRoller``), not a GPU sampling lane.
+
+  The case-frame grammar makes one full-size entropy fetch per decision
+  (schema pick, slot-presence coin, lexicon choice, integer bind), each
+  reduced to a uniform via the amplifier — exactly the entropy half of one
+  token-sampling step, so the grammar decisions and the token samples share
+  the same statistical machinery.
+
+  Pins the quantum gRPC source and the optional thought-level amplifier
+  (``zscore_thought``) so a per-thought aggregate bias rides alongside the
+  unchanged per-decision draws. The lineage is explicit in ``config_hash``.
+
+experimental: false
+origin: null
+overrides:
+  entropy_source_type: quantum_grpc
+  signal_amplifier_type: zscore_thought
+  # Pin 10000 so each qthought decision is fixed regardless of the prod
+  # QR_SAMPLE_COUNT that the serving container's Secret happens to mount.
+  sample_count: 10000

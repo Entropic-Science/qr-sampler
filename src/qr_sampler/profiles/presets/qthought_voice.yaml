@@ -1,0 +1,21 @@
+id: qthought_voice
+name: "Qthought SPEAK lane"
+description: |
+  Per-request sampling lane for the qthought SPEAK step — the user-visible
+  spoken turn produced only when a proposed utterance is disposed to speech.
+
+  EDT (entropy-dependent temperature) with nucleus + top-k truncation for
+  fluent, focused speech — cooler and tighter than the REFLECT lane so the
+  voice reads as composed rather than divergent. Full-size fetch (10000 bytes)
+  on the quantum source with plain ``zscore_mean``.
+
+experimental: false
+origin: null
+overrides:
+  temperature_strategy: edt
+  edt_base_temp: 0.8
+  top_k: 50
+  top_p: 0.9
+  sample_count: 10000
+  entropy_source_type: quantum_grpc
+  signal_amplifier_type: zscore_mean

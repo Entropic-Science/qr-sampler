@@ -1,0 +1,23 @@
+id: qthought_think
+name: "Qthought REFLECT lane"
+description: |
+  Per-request sampling lane for the qthought REFLECT step — the private
+  inner-voice line plus the propose-speech tool call.
+
+  Derived from the ``creative_sampling`` HVH-Drift family: only the base
+  temperature is lifted here (to 1.45) for more divergent reflection; the
+  remaining ``hvh_*`` terms inherit the V6_HVD_R01_01 winning field defaults.
+  A smaller per-request fetch (6000 bytes) trims latency for the reflection
+  pass. Plain ``zscore_mean`` — the thought-level aggregate bias lives on the
+  qthought decode lane, not the model sampling lane.
+
+experimental: false
+origin: "Derived from creative_sampling (V6_HVD_R01_01) with a hotter base temperature"
+overrides:
+  temperature_strategy: hvh_drift
+  hvh_t_base: 1.45
+  top_k: 0
+  top_p: 1.0
+  sample_count: 6000
+  entropy_source_type: quantum_grpc
+  signal_amplifier_type: zscore_mean

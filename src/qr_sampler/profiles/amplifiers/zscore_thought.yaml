@@ -1,0 +1,42 @@
+id: zscore_thought
+name: "Z-Score Thought"
+description: |
+  Z-score mean amplifier with an optional thought-level bias aggregate.
+
+  Per-token amplification is byte-identical to zscore_mean: N raw entropy bytes
+  are mapped to a single float u in (0, 1) by:
+    1. Interpreting bytes as uint8 values [0, 255]
+    2. Computing sample mean M
+    3. Computing SEM = population_std / sqrt(N)   (always derived, never stored)
+    4. Computing z = (M - population_mean) / SEM
+    5. Mapping to uniform: u = 0.5 * (1 + erf(z / sqrt(2)))
+    6. Clamping to (epsilon, 1 - epsilon) to avoid degenerate CDF lookups
+
+  In addition, this amplifier exposes an optional, duck-typed thought protocol
+  (begin_thought / thought_aggregate) that folds the byte statistics of every
+  amplify() call within a "thought" into one thought-scoped z-score and bias.
+  The accumulator is a pure side-channel: it never influences the per-token u,
+  so per-token sampling is identical to zscore_mean and the protocol costs the
+  shipped path nothing when it is not used.
+
+  Use this amplifier when a consumer wants one aggregate bias signal per thought
+  on top of unchanged per-token sampling. For ordinary per-token sampling with
+  no thought-level aggregate, prefer zscore_mean.
+
+  Configuration:
+    QR_SIGNAL_AMPLIFIER_TYPE=zscore_thought
+    QR_SAMPLE_COUNT=10000                   (bytes per token, default)
+    QR_POPULATION_MEAN=127.5               (null hypothesis mean)
+    QR_POPULATION_STD=73.61215932...       (std of Uniform[0, 255])
+
+amplifier_class: "qr_sampler.amplification.zscore_thought:ZScoreThoughtAmplifier"
+input_assumptions: "Uniform byte distribution (each byte i.i.d. Uniform[0, 255])"
+
+compatible_entropy_sources:
+  - system
+  - quantum_grpc
+  - timing_noise
+  - mock_uniform
+  - openentropy
+
+known_incompatible_entropy_sources: []
