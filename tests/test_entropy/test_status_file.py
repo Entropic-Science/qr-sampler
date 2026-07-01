@@ -36,9 +36,7 @@ class TestStatusFilePath:
 
 class TestWriteRead:
     def test_roundtrip(self, status_path) -> None:
-        ok = status_file.write_entropy_status(
-            {"fallback_count": 3, "currently_degraded": True}
-        )
+        ok = status_file.write_entropy_status({"fallback_count": 3, "currently_degraded": True})
         assert ok is True
         data = status_file.read_entropy_status()
         assert data is not None
@@ -86,7 +84,5 @@ class TestWriteRead:
         assert json.loads(raw)["a"] == "b"
 
     def test_write_unwritable_dir_returns_false(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setenv(
-            "QR_ENTROPY_STATUS_FILE", str(tmp_path / "no_such_dir" / "s.json")
-        )
+        monkeypatch.setenv("QR_ENTROPY_STATUS_FILE", str(tmp_path / "no_such_dir" / "s.json"))
         assert status_file.write_entropy_status({"x": 1}) is False

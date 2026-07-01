@@ -102,8 +102,18 @@ APP_NAME = "qr-llm-chat"
 # ``qr_llm_chat/functions/_sources/qr_comparison_pipe.py``. A mismatch breaks
 # OWUI routing (vLLM returns 404 on /v1/chat/completions when ``model:``
 # does not match ``/v1/models``).
-MODEL_HF_REPO_ID = "lovedheart/Qwen3.5-9B-FP8"  # community FP8 e4m3 build of Qwen3.5-9B (~9 GiB resident, vs ~18 GiB for the official bf16 build, vs ~27 GiB for the prior Qwen3.6-27B-FP8). Demo-grade: 3x smaller cold-from-storage payload than the 27B pin → projected snapshot restore ~40 s vs 115-125 s. Architecture is Qwen3_5ForConditionalGeneration so the existing transformers==5.5.4 + MM-probe monkey-patch combo applies unchanged. No official Qwen-org FP8 build of 3.5-9B exists at deploy time (2026-05-24); ``lovedheart`` is the only published FP8 quant. If a future Qwen-org FP8 build appears, switch back to ``Qwen/<...>``.
-MODEL_SERVED_NAME = "qwen3.5-9b"  # /v1/models id; lockstep with qr-llm-chat _QWEN_ID (precision is implementation detail, not picker-visible)
+# community FP8 e4m3 build of Qwen3.5-9B (~9 GiB resident, vs ~18 GiB for the
+# official bf16 build, vs ~27 GiB for the prior Qwen3.6-27B-FP8). Demo-grade:
+# 3x smaller cold-from-storage payload than the 27B pin → projected snapshot
+# restore ~40 s vs 115-125 s. Architecture is Qwen3_5ForConditionalGeneration
+# so the existing transformers==5.5.4 + MM-probe monkey-patch combo applies
+# unchanged. No official Qwen-org FP8 build of 3.5-9B exists at deploy time
+# (2026-05-24); ``lovedheart`` is the only published FP8 quant. If a future
+# Qwen-org FP8 build appears, switch back to ``Qwen/<...>``.
+MODEL_HF_REPO_ID = "lovedheart/Qwen3.5-9B-FP8"
+# /v1/models id; lockstep with qr-llm-chat _QWEN_ID (precision is an
+# implementation detail, not picker-visible).
+MODEL_SERVED_NAME = "qwen3.5-9b"
 
 # iter-14: Snapshot identity hardening. The HF revision used to default to
 # os.environ.get("QWEN_REVISION", "") which (a) silently resolves to "latest"
@@ -116,7 +126,8 @@ MODEL_SERVED_NAME = "qwen3.5-9b"  # /v1/models id; lockstep with qr-llm-chat _QW
 # An empty string here still falls through (so dev iteration on environments
 # without the SHA available is unblocked), but the predeploy.ps1 gate in
 # qr-llm-chat refuses to deploy until this is populated.
-MODEL_REVISION: str = "5d77dcb2e2c606bc261b5b8e946a67781f18d733"  # lovedheart/Qwen3.5-9B-FP8 main as of 2026-05-24 via HF API
+# lovedheart/Qwen3.5-9B-FP8 main as of 2026-05-24 via HF API.
+MODEL_REVISION: str = "5d77dcb2e2c606bc261b5b8e946a67781f18d733"
 
 # iter-14: Snapshot identity version. Modal computes the snapshot key from
 # the image hash + the @modal.enter(snap=True) body. This constant is NOT
@@ -133,7 +144,13 @@ MODEL_REVISION: str = "5d77dcb2e2c606bc261b5b8e946a67781f18d733"  # lovedheart/Q
 # monotonic sub-iteration counter inside that iter.
 SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-15-001-qwen3.5-9b-fp8-demo"
 
-MODEL_GPU_MEMORY_UTILIZATION = "0.85"  # iter-15: bumped from 0.8 (which was tight for 27B-FP8) to 0.85 with the 9B-FP8 swap. 9 GiB weights leave plenty of headroom under H100's 79 GiB even at 0.85 utilization; the extra 5 % expands the KV cache budget so multi-turn chats stay coherent through a longer demo session without prefix caching (which is the one knob we can't re-enable per auto-memory iter14_snapshot_load_working).
+# iter-15: bumped from 0.8 (which was tight for 27B-FP8) to 0.85 with the
+# 9B-FP8 swap. 9 GiB weights leave plenty of headroom under H100's 79 GiB even
+# at 0.85 utilization; the extra 5 % expands the KV cache budget so multi-turn
+# chats stay coherent through a longer demo session without prefix caching
+# (which is the one knob we can't re-enable per auto-memory
+# iter14_snapshot_load_working).
+MODEL_GPU_MEMORY_UTILIZATION = "0.85"
 
 # ---- iter-17 NEW PROFILE: PrismaQuant on vLLM v0.20.0 ---------------------
 # Parallel constants block for the experimental PrismaQuant profile. The
@@ -164,7 +181,9 @@ PRISMAQUANT_MODEL_REVISION: Final[str] = "09de726107c7f9c6b44e34c28541579f0b73a7
 # the snapshotted EngineCore) + the usage-counted sleep/wake perf probes.
 # (iter-55: selector fast path + perf telemetry; iter-54: prefetch.)
 PRISMAQUANT_SNAPSHOT_IDENTITY_VERSION: Final[str] = "iter-56-001-honest-probes"
-PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"  # operator override of recipe's 0.90; demo doesn't use MTP so no need to grow KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
+# operator override of recipe's 0.90; demo doesn't use MTP so no need to grow
+# KV budget — keep headroom for cuBLAS + FlashInfer NVFP4 workspaces.
+PRISMAQUANT_GPU_MEMORY_UTILIZATION = "0.8"
 
 # ---- iter-55: post-wake engine recapture --------------------------------
 # Root cause of the ~2.7 tok/s production floor (iter-54 investigation):
@@ -297,9 +316,7 @@ def _post_wake_engine_recapture(
         )
         return
 
-    pre_ms = _measure_decode_ms_per_token(
-        base_url, model_name, log, phase="pre_recapture"
-    )
+    pre_ms = _measure_decode_ms_per_token(base_url, model_name, log, phase="pre_recapture")
 
     t0 = time.monotonic()
     try:
@@ -311,8 +328,7 @@ def _post_wake_engine_recapture(
         r.raise_for_status()
     except Exception as exc:
         log.warning(
-            "post-wake CUDA-graph recapture failed (engine continues on the "
-            "slow path): %s",
+            "post-wake CUDA-graph recapture failed (engine continues on the slow path): %s",
             exc,
             extra={
                 "event": "vllm.wake.recapture_failed",
@@ -325,15 +341,10 @@ def _post_wake_engine_recapture(
         return
     recapture_ms = (time.monotonic() - t0) * 1000.0
 
-    post_ms = _measure_decode_ms_per_token(
-        base_url, model_name, log, phase="post_recapture"
-    )
-    speedup = (
-        round(pre_ms / post_ms, 2) if (pre_ms and post_ms and post_ms > 0) else None
-    )
+    post_ms = _measure_decode_ms_per_token(base_url, model_name, log, phase="post_recapture")
+    speedup = round(pre_ms / post_ms, 2) if (pre_ms and post_ms and post_ms > 0) else None
     log.info(
-        "post-wake CUDA-graph recapture complete in %.0f ms (decode %s -> %s "
-        "ms/token, speedup=%s)",
+        "post-wake CUDA-graph recapture complete in %.0f ms (decode %s -> %s ms/token, speedup=%s)",
         recapture_ms,
         f"{pre_ms:.0f}" if pre_ms else "?",
         f"{post_ms:.0f}" if post_ms else "?",
@@ -347,6 +358,7 @@ def _post_wake_engine_recapture(
             "speedup": speedup,
         },
     )
+
 
 # Phase 2 R6: anchor for the cold-start budget event. Captured once at
 # module import (i.e. each Modal container's Python process boot). The
@@ -689,14 +701,14 @@ def download_weights() -> dict[str, str]:
     google/gemma-4-31B) remain on the volume so resuming any of them is
     a code-only change to ``MODEL_HF_REPO_ID`` with a warm cache hit.
     """
-    from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+    from huggingface_hub import snapshot_download
 
     qwen_kwargs: dict[str, Any] = {"repo_id": _QWEN_REPO}
     if _QWEN_REVISION:
         qwen_kwargs["revision"] = _QWEN_REVISION
 
     qwen_path = snapshot_download(**qwen_kwargs)
-    weights_volume.commit()  # type: ignore[attr-defined]
+    weights_volume.commit()
 
     return {
         "qwen_path": qwen_path,
@@ -725,14 +737,14 @@ def download_weights_prismaquant() -> dict[str, str]:
     revision matches the cache and re-pulls only if the local files are
     stale.
     """
-    from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+    from huggingface_hub import snapshot_download
 
     kwargs: dict[str, Any] = {"repo_id": PRISMAQUANT_MODEL_HF_REPO_ID}
     if PRISMAQUANT_MODEL_REVISION:
         kwargs["revision"] = PRISMAQUANT_MODEL_REVISION
 
     path = snapshot_download(**kwargs)
-    weights_volume.commit()  # type: ignore[attr-defined]
+    weights_volume.commit()
 
     return {
         "prismaquant_path": path,
@@ -1113,7 +1125,7 @@ class VllmQrQwen:
             # dormant — its own ``cache_dtype.startswith("fp8")`` gate
             # short-circuits when the cmd does not request ``--kv-cache-dtype
             # fp8``. FP8 weights (~9 GiB) + bf16 KV cache (bounded by
-            # max-num-seqs=4 × max-model-len=32768) + activation fits
+            # max-num-seqs=4 x max-model-len=32768) + activation fits
             # comfortably under the 73 GiB usable budget on the H100:1 with
             # the gpu-memory-utilization=0.85 ceiling below.
             # iter-14d (2026-05-23): --enable-prefix-caching DROPPED.
@@ -1742,8 +1754,7 @@ class VllmQrQwen:
                 },
             )
             raise RuntimeError(
-                f"vllm post-wake /health did not return 200 within "
-                f"{self._SLEEP_WAKE_TIMEOUT_S}s"
+                f"vllm post-wake /health did not return 200 within {self._SLEEP_WAKE_TIMEOUT_S}s"
             )
         log.info(
             "vllm engine awake + healthy (snapshot-restored) for %s",
@@ -2571,8 +2582,7 @@ class VllmQrPrismaQuant:
                 },
             )
             raise RuntimeError(
-                f"vllm post-wake /health did not return 200 within "
-                f"{self._SLEEP_WAKE_TIMEOUT_S}s"
+                f"vllm post-wake /health did not return 200 within {self._SLEEP_WAKE_TIMEOUT_S}s"
             )
         log.info(
             "vllm engine awake + healthy (snapshot-restored) for %s",
@@ -2636,7 +2646,9 @@ class VllmQrPrismaQuant:
         # Background /health poller — same as VllmQrQwen.
         self._health_stop_event = threading.Event()
         self._health_thread = threading.Thread(
-            target=self._poll_vllm_health,
+            # Borrowed from VllmQrQwen (see the class-body note below); mypy
+            # can't model the cross-class method reuse, correct at runtime.
+            target=self._poll_vllm_health,  # type: ignore[misc]
             args=(self._health_stop_event,),
             daemon=True,
             name=f"vllm-health-{self.SERVED_MODEL_NAME}",
@@ -2960,7 +2972,7 @@ _OWUI_IMAGE = (
         " -o /tmp/cloudflared.deb"
         " && echo \"cloudflared.sha256 $(sha256sum /tmp/cloudflared.deb | cut -d' ' -f1)\""
         " && dpkg -i /tmp/cloudflared.deb"
-        " && echo \"cloudflared.version $(cloudflared --version 2>&1 | head -1)\""
+        ' && echo "cloudflared.version $(cloudflared --version 2>&1 | head -1)"'
         " && rm /tmp/cloudflared.deb"
     )
     .add_local_python_source("qr_sampler", copy=True)

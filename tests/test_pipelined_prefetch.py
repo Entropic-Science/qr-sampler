@@ -186,9 +186,7 @@ class TestPipelinePrefetch:
         prev_token = -1
         for step in range(3):
             ctx = PrefetchContext(salt=salt, step=step, ticket=ticket)
-            result = pipeline.sample_token(
-                _logits(), prefetch_ctx=ctx, build_onehot=False
-            )
+            result = pipeline.sample_token(_logits(), prefetch_ctx=ctx, build_onehot=False)
             prev_token = result.token_id
             ticket = result.next_ticket
             audit.append((step + 1, prev_token, ticket.nonce))
@@ -288,9 +286,7 @@ class TestAdapterTicketLifecycle:
         state = adapter._request_states[req_idx]
         return state.pipeline.entropy_source._primary  # type: ignore[no-any-return]
 
-    def test_add_fires_first_prefetch_with_sentinel_commitment(
-        self, adapter: Any
-    ) -> None:
+    def test_add_fires_first_prefetch_with_sentinel_commitment(self, adapter: Any) -> None:
         adapter.update_state(_batch_add(0))
         state = adapter._request_states[0]
         assert state.entropy_ticket is not None

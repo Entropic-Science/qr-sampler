@@ -174,14 +174,12 @@ class FallbackEntropySource(EntropySource):
         """
         if ticket is None:
             return self.get_random_bytes(n)
-        return self._fetch_via(
-            n, lambda: self._primary.get_random_bytes_with_ticket(n, ticket)
-        )
+        return self._fetch_via(n, lambda: self._primary.get_random_bytes_with_ticket(n, ticket))
 
     def _fetch_via(self, n: int, fetch_fn: Any) -> bytes:
         """Shared primary-then-fallback flow for serial and ticket fetches."""
         try:
-            data = fetch_fn()
+            data: bytes = fetch_fn()
             recovered = self._currently_degraded
             if recovered:
                 # Transition back to primary — emit a single all-clear event.

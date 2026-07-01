@@ -258,9 +258,7 @@ def _decode_entropy_response(data: bytes) -> tuple[bytes, int, int]:
         else:
             break
     if payload is None:
-        raise EntropyUnavailableError(
-            "Failed to decode gRPC response: field 1 (bytes) not found"
-        )
+        raise EntropyUnavailableError("Failed to decode gRPC response: field 1 (bytes) not found")
     return payload, sequence_id, generation_ts
 
 
@@ -439,9 +437,7 @@ class _BidiSession:
         self.dead = True
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(
-                    EntropyUnavailableError(f"Bidi stream failed: {error}")
-                )
+                fut.set_exception(EntropyUnavailableError(f"Bidi stream failed: {error}"))
         self._pending.clear()
 
     def close(self) -> None:
@@ -797,9 +793,7 @@ class QuantumGrpcSource(EntropySource):
                 try:
                     self._reset_channel()
                 except Exception as reset_exc:
-                    logger.warning(
-                        "half-open channel reset failed: %s", reset_exc
-                    )
+                    logger.warning("half-open channel reset failed: %s", reset_exc)
             else:
                 raise EntropyUnavailableError(
                     "Circuit breaker open: too many consecutive gRPC failures"
@@ -836,7 +830,7 @@ class QuantumGrpcSource(EntropySource):
             # fixed short cadence hammers a dead server. open_count resets to 0
             # on the next successful fetch (see the try block above).
             window = min(
-                self._cb_recovery_window_s * (2 ** self._circuit_open_count),
+                self._cb_recovery_window_s * (2**self._circuit_open_count),
                 self._cb_recovery_window_max_s,
             )
             self._circuit_open = True
@@ -861,9 +855,7 @@ class QuantumGrpcSource(EntropySource):
         try:
             self._reset_channel()
         except Exception as reset_exc:
-            logger.warning(
-                "channel reset after retry-exhaust failed: %s", reset_exc
-            )
+            logger.warning("channel reset after retry-exhaust failed: %s", reset_exc)
 
         raise EntropyUnavailableError(
             f"gRPC entropy fetch failed after {1 + self._retry_count} attempts: {last_error}"
@@ -896,16 +888,13 @@ class QuantumGrpcSource(EntropySource):
             return None
         if (
             self._preprobe_enabled
-            and (time.monotonic() - self._last_preprobe_fail_monotonic)
-            < _PREPROBE_BACKOFF_S
+            and (time.monotonic() - self._last_preprobe_fail_monotonic) < _PREPROBE_BACKOFF_S
         ):
             return None
         try:
             self._ensure_channel()
             assert self._loop is not None
-            future = asyncio.run_coroutine_threadsafe(
-                self._fetch_async(n, nonce or 0), self._loop
-            )
+            future = asyncio.run_coroutine_threadsafe(self._fetch_async(n, nonce or 0), self._loop)
         except Exception as exc:
             logger.debug("prefetch dispatch failed: %s", exc)
             return None
@@ -938,9 +927,7 @@ class QuantumGrpcSource(EntropySource):
             ticket.cancel()
             ticket.hit = False
             self._prefetch_misses += 1
-            logger.debug(
-                "prefetch redeem failed (%s); falling back to serial fetch", exc
-            )
+            logger.debug("prefetch redeem failed (%s); falling back to serial fetch", exc)
             return self.get_random_bytes(n)
 
         # Success bookkeeping mirrors the serial path.
@@ -1133,9 +1120,7 @@ class QuantumGrpcSource(EntropySource):
         )
         return _decode_entropy_response(raw_response)
 
-    async def _fetch_server_streaming(
-        self, n: int, nonce: int = 0
-    ) -> tuple[bytes, int, int]:
+    async def _fetch_server_streaming(self, n: int, nonce: int = 0) -> tuple[bytes, int, int]:
         """Use the streaming RPC in a request/response style.
 
         Sends one request and reads one response from the stream.
@@ -1155,9 +1140,7 @@ class QuantumGrpcSource(EntropySource):
         call.cancel()
         return _decode_entropy_response(raw_response)
 
-    async def _fetch_bidi_streaming(
-        self, n: int, nonce: int = 0
-    ) -> tuple[bytes, int, int]:
+    async def _fetch_bidi_streaming(self, n: int, nonce: int = 0) -> tuple[bytes, int, int]:
         """Fetch over one persistent, correlation-safe bidirectional stream.
 
         The ``_BidiSession`` is lazily created on first call and reused;

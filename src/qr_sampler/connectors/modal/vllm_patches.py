@@ -172,7 +172,7 @@ def _install_fp8_kv_scales_patch() -> None:
             },
         )
 
-    _patched_init_fp8_kv_scales._qr_patched = True  # type: ignore[attr-defined]
+    _patched_init_fp8_kv_scales._qr_patched = True
     runner_cls.init_fp8_kv_scales = _patched_init_fp8_kv_scales
     _log.info(
         "vllm fp8_kv_scales patch installed on GPUModelRunner",
@@ -187,7 +187,7 @@ def _install_fp8_kv_scales_patch() -> None:
 # non-Modal contexts still import this module cleanly").
 try:
     install_vllm_patches()
-except Exception as _err:  # noqa: BLE001 -- defence-in-depth catch is intentional
+except Exception as _err:
     _log.warning(
         "vllm_patches install raised %s: %s — LP discovery proceeding without patches",
         type(_err).__name__,

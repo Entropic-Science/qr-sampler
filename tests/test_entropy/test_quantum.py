@@ -772,9 +772,7 @@ class TestCommitmentNonceWireFormat:
 
     def test_decode_response_defaults_absent_fields_to_zero(self) -> None:
         """Servers that don't echo sequence_id yield (payload, 0, 0)."""
-        payload, seq, gen_ts = _decode_entropy_response(
-            _encode_mock_response(b"\x01\x02")
-        )
+        payload, seq, gen_ts = _decode_entropy_response(_encode_mock_response(b"\x01\x02"))
         assert payload == b"\x01\x02"
         assert seq == 0
         assert gen_ts == 0
@@ -921,9 +919,7 @@ class TestPreprobeHealthySuppression:
                     probes.append(None)
                     return MagicMock()
 
-                monkeypatch.setattr(
-                    "socket.create_connection", counting_connect
-                )
+                monkeypatch.setattr("socket.create_connection", counting_connect)
                 source.get_random_bytes(4)  # first fetch: probe runs
                 assert len(probes) == 1
                 source.get_random_bytes(4)  # healthy: probe suppressed
@@ -1248,9 +1244,7 @@ class TestQuotaExhaustedClassification:
         with patch("grpc.aio.insecure_channel") as mock_channel_fn:
             mock_channel = MagicMock()
             mock_channel_fn.return_value = mock_channel
-            mock_unary_handle = AsyncMock(
-                side_effect=_FakeRpcError("RESOURCE_EXHAUSTED")
-            )
+            mock_unary_handle = AsyncMock(side_effect=_FakeRpcError("RESOURCE_EXHAUSTED"))
             mock_channel.unary_unary = MagicMock(return_value=mock_unary_handle)
 
             from qr_sampler.entropy.quantum import QuantumGrpcSource
@@ -1320,9 +1314,14 @@ class TestQbertResponseShape:
         timestamp_us = 1_781_159_892_384_000
         device_id = b"qbert-device-01"
         wire = (
-            b"\x0a" + _encode_varint(len(payload)) + payload  # field 1, bytes
-            + b"\x10" + _encode_varint(timestamp_us)  # field 2, varint
-            + b"\x1a" + _encode_varint(len(device_id)) + device_id  # field 3, str
+            b"\x0a"
+            + _encode_varint(len(payload))
+            + payload  # field 1, bytes
+            + b"\x10"
+            + _encode_varint(timestamp_us)  # field 2, varint
+            + b"\x1a"
+            + _encode_varint(len(device_id))
+            + device_id  # field 3, str
         )
         decoded_payload, seq, gen_ts = _decode_entropy_response(wire)
         assert decoded_payload == payload

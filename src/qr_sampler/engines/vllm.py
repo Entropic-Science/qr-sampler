@@ -55,7 +55,7 @@ try:
         LogitsProcessor as _VLLMLogitsProcessorBase,
     )
 except ImportError:  # pragma: no cover - exercised only outside Modal
-    _VLLMLogitsProcessorBase = object  # type: ignore[assignment,misc]
+    _VLLMLogitsProcessorBase = object
 
 if TYPE_CHECKING:
     from qr_sampler.amplification.base import SignalAmplifier
@@ -364,9 +364,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # builds a system-primary wrapper whose always-healthy state must
         # not clobber the quantum lane's file.
         try:
-            enable = getattr(
-                self._pipeline.entropy_source, "enable_status_publishing", None
-            )
+            enable = getattr(self._pipeline.entropy_source, "enable_status_publishing", None)
             if callable(enable):
                 enable()
         except Exception:

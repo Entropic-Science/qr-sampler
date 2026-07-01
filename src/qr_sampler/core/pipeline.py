@@ -343,9 +343,7 @@ class SamplingPipeline:
             next_nonce = derive_commit_nonce(
                 prefetch_ctx.salt, prefetch_ctx.step + 1, selection.token_id
             )
-            next_ticket = self._entropy_source.prefetch(
-                active_config.sample_count, next_nonce
-            )
+            next_ticket = self._entropy_source.prefetch(active_config.sample_count, next_nonce)
 
         # --- 6. Build one-hot numpy array (optional) ---
         one_hot: np.ndarray | None = None
@@ -362,12 +360,8 @@ class SamplingPipeline:
         # source at redemption time (None on the serial path).
         prefetch_hit = getattr(ticket, "hit", None) if ticket is not None else None
         ticket_nonce = getattr(ticket, "nonce", 0) if ticket is not None else 0
-        echo_verified = (
-            getattr(ticket, "echo_verified", None) if ticket is not None else None
-        )
-        server_ts_ns = (
-            getattr(ticket, "server_timestamp_ns", None) if ticket is not None else None
-        )
+        echo_verified = getattr(ticket, "echo_verified", None) if ticket is not None else None
+        server_ts_ns = getattr(ticket, "server_timestamp_ns", None) if ticket is not None else None
 
         # Optional HVH-Drift / preset diagnostics. ``.get`` returns ``None``
         # for non-HVH strategies and pre-Step-2 selectors that omit min_p_used.

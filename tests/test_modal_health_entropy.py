@@ -20,9 +20,7 @@ from qr_sampler.entropy.status_file import write_entropy_status  # noqa: E402
 @pytest.fixture(autouse=True)
 def clean_module_state(tmp_path, monkeypatch):
     """Isolate the status file + module globals per test."""
-    monkeypatch.setenv(
-        "QR_ENTROPY_STATUS_FILE", str(tmp_path / "qr_entropy_status.json")
-    )
+    monkeypatch.setenv("QR_ENTROPY_STATUS_FILE", str(tmp_path / "qr_entropy_status.json"))
     mw.set_fallback_source(None)
     yield
     mw.set_fallback_source(None)
