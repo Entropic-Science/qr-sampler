@@ -1132,14 +1132,17 @@ class VllmQrQwen:
             # this hardware). The user has explicitly accepted slower
             # normal-start in exchange for reliable snapshot load.
             # "--enable-prefix-caching",  # DISABLED iter-14d
-            # Context window: 32768 tokens. iter-04's 8192 capped real
-            # multi-turn chat at ~4 turns before truncation, which is
-            # unusable for OWUI's typical session. 32k accommodates
-            # ~16 turns of dense conversation. KV pre-allocation cost is
-            # bounded by max-num-seqs × per-token KV (vLLM packs
-            # dynamically), not by max-model-len alone.
+            # Context window: 65536 tokens (iter 2026-06-23, was 32768 since
+            # iter-04/12). 64k accommodates ~32 turns of dense conversation
+            # and lets a full ~64k-token attachment be ingested whole. KV
+            # pre-allocation cost is bounded by max-num-seqs x per-token KV
+            # (vLLM packs dynamically), not by max-model-len alone. DORMANT:
+            # this class is paused (iter-45 banner above), so the bump only
+            # matters if Qwen 9B is re-introduced to the picker — on the H100
+            # the 9B's bf16 KV at 4 x 65536 is ~26 GiB, well within the 0.85
+            # util budget.
             "--max-model-len",
-            "32768",
+            "65536",
             # Concurrent generation slots inside the vLLM scheduler.
             # Lowered to 4 (was 16, vLLM default 256) to keep the KV
             # cache page count small enough for cuda-checkpoint to
@@ -2097,13 +2100,24 @@ class VllmQrPrismaQuant:
             "--hf-overrides",
             '{"architectures":["Qwen3_5ForCausalLM"]}',
             "--max-model-len",
-            "32768",
+            # iter (2026-06-23): 32768 -> 65536. Doubles the usable context
+            # so a single attached .md is ingested in full up to ~64k tokens
+            # and multi-article generations have room. On the B200 (~180 GiB)
+            # the larger bf16 KV cache (bounded by max-num-seqs=4 x 65536)
+            # fits comfortably under the 0.8 util ceiling; /sleep level=1
+            # frees the KV cache before snapshot, so the wider window does
+            # NOT enlarge the checkpointed state (snapshot restore unaffected).
+            "65536",
             "--max-num-seqs",
             "4",
             "--max-cudagraph-capture-size",
             "4",
+            # iter (2026-06-23): 8192 -> 16384. Halves the chunked-prefill
+            # step count when ingesting a full ~64k-token document, cutting
+            # first-token latency on big-file prompts. Peak prefill activation
+            # is a few GiB on the 27B at this batch size — negligible on B200.
             "--max-num-batched-tokens",
-            "8192",
+            "16384",
             # iter-17b (2026-05-24): --swap-space DROPPED for vLLM 0.20.
             # vLLM 0.20 removed/renamed the --swap-space flag from
             # AsyncEngineArgs CLI (caught by the in-process argv
@@ -2113,8 +2127,9 @@ class VllmQrPrismaQuant:
             # there because that profile's argv set is validated and
             # known-working. Dropping it here means PrismaQuant uses
             # vLLM 0.20's default CPU-RAM swap budget for KV cache
-            # eviction; with --max-num-seqs=4 + --max-model-len=32768
-            # we will not saturate the KV cache during demo workloads
+            # eviction; with --max-num-seqs=4 + --max-model-len=65536 the
+            # worst case is 4 fully-filled 64k bf16-KV sequences (~65 GiB),
+            # which still fits the B200 KV budget under the 0.8 util ceiling
             # so the default is fine. If a future deploy needs a
             # bigger swap, look up the new flag name in vllm 0.20+
             # docs (likely renamed to --cpu-offload-gb).
@@ -2905,6 +2920,24 @@ _OWUI_IMAGE = (
             # strips that DB key in pre_snapshot before OWUI is imported so
             # this env value actually wins.
             "RAG_EMBEDDING_MODEL": "",
+            # iter (2026-06-23): full-document file ingestion. RAG embedding
+            # is disabled above, so OWUI cannot embed+retrieve attachments.
+            # BYPASS_EMBEDDING_AND_RETRIEVAL injects each uploaded file's FULL
+            # text straight into the model context (no chunking, no vector
+            # search) — the only path that works without an embedding model —
+            # and RAG_FULL_CONTEXT keeps any retrieval-shaped path full-text
+            # too. Paired with --max-model-len=65536 on the vLLM side, a
+            # single .md up to ~64k tokens is ingested whole. These are
+            # PersistentConfig keys, so a stale DB-persisted value would
+            # shadow the env defaults; lifespan_hooks._strip_stale_rag_embedding_config
+            # strips them in pre_snapshot (before OWUI reads the config blob)
+            # so these env values win deterministically across redeploys.
+            # RAG_FILE_MAX_SIZE is in MB (a 64k-token .md is ~0.25 MB); the
+            # count cap allows several attachments per chat.
+            "BYPASS_EMBEDDING_AND_RETRIEVAL": "true",
+            "RAG_FULL_CONTEXT": "true",
+            "RAG_FILE_MAX_SIZE": "100",
+            "RAG_FILE_MAX_COUNT": "10",
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -3022,7 +3055,15 @@ owui_data_volume = modal.Volume.from_name("qr-llm-chat-data", create_if_missing=
     # min_containers=1 sets the floor. The two together pin OWUI
     # at exactly one replica.
     scaledown_window=300,  # 5 min — only relevant for transient extras.
-    timeout=60 * 60,
+    # iter (2026-06-23): 1h -> 2h. A single chat request streams for the
+    # entire generation; two 2000-3000-word articles at the PrismaQuant
+    # decode rate run ~20-30 min. 2h matches the vLLM container timeout
+    # (_CLS_KWARGS) and leaves wide margin so a long-form generation is
+    # never cut off mid-stream by this outer ASGI per-request ceiling.
+    # (The pipe's own httpx timeout is per-READ — it bounds inter-token
+    # gaps, not total wall clock — so streaming itself never total-times-
+    # out; this ceiling is the backstop for the whole request.)
+    timeout=60 * 60 * 2,
     min_containers=1,  # iter-42: keep OWUI warm 24/7 — see comment above.
     # Hard cap at 1 replica. OWUI keeps in-memory state (PersistentConfig
     # cache, session cookies, lazy admin-user check) that must be

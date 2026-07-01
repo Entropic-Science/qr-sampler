@@ -70,6 +70,43 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
     },
+    # Qthought decode lane (qr_sampler.qthought.QthoughtRoller). The grammar
+    # makes one full-size entropy fetch per case-frame decision, each reduced to
+    # a uniform via the amplifier — same shape as one token-sampling step's
+    # entropy half. Pins the quantum source and the optional thought-level
+    # amplifier (zscore_thought) so a per-thought aggregate bias rides alongside
+    # the unchanged per-decision draws; the lineage is explicit in config_hash.
+    "qthought": {
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "zscore_thought",
+        "sample_count": 10000,
+    },
+    # Qthought REFLECT lane — the private inner-voice / propose-speech completion.
+    # Derived from creative_sampling's HVH-Drift family (the unspecified hvh_*
+    # terms inherit the V6_HVD_R01_01 field defaults), with a hotter base for
+    # divergent reflection and a smaller fetch. Plain zscore_mean: the
+    # thought-level aggregate lives on the qthought decode lane, not the model lane.
+    "qthought_think": {
+        "temperature_strategy": "hvh_drift",
+        "hvh_t_base": 1.45,
+        "top_k": 0,
+        "top_p": 1.0,
+        "sample_count": 6000,
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "zscore_mean",
+    },
+    # Qthought SPEAK lane — the user-visible voice. EDT temperature with nucleus
+    # + top-k truncation for fluent, focused speech (cooler and tighter than the
+    # REFLECT lane). Full-size fetch on the quantum source + zscore_mean.
+    "qthought_voice": {
+        "temperature_strategy": "edt",
+        "edt_base_temp": 0.8,
+        "top_k": 50,
+        "top_p": 0.9,
+        "sample_count": 10000,
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "zscore_mean",
+    },
 }
 
 

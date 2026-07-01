@@ -2,9 +2,9 @@
 title: QR vs PRNG Comparison
 author: qr-sampler
 author_url: https://github.com/alchemystack/qr-sampler
-version: 0.3.0
+version: 0.3.1
 license: MIT
-description: Live-replacing dual-column comparison of quantum vs pseudo-random sampling + OWUI 0.9.5 pipe-id prefix fix.
+description: Dual-column quantum vs pseudo-random comparison + per-lane history (no header echo).
 """
 
 from __future__ import annotations
@@ -119,6 +119,115 @@ def _escape_for_table_cell(text: str) -> str:
     if not text:
         return ""
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+
+# Per-lane conversation-history sanitisation (mirrored from
+# qr-llm-chat ``qr_comparison_pipe`` iter-58, 2026-06-28). The Pipe
+# persists the *combined* dual-column table as the assistant turn; on a
+# follow-up turn OWUI replays it as the prior assistant message and
+# ``_build_side_body`` previously forwarded it verbatim to BOTH
+# single-lane upstreams. Each model then saw a prior assistant turn
+# beginning with ``| Quantum | Pseudo-random |`` and echoed that header
+# at the top of its next reply. The helpers below invert
+# ``_escape_for_table_cell`` / ``_render_dual_column_markdown`` so each
+# lane is conditioned only on ITS OWN prior answer.
+_LANE_QUANTUM = "quantum"
+_LANE_PSEUDO = "pseudo"
+_COMPARISON_HEADER_LINE = f"| {_QUANTUM_LABEL} | {_PRNG_LABEL} |"
+
+
+def _split_table_cells(row: str) -> list[str]:
+    """Split a markdown table row on UNescaped ``|`` delimiters.
+
+    ``_escape_for_table_cell`` renders a literal pipe as ``\\|``, so a
+    naive ``split("|")`` over-splits. We treat ``\\<char>`` as a two-char
+    escape unit belonging to the current cell. For ``"| a | b |"`` this
+    yields ``["", " a ", " b ", ""]``; callers take ``cells[1:-1]``.
+    """
+    cells: list[str] = []
+    cur: list[str] = []
+    i = 0
+    n = len(row)
+    while i < n:
+        ch = row[i]
+        if ch == "\\" and i + 1 < n:
+            cur.append(ch)
+            cur.append(row[i + 1])
+            i += 2
+            continue
+        if ch == "|":
+            cells.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    cells.append("".join(cur))
+    return cells
+
+
+def _unescape_table_cell(text: str) -> str:
+    """Invert ``_escape_for_table_cell`` for one cell's raw text."""
+    if not text:
+        return ""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in ("\\", "|"):
+                out.append(nxt)
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out).replace("<br>", "\n")
+
+
+def _extract_prior_lane_text(content: str, lane: str) -> str | None:
+    """Return one lane's answer from a rendered comparison table, else ``None``."""
+    lines = content.split("\n")
+    if len(lines) < 3:
+        return None
+    if lines[0].strip() != _COMPARISON_HEADER_LINE:
+        return None
+    if lines[1].strip().replace(" ", "") != "|---|---|":
+        return None
+    cells = [c.strip() for c in _split_table_cells(lines[2])[1:-1]]
+    if len(cells) < 2:
+        return None
+    raw = cells[0] if lane == _LANE_QUANTUM else cells[1]
+    return _unescape_table_cell(raw)
+
+
+def _sanitize_history_for_lane(messages: Any, lane: str) -> Any:
+    """Rewrite prior comparison-table assistant turns down to ``lane``'s cell.
+
+    Returns a NEW list (new dicts only for rewritten messages) so the two
+    lanes — which share the inbound ``body`` — never see each other's
+    mutations. Non-assistant / non-string / non-table turns pass through.
+    """
+    if not isinstance(messages, list):
+        return messages
+    out: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            out.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            out.append(msg)
+            continue
+        lane_text = _extract_prior_lane_text(content, lane)
+        if lane_text is None:
+            out.append(msg)
+            continue
+        new_msg = dict(msg)
+        new_msg["content"] = lane_text
+        out.append(new_msg)
+    return out
 
 
 def _render_out_of_allowance_markdown(resp: dict[str, Any]) -> str:
@@ -811,9 +920,19 @@ class Pipe:
         the per-side override. `stream` is forced True regardless of what
         OWUI passed — the Pipe is a streaming surface by design.
         """
-        side_body: dict[str, Any] = {
-            k: v for k, v in body.items() if k not in {"metadata", "model", "stream", "extra_body"}
-        }
+        # Strip the dual-column scaffolding from prior assistant turns so
+        # this lane is conditioned only on its own past answers — otherwise
+        # the model echoes the ``| Quantum | Pseudo-random |`` header on
+        # follow-up turns (mirrored from qr-llm-chat iter-58, 2026-06-28).
+        lane = _LANE_QUANTUM if entropy_source_type == "quantum_grpc" else _LANE_PSEUDO
+        side_body: dict[str, Any] = {}
+        for k, v in body.items():
+            if k in {"metadata", "model", "stream", "extra_body"}:
+                continue
+            if k == "messages":
+                side_body["messages"] = _sanitize_history_for_lane(v, lane)
+                continue
+            side_body[k] = v
         side_body["model"] = base_model
         side_body["stream"] = True
         existing_extra = body.get("extra_body") if isinstance(body.get("extra_body"), dict) else {}

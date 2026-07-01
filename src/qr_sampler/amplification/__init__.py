@@ -9,6 +9,7 @@ from qr_sampler.amplification.base import AmplificationResult, SignalAmplifier
 from qr_sampler.amplification.ecdf import ECDFAmplifier
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.amplification.zscore import ZScoreMeanAmplifier
+from qr_sampler.amplification.zscore_thought import ZScoreThoughtAmplifier
 
 __all__ = [
     "AmplificationResult",
@@ -16,4 +17,5 @@ __all__ = [
     "ECDFAmplifier",
     "SignalAmplifier",
     "ZScoreMeanAmplifier",
+    "ZScoreThoughtAmplifier",
 ]
