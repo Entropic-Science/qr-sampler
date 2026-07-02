@@ -33,12 +33,13 @@ import logging
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig, resolve_config
 from qr_sampler.core.pipeline import build_entropy_source, config_hash
 from qr_sampler.entropy.fallback import FallbackEntropySource
+from qr_sampler.presets import PRESET_QTHOUGHT
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -47,6 +48,9 @@ if TYPE_CHECKING:
     from qr_sampler.entropy.base import EntropySource
 
 logger = logging.getLogger("qr_sampler")
+
+#: The kinds of decision a :class:`QthoughtRoller` can produce provenance for.
+DecisionKind = Literal["choose", "choose_weighted", "coin", "bind_int", "draw_u", "draw_index"]
 
 
 @dataclass(frozen=True)
@@ -59,8 +63,13 @@ class ChoiceProvenance:
     honesty labels (``source``, ``is_fallback``) and freshness/latency stamps.
     """
 
-    kind: str
-    """Decision kind: ``'choose'`` | ``'choose_weighted'`` | ``'coin'`` | ``'bind_int'``."""
+    kind: DecisionKind
+    """Which decision method produced this draw.
+
+    ``'draw_u'``/``'draw_index'`` (:meth:`QthoughtRoller.draw_u` /
+    :meth:`QthoughtRoller.draw_index`) are raw draws returned directly to the
+    caller rather than buffered — see those methods' docstrings.
+    """
 
     value: int | bool
     """The decision result (an index/integer; a ``bool`` for :meth:`QthoughtRoller.coin`)."""
@@ -216,23 +225,37 @@ class QthoughtRoller:
 
     Every public decision method performs exactly one fresh fetch + amplify and
     records a :class:`ChoiceProvenance`; :meth:`drain` hands the buffer back to
-    the caller and clears it. Methods are sync (the underlying gRPC path is
-    blocking); async callers wrap them in ``asyncio.to_thread``.
+    the caller and clears it. :meth:`draw_u`/:meth:`draw_index` are the
+    exception — they hand their provenance back directly instead of buffering
+    it. Methods are sync (the underlying gRPC path is blocking); async
+    callers wrap them in ``asyncio.to_thread``.
     """
 
-    def __init__(self, config: QRSamplerConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: QRSamplerConfig | None = None,
+        *,
+        entropy_source: EntropySource | None = None,
+    ) -> None:
         """Build the entropy source + amplifier from config.
 
         Args:
             config: Explicit sampler configuration. ``None`` loads the
                 environment defaults and applies the ``qthought`` preset.
+            entropy_source: Explicit entropy source, overriding whatever
+                ``config`` would otherwise build. The injection point for
+                tests/tools that need a specific source (e.g. a seeded
+                :class:`~qr_sampler.entropy.mock.MockUniformSource`) without
+                reaching into the roller's private ``_source`` attribute.
         """
         if config is None:
-            config = resolve_config(QRSamplerConfig(preset="qthought"), None)
+            config = resolve_config(QRSamplerConfig(preset=PRESET_QTHOUGHT), None)
         config = _ensure_source_importable(config)
         self._config = config
         self._config_hash = config_hash(config)
-        self._source: EntropySource = build_entropy_source(config)
+        self._source: EntropySource = (
+            entropy_source if entropy_source is not None else build_entropy_source(config)
+        )
         self._amplifier: SignalAmplifier = AmplifierRegistry.build(config)
         if hasattr(self._amplifier, "calibrate"):
             self._amplifier.calibrate(self._source, config)
@@ -379,6 +402,44 @@ class QthoughtRoller:
         self._record("bind_int", value, draw)
         return value
 
+    def draw_u(self) -> ChoiceProvenance:
+        """One fresh amplified draw, with the raw uniform as the payload of interest.
+
+        Entropy math is byte-identical to every other decision (one fresh
+        ``get_random_bytes(sample_count)`` → ``amplify`` → ``u``), but unlike
+        :meth:`choose`/:meth:`coin`/:meth:`bind_int`/:meth:`choose_weighted`
+        this does **not** append to the drain buffer and does **not** touch an
+        open thought scope — it is a raw draw for a caller that wants the
+        amplified uniform itself (e.g. the qthought broker's dispose gate),
+        not a grammar decision. ``kind='draw_u'``; ``value`` is a placeholder
+        (``0``) — read ``.u`` on the returned provenance.
+
+        Returns:
+            The :class:`ChoiceProvenance` for this draw, handed back directly.
+        """
+        draw = self._draw()
+        return self._to_provenance("draw_u", 0, draw)
+
+    def draw_index(self, k: int) -> ChoiceProvenance:
+        """One fresh amplified ``choose(k)``-style draw, provenance returned directly.
+
+        Same index mapping as :meth:`choose` (``min(int(u * k), k - 1)``), but
+        — like :meth:`draw_u` — the provenance is handed back directly instead
+        of being buffered, and no thought scope is touched.
+
+        Args:
+            k: Number of options (must be >= 1).
+
+        Returns:
+            The :class:`ChoiceProvenance` for this draw, handed back directly;
+            ``.value`` is the selected index in ``[0, k-1]``.
+        """
+        if k < 1:
+            raise ValueError(f"draw_index(k) requires k >= 1, got {k}")
+        draw = self._draw()
+        value = min(int(draw.u * k), k - 1)
+        return self._to_provenance("draw_index", value, draw)
+
     def drain(self) -> tuple[ChoiceProvenance, ...]:
         """Return and clear the buffered per-decision provenance.
 
@@ -456,18 +517,22 @@ class QthoughtRoller:
             latency_ms=latency_ms,
         )
 
-    def _record(self, kind: str, value: int | bool, draw: _Draw) -> None:
-        """Append one :class:`ChoiceProvenance` for a completed decision."""
-        self._buffer.append(
-            ChoiceProvenance(
-                kind=kind,
-                value=value,
-                u=draw.u,
-                z_score=draw.z_score,
-                bias=draw.bias,
-                source=draw.source,
-                is_fallback=draw.is_fallback,
-                generation_timestamp=draw.generation_timestamp,
-                latency_ms=draw.latency_ms,
-            )
+    def _to_provenance(
+        self, kind: DecisionKind, value: int | bool, draw: _Draw
+    ) -> ChoiceProvenance:
+        """Build one :class:`ChoiceProvenance` from a completed draw (no buffering)."""
+        return ChoiceProvenance(
+            kind=kind,
+            value=value,
+            u=draw.u,
+            z_score=draw.z_score,
+            bias=draw.bias,
+            source=draw.source,
+            is_fallback=draw.is_fallback,
+            generation_timestamp=draw.generation_timestamp,
+            latency_ms=draw.latency_ms,
         )
+
+    def _record(self, kind: DecisionKind, value: int | bool, draw: _Draw) -> None:
+        """Append one :class:`ChoiceProvenance` for a completed decision to the buffer."""
+        self._buffer.append(self._to_provenance(kind, value, draw))

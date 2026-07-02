@@ -280,6 +280,130 @@ def test_drain_returns_and_clears(mock_config: QRSamplerConfig) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# draw_u / draw_index — raw draws, returned directly, never buffered
+# --------------------------------------------------------------------------- #
+
+
+def test_draw_u_in_range_and_not_buffered(mock_config: QRSamplerConfig) -> None:
+    """draw_u returns a provenance directly and leaves the drain buffer untouched."""
+    roller = QthoughtRoller(mock_config)
+    try:
+        prov = roller.draw_u()
+        assert isinstance(prov, ChoiceProvenance)
+        assert prov.kind == "draw_u"
+        assert 0.0 < prov.u < 1.0
+        assert prov.source == "mock_uniform"
+        assert prov.is_fallback is False
+        assert prov.latency_ms >= 0.0
+        assert prov.generation_timestamp > 0.0
+        assert prov.thought_aggregate is None
+        assert roller.drain() == ()  # never appended to the buffer
+    finally:
+        roller.close()
+
+
+def test_draw_index_in_range_and_not_buffered(mock_config: QRSamplerConfig) -> None:
+    """draw_index returns a provenance directly, in-range value, never buffered."""
+    roller = QthoughtRoller(mock_config)
+    try:
+        for _ in range(20):
+            prov = roller.draw_index(9)
+            assert prov.kind == "draw_index"
+            assert isinstance(prov.value, int)
+            assert 0 <= prov.value <= 8
+        assert roller.drain() == ()  # 20 draws, none buffered
+    finally:
+        roller.close()
+
+
+def test_draw_u_parity_with_amplifier(mock_config: QRSamplerConfig) -> None:
+    """draw_u's u matches the amplifier recomputed from the same deterministic buffer."""
+    roller = QthoughtRoller(mock_config)
+    roller._source = _ConstSource(160)
+    try:
+        prov = roller.draw_u()
+        expected_u = _amplified_u(mock_config, _ConstSource(160))
+        assert prov.u == pytest.approx(expected_u)
+    finally:
+        roller.close()
+
+
+def test_draw_index_parity_with_choose(mock_config: QRSamplerConfig) -> None:
+    """draw_index(k) maps u to an index exactly like choose(k)'s min(int(u*k), k-1)."""
+    roller = QthoughtRoller(mock_config)
+    roller._source = _ConstSource(160)
+    try:
+        prov = roller.draw_index(10)
+        expected_u = _amplified_u(mock_config, _ConstSource(160))
+        expected = min(int(expected_u * 10), 9)
+        assert prov.value == expected
+    finally:
+        roller.close()
+
+
+def test_draw_index_rejects_non_positive_k(mock_config: QRSamplerConfig) -> None:
+    roller = QthoughtRoller(mock_config)
+    try:
+        with pytest.raises(ValueError, match="k >= 1"):
+            roller.draw_index(0)
+    finally:
+        roller.close()
+
+
+def test_draw_u_jit_one_fetch_per_draw(mock_config: QRSamplerConfig) -> None:
+    """Each draw_u/draw_index triggers exactly one fresh fetch (invariant 4)."""
+    counter = _CountingSource(_ConstSource(140))
+    roller = QthoughtRoller(mock_config)
+    roller._source = counter
+    try:
+        roller.draw_u()
+        assert counter.calls == 1
+        roller.draw_index(5)
+        assert counter.calls == 2
+    finally:
+        roller.close()
+
+
+def test_draw_u_fallback_flag_propagates(mock_config: QRSamplerConfig) -> None:
+    """A primary EntropyUnavailableError surfaces on draw_u as is_fallback=True."""
+    roller = QthoughtRoller(mock_config)
+    roller._source = FallbackEntropySource(_FailingSource(), _FixedSource())
+    try:
+        prov = roller.draw_u()
+        assert prov.is_fallback is True
+        assert prov.source == "fixed"
+    finally:
+        roller.close()
+
+
+def test_draw_u_does_not_open_or_close_thought_scope(mock_config: QRSamplerConfig) -> None:
+    """draw_u/draw_index never toggle the buffered-decision thought-scope flag."""
+    roller = QthoughtRoller(mock_config)
+    try:
+        assert roller._thought_active is False
+        roller.draw_u()
+        assert roller._thought_active is False
+        roller.draw_index(4)
+        assert roller._thought_active is False
+    finally:
+        roller.close()
+
+
+def test_roller_accepts_entropy_source_ctor_kwarg() -> None:
+    """The entropy_source= ctor seam injects a source without a private-attribute poke."""
+    source = _ConstSource(160)
+    config = QRSamplerConfig(entropy_source_type="mock_uniform", sample_count=1024)
+    roller = QthoughtRoller(config, entropy_source=source)
+    try:
+        prov = roller.draw_u()
+        expected_u = _amplified_u(config, source)
+        assert prov.u == pytest.approx(expected_u)
+        assert prov.source == "const"
+    finally:
+        roller.close()
+
+
+# --------------------------------------------------------------------------- #
 # Fallback labelling + status
 # --------------------------------------------------------------------------- #
 

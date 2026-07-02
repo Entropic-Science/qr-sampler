@@ -14,10 +14,6 @@ change would silently break on:
    and :class:`~qr_sampler.qthought.ChoiceProvenance` — a signature change
    here is a breaking change for qthought even though nothing in qr-sampler's
    own suite would catch it.
-
-Note: the :meth:`QthoughtRoller.draw_u` / :meth:`QthoughtRoller.draw_index`
-signature snapshots are added in a later step alongside those methods
-themselves — do not pre-add them here.
 """
 
 from __future__ import annotations
@@ -119,6 +115,8 @@ _ROLLER_METHOD_NAMES = (
     "drain",
     "status",
     "begin_thought",
+    "draw_u",
+    "draw_index",
 )
 
 
@@ -136,7 +134,18 @@ def test_qthought_roller_method_signatures_pinned() -> None:
         "drain": "(self) -> 'tuple[ChoiceProvenance, ...]'",
         "status": "(self) -> 'dict[str, Any]'",
         "begin_thought": "(self) -> 'None'",
+        "draw_u": "(self) -> 'ChoiceProvenance'",
+        "draw_index": "(self, k: 'int') -> 'ChoiceProvenance'",
     }
+
+
+def test_qthought_roller_ctor_has_entropy_source_kwarg() -> None:
+    """The explicit-injection ctor seam ``entropy_source=`` is present and keyword-only."""
+    signature = inspect.signature(contract.QthoughtRoller.__init__)
+    assert str(signature) == (
+        "(self, config: 'QRSamplerConfig | None' = None, *, "
+        "entropy_source: 'EntropySource | None' = None) -> 'None'"
+    )
 
 
 def test_choice_provenance_field_names_pinned() -> None:
