@@ -1,11 +1,11 @@
-"""Tests for the qthought roller (spec §3.x).
+"""Tests for the qthought roller.
 
-Clones the contseq-roller coverage (byte range, amplifier parity, fallback-flag
-propagation, ``_ensure_source_importable``) and extends it for the typed
-arbitrary-arity decisions the case-frame grammar needs (``choose`` /
-``choose_weighted`` / ``coin`` / ``bind_int``), the just-in-time distinct-fetch
-contract (one fresh fetch per decision, invariant 4), the three lockstep presets,
-and the optional, fallback-safe thought-level aggregate protocol.
+Covers amplifier parity, fallback-flag propagation,
+``_ensure_source_importable``, the typed arbitrary-arity decisions the
+case-frame grammar needs (``choose`` / ``choose_weighted`` / ``coin`` /
+``bind_int``), the just-in-time distinct-fetch contract (one fresh fetch per
+decision, invariant 4), the three lockstep presets, and the optional,
+fallback-safe thought-level aggregate protocol.
 """
 
 from __future__ import annotations

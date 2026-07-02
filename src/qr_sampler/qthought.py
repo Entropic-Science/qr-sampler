@@ -1,9 +1,8 @@
 """Qthought roller — fresh quantum draws for arbitrary-arity grammar decisions.
 
-The ``qthought`` "automated mind" consumes entropy in the same shape as the
-:class:`~qr_sampler.contseq.ContseqRoller` (one full-size ``sample_count`` fetch
-reduced through the configured amplifier to a uniform float ``u``), but where the
-contseq roller maps every fetch onto a single 256-way byte code, the qthought
+The ``qthought`` "automated mind" consumes entropy in the same shape as one
+token-sampling step's entropy half (one full-size ``sample_count`` fetch
+reduced through the configured amplifier to a uniform float ``u``). The
 roller exposes a *typed family* of decisions that a case-frame grammar needs:
 
 - :meth:`QthoughtRoller.choose` — uniform pick of one of ``k`` options.
@@ -17,13 +16,13 @@ Every decision performs exactly **one fresh** ``get_random_bytes(sample_count)``
 buffer, so the entropy is just-in-time and never cached across decisions
 (invariant 4). :meth:`QthoughtRoller.drain` returns and clears that buffer.
 
-Parity with token sampling is deliberate — like the contseq roller, this is the
-entropy half of ``SamplingPipeline.sample_token`` with the logits half cut away,
-so the grammar decisions and the GPU token samples draw from the same statistical
-machinery and the same fallback/honesty labelling.
+Parity with token sampling is deliberate — this is the entropy half of
+``SamplingPipeline.sample_token`` with the logits half cut away, so the grammar
+decisions and the GPU token samples draw from the same statistical machinery
+and the same fallback/honesty labelling.
 
 This module has zero vLLM/torch imports — it composes the entropy stack exactly
-the way ``core/pipeline.py`` and ``contseq.py`` do. ``QthoughtRoller`` methods are
+the way ``core/pipeline.py`` does. ``QthoughtRoller`` methods are
 SYNC (the underlying gRPC fetch is blocking); async callers run them via
 ``asyncio.to_thread`` so their event loop never blocks on the network.
 """
@@ -54,8 +53,7 @@ logger = logging.getLogger("qr_sampler")
 class ChoiceProvenance:
     """One qthought decision plus the entropy provenance it was derived from.
 
-    This is the :class:`~qr_sampler.contseq.RollResult` analogue, extended with
-    the *decision context* the grammar needs to audit a decoded thought: which
+    This carries the *decision context* the grammar needs to audit a decoded thought: which
     kind of decision was made (``kind``), what it resolved to (``value``), and
     the per-draw bias diagnostics (``z_score``, ``bias``) alongside the entropy
     honesty labels (``source``, ``is_fallback``) and freshness/latency stamps.
