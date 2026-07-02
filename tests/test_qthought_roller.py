@@ -570,7 +570,7 @@ def test_default_construction_resolves_qthought_preset() -> None:
 def test_quantum_grpc_resolves_via_builtin_table() -> None:
     """quantum_grpc resolves through the registry's lazy builtin table.
 
-    Nothing else needs to have imported ``qr_sampler.entropy.quantum`` —
+    Nothing else needs to have imported the qgrpc source module —
     this is the property that made the roller's old import-nudge helper
     deletable.
     """

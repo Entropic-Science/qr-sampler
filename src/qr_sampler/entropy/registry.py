@@ -37,14 +37,14 @@ class EntropySourceRegistry:
     """
 
     #: Built-in sources, resolved lazily on first ``get()``. Importing a
-    #: target module never requires its optional runtime deps (e.g.
-    #: ``quantum.py`` defers its grpcio import to construction time).
+    #: target module never requires its optional runtime deps (e.g. the
+    #: qgrpc source defers its grpcio import to construction time).
     _BUILTINS: ClassVar[dict[str, str]] = {
         "system": "qr_sampler.entropy.system:SystemEntropySource",
         "mock_uniform": "qr_sampler.entropy.mock:MockUniformSource",
         "timing_noise": "qr_sampler.entropy.timing:TimingNoiseSource",
         "openentropy": "qr_sampler.entropy.openentropy:OpenEntropySource",
-        "quantum_grpc": "qr_sampler.entropy.quantum:QuantumGrpcSource",
+        "quantum_grpc": "qr_sampler.entropy.qgrpc:QuantumGrpcSource",
     }
 
     _registry: ClassVar[dict[str, type[EntropySource]]] = {}

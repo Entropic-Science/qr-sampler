@@ -42,7 +42,7 @@ description: |
     Tracks rolling P99 latency, opens after 3 consecutive failures, enters
     half-open state after 10s. All thresholds configurable via QR_CB_* env vars.
 
-source_class: "qr_sampler.entropy.quantum:QuantumGrpcSource"
+source_class: "qr_sampler.entropy.qgrpc:QuantumGrpcSource"
 transport: grpc
 
 dependencies:

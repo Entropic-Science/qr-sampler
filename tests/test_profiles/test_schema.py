@@ -112,7 +112,7 @@ class TestEntropySourceProfile:
             id="quantum_grpc",
             name="Quantum gRPC",
             description="Remote entropy via gRPC",
-            source_class="qr_sampler.entropy.quantum:QuantumGrpcSource",
+            source_class="qr_sampler.entropy.qgrpc:QuantumGrpcSource",
             transport="grpc",
             dependencies=["grpcio", "protobuf"],
             compatible_amplifiers=["zscore_mean", "ecdf"],

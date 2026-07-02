@@ -1,7 +1,8 @@
 """Hand-written protobuf message stubs for the entropy service.
 
 These are lightweight message classes that mirror the ``entropy_service.proto``
-definition using **standard protobuf wire encoding**. They produce bytes
+definition using **standard protobuf wire encoding** (primitives from
+:mod:`qr_sampler.proto.wire`). They produce bytes
 identical to ``protoc``-generated code, making them compatible with any
 standard gRPC server (including ``grpcurl``).
 
@@ -18,62 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# ---------------------------------------------------------------------------
-# Protobuf wire-format helpers
-# ---------------------------------------------------------------------------
-
-
-def _encode_varint(value: int) -> bytes:
-    """Encode an unsigned integer as a protobuf varint (LEB128).
-
-    Args:
-        value: Non-negative integer to encode.
-
-    Returns:
-        LEB128-encoded bytes.
-    """
-    parts: list[int] = []
-    while value > 0x7F:
-        parts.append((value & 0x7F) | 0x80)
-        value >>= 7
-    parts.append(value & 0x7F)
-    return bytes(parts)
-
-
-def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
-    """Decode a varint from bytes at the given offset.
-
-    Args:
-        data: Raw bytes.
-        offset: Starting position.
-
-    Returns:
-        Tuple of (decoded_value, new_offset).
-    """
-    result = 0
-    shift = 0
-    while True:
-        b = data[offset]
-        result |= (b & 0x7F) << shift
-        offset += 1
-        if not (b & 0x80):
-            break
-        shift += 7
-    return result, offset
-
-
-def _encode_tag(field_number: int, wire_type: int) -> bytes:
-    """Encode a protobuf field tag.
-
-    Args:
-        field_number: The proto field number (1-based).
-        wire_type: 0 = varint, 2 = length-delimited.
-
-    Returns:
-        Varint-encoded tag bytes.
-    """
-    return _encode_varint((field_number << 3) | wire_type)
-
+from qr_sampler.proto.wire import decode_varint, encode_tag, encode_varint
 
 # ---------------------------------------------------------------------------
 # Message classes
@@ -100,12 +46,12 @@ class EntropyRequest:
         parts: list[bytes] = []
         if self.bytes_needed != 0:
             # Field 1, wire type 0 (varint) — int32
-            parts.append(_encode_tag(1, 0))
-            parts.append(_encode_varint(self.bytes_needed))
+            parts.append(encode_tag(1, 0))
+            parts.append(encode_varint(self.bytes_needed))
         if self.sequence_id != 0:
             # Field 2, wire type 0 (varint) — int64
-            parts.append(_encode_tag(2, 0))
-            parts.append(_encode_varint(self.sequence_id))
+            parts.append(encode_tag(2, 0))
+            parts.append(encode_varint(self.sequence_id))
         return b"".join(parts)
 
     @classmethod
@@ -115,17 +61,17 @@ class EntropyRequest:
         sequence_id = 0
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
+            tag, offset = decode_varint(data, offset)
             field_number = tag >> 3
             wire_type = tag & 0x07
             if wire_type == 0:
-                value, offset = _decode_varint(data, offset)
+                value, offset = decode_varint(data, offset)
                 if field_number == 1:
                     bytes_needed = value
                 elif field_number == 2:
                     sequence_id = value
             elif wire_type == 2:
-                length, offset = _decode_varint(data, offset)
+                length, offset = decode_varint(data, offset)
                 offset += length  # Skip unknown length-delimited fields
             elif wire_type == 5:
                 offset += 4  # Skip unknown 32-bit fields
@@ -161,22 +107,22 @@ class EntropyResponse:
         parts: list[bytes] = []
         if self.data:
             # Field 1, wire type 2 (length-delimited) — bytes
-            parts.append(_encode_tag(1, 2))
-            parts.append(_encode_varint(len(self.data)))
+            parts.append(encode_tag(1, 2))
+            parts.append(encode_varint(len(self.data)))
             parts.append(self.data)
         if self.sequence_id != 0:
             # Field 2, wire type 0 (varint) — int64
-            parts.append(_encode_tag(2, 0))
-            parts.append(_encode_varint(self.sequence_id))
+            parts.append(encode_tag(2, 0))
+            parts.append(encode_varint(self.sequence_id))
         if self.generation_timestamp_ns != 0:
             # Field 3, wire type 0 (varint) — int64
-            parts.append(_encode_tag(3, 0))
-            parts.append(_encode_varint(self.generation_timestamp_ns))
+            parts.append(encode_tag(3, 0))
+            parts.append(encode_varint(self.generation_timestamp_ns))
         if self.device_id:
             # Field 4, wire type 2 (length-delimited) — string
             device_bytes = self.device_id.encode("utf-8")
-            parts.append(_encode_tag(4, 2))
-            parts.append(_encode_varint(len(device_bytes)))
+            parts.append(encode_tag(4, 2))
+            parts.append(encode_varint(len(device_bytes)))
             parts.append(device_bytes)
         return b"".join(parts)
 
@@ -189,17 +135,17 @@ class EntropyResponse:
         device_id = ""
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
+            tag, offset = decode_varint(data, offset)
             field_number = tag >> 3
             wire_type = tag & 0x07
             if wire_type == 0:
-                value, offset = _decode_varint(data, offset)
+                value, offset = decode_varint(data, offset)
                 if field_number == 2:
                     sequence_id = value
                 elif field_number == 3:
                     generation_timestamp_ns = value
             elif wire_type == 2:
-                length, offset = _decode_varint(data, offset)
+                length, offset = decode_varint(data, offset)
                 raw = data[offset : offset + length]
                 offset += length
                 if field_number == 1:

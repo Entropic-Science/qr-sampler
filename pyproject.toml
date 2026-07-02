@@ -75,7 +75,7 @@ vllm = "qr_sampler.engines.vllm:VLLMAdapter"
 
 [project.entry-points."qr_sampler.entropy_sources"]
 system = "qr_sampler.entropy.system:SystemEntropySource"
-quantum_grpc = "qr_sampler.entropy.quantum:QuantumGrpcSource"
+quantum_grpc = "qr_sampler.entropy.qgrpc:QuantumGrpcSource"
 timing_noise = "qr_sampler.entropy.timing:TimingNoiseSource"
 mock_uniform = "qr_sampler.entropy.mock:MockUniformSource"
 openentropy = "qr_sampler.entropy.openentropy:OpenEntropySource"
@@ -163,9 +163,6 @@ warn_unused_ignores = false
 
 [tool.coverage.run]
 source = ["src/qr_sampler"]
-omit = [
-    "src/qr_sampler/proto/*",
-]
 
 [tool.coverage.report]
 fail_under = 90
