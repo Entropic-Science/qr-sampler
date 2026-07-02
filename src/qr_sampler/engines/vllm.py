@@ -39,7 +39,6 @@ from qr_sampler.core.pipeline import (
 )
 from qr_sampler.core.types import PrefetchContext
 from qr_sampler.engines.base import EngineAdapter
-from qr_sampler.engines.registry import EngineAdapterRegistry
 from qr_sampler.exceptions import ConfigValidationError
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
@@ -48,8 +47,8 @@ from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 # vllm.v1.sample.logits_processor.LogitsProcessor. Duck-typing alone passes
 # attribute checks but fails the isinstance/issubclass gate. In dev / test
 # environments vLLM is not installed, so we fall back to ``object`` — the
-# module must still import cleanly there because EngineAdapterRegistry pulls
-# it in unconditionally.
+# module must still import cleanly there because EngineAdapterRegistry's
+# builtin table resolves this module on demand.
 try:
     from vllm.v1.sample.logits_processor import (
         LogitsProcessor as _VLLMLogitsProcessorBase,
@@ -280,7 +279,6 @@ class _PerfAggregator:
             )
 
 
-@EngineAdapterRegistry.register("vllm")
 class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
     """vLLM V1 LogitsProcessor that replaces token sampling with
     external-entropy-driven selection.

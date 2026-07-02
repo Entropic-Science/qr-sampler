@@ -9,10 +9,8 @@ from __future__ import annotations
 import os
 
 from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.registry import register_entropy_source
 
 
-@register_entropy_source("system")
 class SystemEntropySource(EntropySource):
     """``os.urandom()`` wrapper — always available, cryptographically secure.
 

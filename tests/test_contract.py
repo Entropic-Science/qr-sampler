@@ -22,7 +22,7 @@ import dataclasses
 import inspect
 
 from qr_sampler import contract
-from qr_sampler.presets import BUILTIN_PRESETS
+from qr_sampler.config import BUILTIN_PRESETS
 
 # ── 1. __all__ is frozen ──────────────────────────────────────────────────
 

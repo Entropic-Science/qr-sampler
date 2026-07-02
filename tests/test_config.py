@@ -14,8 +14,8 @@ from unittest.mock import patch
 import pytest
 
 from qr_sampler.config import (
-    _ALL_FIELDS,
-    _PER_REQUEST_FIELDS,
+    ALL_FIELDS,
+    PER_REQUEST_FIELDS,
     QRSamplerConfig,
     resolve_config,
     validate_extra_args,
@@ -224,8 +224,8 @@ class TestResolveConfig:
         assert result.top_k == 100
 
     def test_all_per_request_fields_overridable(self, default_config: QRSamplerConfig) -> None:
-        """Every field in _PER_REQUEST_FIELDS should be overridable."""
-        for field_name in _PER_REQUEST_FIELDS:
+        """Every field in PER_REQUEST_FIELDS should be overridable."""
+        for field_name in PER_REQUEST_FIELDS:
             key = f"qr_{field_name}"
             # Use a value that's different from default
             field_info = QRSamplerConfig.model_fields[field_name]
@@ -276,12 +276,12 @@ class TestResolveConfig:
         """preset is NOT per-request overridable via the normal field-merge path.
 
         ``preset`` itself is an infrastructure-only field (set by QR_PRESET),
-        so it must never appear in ``_PER_REQUEST_FIELDS``. The selection
+        so it must never appear in ``PER_REQUEST_FIELDS``. The selection
         surface uses ``qr_preset`` as a special key that ``resolve_config``
         and ``validate_extra_args`` both recognize via the preset-resolution
         layer (it expands into concrete qr_* overrides before merging).
         """
-        assert "preset" not in _PER_REQUEST_FIELDS
+        assert "preset" not in PER_REQUEST_FIELDS
         # Known preset names must be accepted (the validation hook needs to
         # let qr_preset through so the vLLM per-request preset flow works).
         validate_extra_args({"qr_preset": "creative_sampling"})
@@ -311,6 +311,7 @@ class TestNonOverridableFields:
             "grpc_api_key",
             "grpc_api_key_header",
             "fallback_mode",
+            "oe_conditioning",
             "oe_sources",
             "oe_parallel",
             "oe_timeout",
@@ -335,6 +336,7 @@ class TestNonOverridableFields:
             "grpc_api_key",
             "grpc_api_key_header",
             "fallback_mode",
+            "oe_conditioning",
             "oe_sources",
             "oe_parallel",
             "oe_timeout",
@@ -380,10 +382,10 @@ class TestFieldSets:
     """Verify internal field sets are consistent."""
 
     def test_per_request_fields_are_subset_of_all(self) -> None:
-        assert _PER_REQUEST_FIELDS <= _ALL_FIELDS
+        assert PER_REQUEST_FIELDS <= ALL_FIELDS
 
     def test_infrastructure_fields_not_in_per_request(self) -> None:
-        infra_fields = _ALL_FIELDS - _PER_REQUEST_FIELDS
+        infra_fields = ALL_FIELDS - PER_REQUEST_FIELDS
         assert "grpc_server_address" in infra_fields
         assert "grpc_timeout_ms" in infra_fields
         assert "grpc_retry_count" in infra_fields
@@ -397,11 +399,55 @@ class TestFieldSets:
     def test_entropy_source_type_is_per_request(self) -> None:
         """entropy_source_type is per-request overridable so comparison mode
         can route requests to different entropy sources on the same engine."""
-        assert "entropy_source_type" in _PER_REQUEST_FIELDS
+        assert "entropy_source_type" in PER_REQUEST_FIELDS
 
     def test_all_fields_populated(self) -> None:
-        """_ALL_FIELDS should contain every model field."""
-        assert frozenset(QRSamplerConfig.model_fields.keys()) == _ALL_FIELDS
+        """ALL_FIELDS should contain every model field."""
+        assert frozenset(QRSamplerConfig.model_fields.keys()) == ALL_FIELDS
+
+    def test_per_request_fields_derived_set_is_exactly_the_intended_set(self) -> None:
+        """PER_REQUEST_FIELDS is derived from field metadata; this pin makes
+        a metadata mistake (missing/extra ``per_request`` marker) fail loudly."""
+        intended = frozenset(
+            {
+                "signal_amplifier_type",
+                "sample_count",
+                "population_mean",
+                "population_std",
+                "uniform_clamp_epsilon",
+                "temperature_strategy",
+                "fixed_temperature",
+                "edt_base_temp",
+                "edt_exponent",
+                "edt_min_temp",
+                "edt_max_temp",
+                "top_k",
+                "top_p",
+                "log_level",
+                "diagnostic_mode",
+                "entropy_source_type",
+                "entropy_prefetch",
+                "hvh_t_base",
+                "hvh_alpha_h",
+                "hvh_alpha_vh",
+                "hvh_gamma_dh",
+                "hvh_delta_dvh",
+                "hvh_lambda_ema",
+                "hvh_min_p_base",
+                "hvh_kappa_h",
+                "hvh_nu_dh",
+                "min_p_base",
+            }
+        )
+        assert intended == PER_REQUEST_FIELDS
+
+    def test_qrng_quota_defaults(self, default_config: QRSamplerConfig) -> None:
+        """QRNG service quota limits are config fields with the documented
+        service limits as defaults (deploy config, not code constants)."""
+        assert default_config.qrng_max_bytes_per_request == 35_200
+        assert default_config.qrng_max_requests_per_minute == 500
+        assert default_config.qrng_max_bytes_per_day == 500 * 1024 * 1024
+        assert "qrng_max_bytes_per_request" not in PER_REQUEST_FIELDS
 
 
 # ---------------------------------------------------------------------------
@@ -480,10 +526,12 @@ class TestOpenEntropyConfigFields:
             config = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
         assert config.oe_conditioning == "sha256"
 
-    def test_oe_conditioning_per_request(self, default_config: QRSamplerConfig) -> None:
-        """Verify oe_conditioning can be overridden per-request."""
-        result = resolve_config(default_config, {"qr_oe_conditioning": "vonneumann"})
-        assert result.oe_conditioning == "vonneumann"
+    def test_oe_conditioning_infra_locked(self) -> None:
+        """oe_conditioning is read only at source construction — a per-request
+        override was a silent no-op falsifying config_hash provenance, so it
+        is rejected outright (behavior-change ledger #1)."""
+        with pytest.raises(ConfigValidationError, match="infrastructure field"):
+            validate_extra_args({"qr_oe_conditioning": "vonneumann"})
 
     def test_oe_sources_infra_locked(self) -> None:
         """Verify oe_sources cannot be overridden per-request."""

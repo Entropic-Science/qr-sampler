@@ -9,10 +9,8 @@ from __future__ import annotations
 import numpy as np
 
 from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.registry import register_entropy_source
 
 
-@register_entropy_source("mock_uniform")
 class MockUniformSource(EntropySource):
     """Configurable mock entropy source for testing.
 

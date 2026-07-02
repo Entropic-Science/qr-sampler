@@ -12,7 +12,6 @@ import logging
 from typing import TYPE_CHECKING
 
 from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.registry import register_entropy_source
 from qr_sampler.exceptions import EntropyUnavailableError
 
 if TYPE_CHECKING:
@@ -32,7 +31,6 @@ except ImportError:
     _OPENENTROPY_AVAILABLE = False
 
 
-@register_entropy_source("openentropy")
 class OpenEntropySource(EntropySource):
     """Hardware entropy via the ``openentropy`` library.
 

@@ -13,9 +13,10 @@ from qr_sampler.entropy.mock import MockUniformSource
 from qr_sampler.entropy.registry import EntropySourceRegistry, register_entropy_source
 from qr_sampler.entropy.system import SystemEntropySource
 
-# TimingNoiseSource and QuantumGrpcSource are registered by their own modules
-# but imported lazily to avoid mandatory dependencies on grpcio or triggering
-# the TimingNoiseSource deprecation warning at import time.
+# All built-in sources (including TimingNoiseSource and QuantumGrpcSource)
+# are declared in EntropySourceRegistry._BUILTINS and imported lazily on
+# first registry lookup — importing this package has no registration side
+# effects.
 
 __all__ = [
     "EntropySource",

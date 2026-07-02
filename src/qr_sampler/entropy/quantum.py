@@ -44,7 +44,6 @@ from collections import deque
 from typing import TYPE_CHECKING, Any
 
 from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.registry import register_entropy_source
 from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
 
 if TYPE_CHECKING:
@@ -79,24 +78,9 @@ _PREPROBE_ENABLED_ENV_VAR = "QR_GRPC_PREPROBE_ENABLED"
 # behaviour is actually useful.
 _PREPROBE_HEALTHY_WINDOW_S = 30.0
 
-# Documented limits of the qbert/Cipherstone QRNG service for our API key
-# (QRNG team README, 2026-06-10; adjustable on request to the QRNG team).
-# Exceeding any of them returns gRPC RESOURCE_EXHAUSTED — a quota verdict,
-# not a connectivity one, which is why ``_is_quota_exhausted`` gives it a
-# distinct telemetry event: the operator response is "lower sample_count /
-# concurrency or ask for a bigger quota", never "go check the tunnel".
-#
-# Request-rate math worth keeping in view: the just-in-time post-selection
-# contract pins entropy fetches at exactly ONE request per generated token
-# (coalescing N tokens' bytes into one request would fetch token N+1's
-# entropy before token N is committed — breaking the experiment's causal
-# ordering, so it is deliberately not an optimisation we will ever take).
-# At 500 requests/minute that caps aggregate decode throughput at ~8.3
-# tokens/sec across ALL concurrent sequences (max_num_seqs=4 can exceed
-# this under load).
-_QRNG_MAX_BYTES_PER_REQUEST = 35_200
-_QRNG_MAX_REQUESTS_PER_MINUTE = 500
-_QRNG_MAX_BYTES_PER_DAY = 500 * 1024 * 1024
+# QRNG service quota limits now live on QRSamplerConfig
+# (``qrng_max_bytes_per_request`` etc. — deploy config, not code); this
+# source reads them at construction time for its quota telemetry.
 
 # Minimum seconds between consecutive ``qrng.quota_exhausted`` log events.
 # A quota storm fails once per token; one structured event per minute is
@@ -454,7 +438,6 @@ class _BidiSession:
 # ---------------------------------------------------------------------------
 
 
-@register_entropy_source("quantum_grpc")
 class QuantumGrpcSource(EntropySource):
     """Protocol-agnostic gRPC entropy source with configurable transport mode.
 
@@ -515,7 +498,10 @@ class QuantumGrpcSource(EntropySource):
         # the FIRST quota log whenever the host booted less than
         # _QUOTA_LOG_THROTTLE_S ago (fresh CI runners, fresh VMs).
         self._last_quota_log_monotonic: float = float("-inf")
-        if config.sample_count > _QRNG_MAX_BYTES_PER_REQUEST:
+        self._quota_max_bytes_per_request = config.qrng_max_bytes_per_request
+        self._quota_max_requests_per_minute = config.qrng_max_requests_per_minute
+        self._quota_max_bytes_per_day = config.qrng_max_bytes_per_day
+        if config.sample_count > self._quota_max_bytes_per_request:
             logger.warning(
                 "sample_count=%d exceeds the QRNG service's documented "
                 "per-request limit of %d bytes — every per-token fetch will "
@@ -523,11 +509,11 @@ class QuantumGrpcSource(EntropySource):
                 "the fallback source. Lower QR_SAMPLE_COUNT or request a "
                 "larger per-request quota.",
                 config.sample_count,
-                _QRNG_MAX_BYTES_PER_REQUEST,
+                self._quota_max_bytes_per_request,
                 extra={
                     "event": "qrng.sample_count_exceeds_request_cap",
                     "sample_count": config.sample_count,
-                    "max_bytes_per_request": _QRNG_MAX_BYTES_PER_REQUEST,
+                    "max_bytes_per_request": self._quota_max_bytes_per_request,
                 },
             )
 
@@ -991,14 +977,14 @@ class QuantumGrpcSource(EntropySource):
                         "sequences, or request a larger quota from the QRNG "
                         "team.",
                         n,
-                        _QRNG_MAX_BYTES_PER_REQUEST,
-                        _QRNG_MAX_REQUESTS_PER_MINUTE,
-                        _QRNG_MAX_BYTES_PER_DAY,
+                        self._quota_max_bytes_per_request,
+                        self._quota_max_requests_per_minute,
+                        self._quota_max_bytes_per_day,
                         extra={
                             "event": "qrng.quota_exhausted",
                             "bytes_requested": n,
-                            "max_bytes_per_request": _QRNG_MAX_BYTES_PER_REQUEST,
-                            "max_requests_per_minute": _QRNG_MAX_REQUESTS_PER_MINUTE,
+                            "max_bytes_per_request": self._quota_max_bytes_per_request,
+                            "max_requests_per_minute": self._quota_max_requests_per_minute,
                         },
                     )
                 raise EntropyUnavailableError(

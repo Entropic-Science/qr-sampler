@@ -1,7 +1,7 @@
 """Sync test between BUILTIN_PRESETS (runtime) and YAML profiles (docs).
 
 CLAUDE.md invariant 16: profile loading never affects runtime sampling.
-``BUILTIN_PRESETS`` in ``qr_sampler.presets`` is the runtime source of
+``BUILTIN_PRESETS`` in ``qr_sampler.config.presets`` is the runtime source of
 truth; the YAML files in ``qr_sampler.profiles.presets`` are
 documentation. This test is the only guard against drift between them.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from qr_sampler.presets import BUILTIN_PRESETS
+from qr_sampler.config import BUILTIN_PRESETS
 from qr_sampler.profiles.loader import ProfileLoader
 
 

@@ -1,11 +1,11 @@
 """Tests for the qthought roller.
 
-Covers amplifier parity, fallback-flag propagation,
-``_ensure_source_importable``, the typed arbitrary-arity decisions the
-case-frame grammar needs (``choose`` / ``choose_weighted`` / ``coin`` /
-``bind_int``), the just-in-time distinct-fetch contract (one fresh fetch per
-decision, invariant 4), the three lockstep presets, and the optional,
-fallback-safe thought-level aggregate protocol.
+Covers amplifier parity, fallback-flag propagation, the typed
+arbitrary-arity decisions the case-frame grammar needs (``choose`` /
+``choose_weighted`` / ``coin`` / ``bind_int``), the just-in-time
+distinct-fetch contract (one fresh fetch per decision, invariant 4), the
+three lockstep presets, and the optional, fallback-safe thought-level
+aggregate protocol.
 """
 
 from __future__ import annotations
@@ -13,17 +13,15 @@ from __future__ import annotations
 import pytest
 
 from qr_sampler.amplification.zscore import ZScoreMeanAmplifier
-from qr_sampler.config import QRSamplerConfig
+from qr_sampler.config import BUILTIN_PRESETS, QRSamplerConfig
 from qr_sampler.entropy.base import EntropySource
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.exceptions import EntropyUnavailableError
-from qr_sampler.presets import BUILTIN_PRESETS
 from qr_sampler.qthought import (
     BindSpec,
     ChoiceProvenance,
     IntRange,
     QthoughtRoller,
-    _ensure_source_importable,
 )
 
 
@@ -527,7 +525,7 @@ def test_bind_int_rejects_bad_spec(mock_config: QRSamplerConfig) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Presets + default construction + _ensure_source_importable
+# Presets + default construction + registry lazy resolution
 # --------------------------------------------------------------------------- #
 
 
@@ -569,32 +567,13 @@ def test_default_construction_resolves_qthought_preset() -> None:
         roller.close()
 
 
-def test_ensure_source_importable_registers_quantum() -> None:
-    """quantum_grpc resolves even when nothing else imported quantum.py."""
+def test_quantum_grpc_resolves_via_builtin_table() -> None:
+    """quantum_grpc resolves through the registry's lazy builtin table.
+
+    Nothing else needs to have imported ``qr_sampler.entropy.quantum`` —
+    this is the property that made the roller's old import-nudge helper
+    deletable.
+    """
     from qr_sampler.entropy.registry import EntropySourceRegistry
 
-    config = QRSamplerConfig(entropy_source_type="quantum_grpc")
-    result = _ensure_source_importable(config)
-
-    assert result.entropy_source_type == "quantum_grpc"
     assert EntropySourceRegistry.get("quantum_grpc") is not None
-
-
-def test_ensure_source_importable_degrades_on_import_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """grpcio genuinely absent → roller degrades to fallback_mode, no crash."""
-    import sys
-
-    # None in sys.modules makes `import qr_sampler.entropy.quantum`
-    # raise ImportError without touching the real module machinery.
-    monkeypatch.setitem(sys.modules, "qr_sampler.entropy.quantum", None)
-
-    config = QRSamplerConfig(entropy_source_type="quantum_grpc", fallback_mode="system")
-    result = _ensure_source_importable(config)
-    assert result.entropy_source_type == "system"
-
-    # fallback_mode="error" still must not crash — degrade to system.
-    config = QRSamplerConfig(entropy_source_type="quantum_grpc", fallback_mode="error")
-    result = _ensure_source_importable(config)
-    assert result.entropy_source_type == "system"

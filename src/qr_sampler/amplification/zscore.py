@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from qr_sampler.amplification.base import AmplificationResult, SignalAmplifier
-from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.exceptions import SignalAmplificationError
 
 if TYPE_CHECKING:
@@ -23,7 +22,6 @@ if TYPE_CHECKING:
 _SQRT2 = math.sqrt(2.0)
 
 
-@AmplifierRegistry.register("zscore_mean")
 class ZScoreMeanAmplifier(SignalAmplifier):
     """Z-score signal amplification.
 

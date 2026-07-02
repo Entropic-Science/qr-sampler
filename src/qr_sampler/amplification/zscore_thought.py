@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.amplification.zscore import ZScoreMeanAmplifier
 
 if TYPE_CHECKING:
@@ -38,7 +37,6 @@ if TYPE_CHECKING:
 _SQRT2 = math.sqrt(2.0)
 
 
-@AmplifierRegistry.register("zscore_thought")
 class ZScoreThoughtAmplifier(ZScoreMeanAmplifier):
     """Z-score amplifier with an optional thought-level bias aggregate.
 

@@ -1269,12 +1269,11 @@ class TestQuotaExhaustedClassification:
         except ImportError:
             pytest.skip("grpcio not installed")
 
-        from qr_sampler.entropy.quantum import (
-            _QRNG_MAX_BYTES_PER_REQUEST,
-            QuantumGrpcSource,
-        )
+        from qr_sampler.config import QRSamplerConfig
+        from qr_sampler.entropy.quantum import QuantumGrpcSource
 
-        config = _make_config(sample_count=_QRNG_MAX_BYTES_PER_REQUEST + 1)
+        cap = QRSamplerConfig(_env_file=None).qrng_max_bytes_per_request  # type: ignore[call-arg]
+        config = _make_config(sample_count=cap + 1)
         with caplog.at_level("WARNING", logger="qr_sampler"):
             source = QuantumGrpcSource(config)
         source.close()
@@ -1287,12 +1286,11 @@ class TestQuotaExhaustedClassification:
         except ImportError:
             pytest.skip("grpcio not installed")
 
-        from qr_sampler.entropy.quantum import (
-            _QRNG_MAX_BYTES_PER_REQUEST,
-            QuantumGrpcSource,
-        )
+        from qr_sampler.config import QRSamplerConfig
+        from qr_sampler.entropy.quantum import QuantumGrpcSource
 
-        config = _make_config(sample_count=_QRNG_MAX_BYTES_PER_REQUEST)
+        cap = QRSamplerConfig(_env_file=None).qrng_max_bytes_per_request  # type: ignore[call-arg]
+        config = _make_config(sample_count=cap)
         with caplog.at_level("WARNING", logger="qr_sampler"):
             source = QuantumGrpcSource(config)
         source.close()

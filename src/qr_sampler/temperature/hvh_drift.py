@@ -30,7 +30,6 @@ from qr_sampler.temperature.base import (
     TemperatureResult,
     TemperatureStrategy,
 )
-from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 if TYPE_CHECKING:
     from qr_sampler.config import QRSamplerConfig
@@ -44,7 +43,6 @@ _MIN_P_CLAMP: tuple[float, float] = (0.0, 0.15)
 _logger = logging.getLogger("qr_sampler")
 
 
-@TemperatureStrategyRegistry.register("hvh_drift")
 class HVHDriftStrategy(TemperatureStrategy):
     """Per-request stateful HVH-Drift temperature strategy.
 

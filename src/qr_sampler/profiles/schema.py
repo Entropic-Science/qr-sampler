@@ -112,7 +112,7 @@ class PresetProfile(BaseModel):
     A preset is a documented bundle of per-request overrides surfaced
     through the CLI (``qr-sampler list presets`` / ``info preset <id>``)
     and the Open WebUI user toggle. Runtime expansion lives in
-    ``qr_sampler.presets.BUILTIN_PRESETS``; this YAML-backed profile is
+    ``qr_sampler.config.presets.BUILTIN_PRESETS``; this YAML-backed profile is
     documentation that a sync test holds in lock-step with the dict.
     """
 

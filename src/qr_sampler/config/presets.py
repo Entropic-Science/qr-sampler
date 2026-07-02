@@ -17,7 +17,7 @@ Resolution flow (engine-agnostic; see CLAUDE.md invariant 15):
    underneath any caller-supplied ``qr_*`` keys (caller wins per FR-10),
    and ``qr_preset`` is stripped from the output.
 3. The resulting ``qr_*`` dict flows through the usual
-   ``validate_extra_args`` -> ``_PER_REQUEST_FIELDS`` merge path.
+   ``validate_extra_args`` -> ``PER_REQUEST_FIELDS`` merge path.
 
 ``BUILTIN_PRESETS`` is the runtime source of truth (CLAUDE.md invariant
 16: profile YAML in ``profiles/presets/`` is documentation only; a
@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Final
 from qr_sampler.exceptions import ConfigValidationError
 
 if TYPE_CHECKING:
-    from qr_sampler.config import QRSamplerConfig
+    from qr_sampler.config.model import QRSamplerConfig
 
 #: Preset-name constants for the three qthought lanes, re-exported via
 #: ``qr_sampler.contract`` as the canonical spelling qthought binds against

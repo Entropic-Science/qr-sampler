@@ -1,11 +1,18 @@
-"""Configuration system for qr-sampler.
+"""The declarative configuration model for qr-sampler.
 
-Uses pydantic-settings for declarative, layered configuration:
+Uses pydantic-settings for layered configuration:
 init kwargs -> environment variables (QR_*) -> .env file -> field defaults.
 
-Per-request overrides are applied via resolve_config() which creates a new
-config instance without mutating the defaults. Infrastructure fields are
-protected from per-request override.
+Fields are divided into two groups:
+
+- **Infrastructure**: server addresses, timeouts, transport mode, quotas —
+  NOT overridable per-request.
+- **Sampling parameters**: amplification, temperature, selection, logging —
+  overridable per-request via ``SamplingParams.extra_args`` with a ``qr_``
+  prefix. A field is per-request if and only if it is declared with
+  ``Field(json_schema_extra={"per_request": True})``; the
+  :data:`PER_REQUEST_FIELDS` set is DERIVED from that metadata at import
+  time, so the declaration on the field is the single source of truth.
 """
 
 from __future__ import annotations
@@ -15,54 +22,9 @@ from typing import Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from qr_sampler.exceptions import ConfigValidationError
-
-# Fields that can be overridden per-request via SamplingParams.extra_args.
-# Infrastructure fields (server address, timeout, retry, fallback mode, etc.)
-# are deliberately excluded — they cannot change per-request.
-_PER_REQUEST_FIELDS: frozenset[str] = frozenset(
-    {
-        "signal_amplifier_type",
-        "sample_count",
-        "population_mean",
-        "population_std",
-        "uniform_clamp_epsilon",
-        "temperature_strategy",
-        "fixed_temperature",
-        "edt_base_temp",
-        "edt_exponent",
-        "edt_min_temp",
-        "edt_max_temp",
-        "top_k",
-        "top_p",
-        "log_level",
-        "diagnostic_mode",
-        "oe_conditioning",
-        # Per-request switchable so comparison mode can fan out two requests
-        # to the same engine instance with different entropy sources. The
-        # engine adapter additionally constrains the allowed values at startup
-        # to the set of entropy sources it has pre-initialised.
-        "entropy_source_type",
-        # Timing-only switch (does not affect the sampled distribution):
-        # per-request override lets an operator A/B the pipelined vs serial
-        # fetch latency on a live deployment.
-        "entropy_prefetch",
-        # HVH-Drift hyperparameters (V6_HVD_R01_01 winner from createmp-evalsuite).
-        "hvh_t_base",
-        "hvh_alpha_h",
-        "hvh_alpha_vh",
-        "hvh_gamma_dh",
-        "hvh_delta_dvh",
-        "hvh_lambda_ema",
-        "hvh_min_p_base",
-        "hvh_kappa_h",
-        "hvh_nu_dh",
-        "min_p_base",
-    }
-)
-
-# All known config field names (populated after class definition).
-_ALL_FIELDS: frozenset[str] = frozenset()
+#: Marker for per-request-overridable fields (see module docstring).
+#: ``dict[str, Any]`` keeps it assignable to pydantic's invariant JsonDict.
+_PER_REQUEST: dict[str, Any] = {"per_request": True}
 
 
 class QRSamplerConfig(BaseSettings):
@@ -70,11 +32,9 @@ class QRSamplerConfig(BaseSettings):
 
     Resolution order: init kwargs -> env vars (QR_*) -> .env file -> defaults.
 
-    Fields are divided into two groups:
-    - **Infrastructure**: Server addresses, timeouts, transport mode — NOT
-      overridable per-request.
-    - **Sampling parameters**: Amplification, temperature, selection, logging
-      — overridable per-request via SamplingParams.extra_args with qr_ prefix.
+    Per-request overrides are applied via ``resolve_config()`` which creates
+    a new config instance without mutating the defaults. Infrastructure
+    fields are protected from per-request override.
     """
 
     model_config = SettingsConfigDict(
@@ -104,7 +64,7 @@ class QRSamplerConfig(BaseSettings):
             "known-good connection — no channel-establishment cost is "
             "paid mid-fetch. The circuit breaker still trips on "
             "consecutive failures and the TCP pre-probe fast-fails when "
-            "the cloudflared tunnel is down."
+            "the tunnel to the entropy server is down."
         ),
     )
     grpc_mode: str = Field(
@@ -151,7 +111,14 @@ class QRSamplerConfig(BaseSettings):
 
     entropy_source_type: str = Field(
         default="system",
-        description="Primary entropy source identifier",
+        description=(
+            "Primary entropy source identifier. Per-request switchable so "
+            "comparison mode can fan out two requests to the same engine "
+            "instance with different entropy sources. The engine adapter "
+            "additionally constrains the allowed values at startup to the "
+            "set of entropy sources it has pre-initialised."
+        ),
+        json_schema_extra=_PER_REQUEST,
     )
 
     entropy_prefetch: bool = Field(
@@ -166,8 +133,42 @@ class QRSamplerConfig(BaseSettings):
             "carries a commitment nonce derived from that token (echoed by "
             "the server via sequence_id) so the ordering is externally "
             "verifiable. Set QR_ENTROPY_PREFETCH=0 to restore the "
-            "strictly-serial fetch-after-logits timing."
+            "strictly-serial fetch-after-logits timing. Timing-only switch "
+            "(does not affect the sampled distribution): per-request "
+            "override lets an operator A/B the pipelined vs serial fetch "
+            "latency on a live deployment."
         ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- QRNG service quotas (NOT per-request overridable) ---
+    # Documented limits of the QRNG service for our API key (QRNG team
+    # README, 2026-06-10; adjustable on request to the QRNG team).
+    # Exceeding any of them returns gRPC RESOURCE_EXHAUSTED — a quota
+    # verdict, not a connectivity one; QuantumGrpcSource gives it a distinct
+    # telemetry event so the operator response is "lower sample_count /
+    # concurrency or ask for a bigger quota", never "go check the tunnel".
+    #
+    # Request-rate math worth keeping in view: the just-in-time
+    # post-selection contract pins entropy fetches at exactly ONE request
+    # per generated token (coalescing N tokens' bytes into one request
+    # would fetch token N+1's entropy before token N is committed —
+    # breaking the experiment's causal ordering, so it is deliberately not
+    # an optimisation we will ever take). At 500 requests/minute that caps
+    # aggregate decode throughput at ~8.3 tokens/sec across ALL concurrent
+    # sequences.
+
+    qrng_max_bytes_per_request: int = Field(
+        default=35_200,
+        description="QRNG service per-request byte quota (RESOURCE_EXHAUSTED beyond it)",
+    )
+    qrng_max_requests_per_minute: int = Field(
+        default=500,
+        description="QRNG service request-rate quota per minute",
+    )
+    qrng_max_bytes_per_day: int = Field(
+        default=500 * 1024 * 1024,
+        description="QRNG service daily byte quota",
     )
 
     # --- Circuit Breaker (NOT per-request overridable) ---
@@ -217,6 +218,7 @@ class QRSamplerConfig(BaseSettings):
     signal_amplifier_type: str = Field(
         default="zscore_mean",
         description="Signal amplification algorithm",
+        json_schema_extra=_PER_REQUEST,
     )
     sample_count: int = Field(
         # iter-48 (2026-05-25): halved from 20480 → 10000 to reduce
@@ -228,18 +230,22 @@ class QRSamplerConfig(BaseSettings):
         # ``qrng_colocation_constraint`` auto-memory).
         default=10000,
         description="Number of entropy bytes to fetch per token",
+        json_schema_extra=_PER_REQUEST,
     )
     population_mean: float = Field(
         default=127.5,
         description="Null-hypothesis mean of byte values {0..255}",
+        json_schema_extra=_PER_REQUEST,
     )
     population_std: float = Field(
         default=73.61215932167728,
         description="Population std for continuous uniform [0, 255]",
+        json_schema_extra=_PER_REQUEST,
     )
     uniform_clamp_epsilon: float = Field(
         default=1e-10,
         description="Clamp u to (epsilon, 1-epsilon) to avoid degenerate CDF",
+        json_schema_extra=_PER_REQUEST,
     )
     ecdf_calibration_samples: int = Field(
         default=2000,
@@ -252,6 +258,7 @@ class QRSamplerConfig(BaseSettings):
     temperature_strategy: str = Field(
         default="fixed",
         description="Temperature strategy: 'fixed' or 'edt'",
+        json_schema_extra=_PER_REQUEST,
     )
     fixed_temperature: float = Field(
         default=1.0,
@@ -266,22 +273,27 @@ class QRSamplerConfig(BaseSettings):
             "quantum-entropy baseline — sharpening the distribution makes "
             "the QRNG signal less load-bearing."
         ),
+        json_schema_extra=_PER_REQUEST,
     )
     edt_base_temp: float = Field(
         default=0.8,
         description="Base coefficient for EDT",
+        json_schema_extra=_PER_REQUEST,
     )
     edt_exponent: float = Field(
         default=0.5,
         description="Power-law exponent for EDT",
+        json_schema_extra=_PER_REQUEST,
     )
     edt_min_temp: float = Field(
         default=0.1,
         description="EDT temperature floor",
+        json_schema_extra=_PER_REQUEST,
     )
     edt_max_temp: float = Field(
         default=2.0,
         description="EDT temperature ceiling",
+        json_schema_extra=_PER_REQUEST,
     )
 
     # --- HVH-Drift Temperature Strategy (per-request overridable) ---
@@ -292,38 +304,47 @@ class QRSamplerConfig(BaseSettings):
     hvh_t_base: float = Field(
         default=1.35,
         description="HVH-Drift base temperature (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_alpha_h: float = Field(
         default=0.3,
         description="HVH-Drift entropy coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_alpha_vh: float = Field(
         default=-0.2,
         description="HVH-Drift varentropy coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_gamma_dh: float = Field(
         default=1.0,
         description="HVH-Drift entropy-drift coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_delta_dvh: float = Field(
         default=0.5,
         description="HVH-Drift varentropy-drift coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_lambda_ema: float = Field(
         default=0.02,
         description="HVH-Drift EMA decay rate for H/VH state (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_min_p_base: float = Field(
         default=0.025,
         description="HVH-Drift min-p base term (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_kappa_h: float = Field(
         default=0.03,
         description="HVH-Drift min-p entropy coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
     hvh_nu_dh: float = Field(
         default=0.02,
         description="HVH-Drift min-p entropy-drift coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
     )
 
     # --- Token Selection (per-request overridable) ---
@@ -331,10 +352,12 @@ class QRSamplerConfig(BaseSettings):
     top_k: int = Field(
         default=0,
         description="Top-k filtering (<=0 disables)",
+        json_schema_extra=_PER_REQUEST,
     )
     top_p: float = Field(
         default=1.0,
         description="Nucleus sampling threshold (1.0 disables)",
+        json_schema_extra=_PER_REQUEST,
     )
     min_p_base: float = Field(
         default=0.0,
@@ -343,6 +366,7 @@ class QRSamplerConfig(BaseSettings):
             "active temperature strategy does not emit a per-token min_p. "
             "Default 0.0 disables min-p (preserves prior behavior; NFR-7)."
         ),
+        json_schema_extra=_PER_REQUEST,
     )
 
     # --- Logging (per-request overridable) ---
@@ -350,15 +374,17 @@ class QRSamplerConfig(BaseSettings):
     log_level: str = Field(
         default="summary",
         description="Logging verbosity: 'none', 'summary', 'full'",
+        json_schema_extra=_PER_REQUEST,
     )
     diagnostic_mode: bool = Field(
         default=False,
         description="Store all token records in memory for analysis",
+        json_schema_extra=_PER_REQUEST,
     )
 
     # --- Preset (env-var ingestion only; NOT per-request overridable) ---
-    # Resolved by qr_sampler.presets.expand_extra_args, not via the normal
-    # _PER_REQUEST_FIELDS merge path. Per-request callers use the
+    # Resolved by qr_sampler.config.presets.expand_extra_args, not via the
+    # normal PER_REQUEST_FIELDS merge path. Per-request callers use the
     # `qr_preset` key in extra_args directly.
 
     preset: str | None = Field(
@@ -370,7 +396,12 @@ class QRSamplerConfig(BaseSettings):
         ),
     )
 
-    # --- OpenEntropy (oe_conditioning per-request, others infrastructure) ---
+    # --- OpenEntropy (all infrastructure) ---
+    # ``oe_conditioning`` is deliberately NOT per-request: it is read only
+    # when the OpenEntropy source is constructed (see entropy/openentropy.py),
+    # so a per-request override would be a silent no-op that falsifies the
+    # ``config_hash`` provenance. Callers sending ``qr_oe_conditioning``
+    # fail fast with ConfigValidationError instead.
 
     oe_conditioning: str = Field(
         default="raw",
@@ -390,117 +421,13 @@ class QRSamplerConfig(BaseSettings):
     )
 
 
-# Populate _ALL_FIELDS now that the class is defined.
-_ALL_FIELDS = frozenset(QRSamplerConfig.model_fields.keys())
+#: All known config field names.
+ALL_FIELDS: frozenset[str] = frozenset(QRSamplerConfig.model_fields.keys())
 
-
-def _strip_prefix(key: str) -> str:
-    """Strip the 'qr_' prefix from an extra_args key.
-
-    Args:
-        key: The key with or without 'qr_' prefix.
-
-    Returns:
-        The key with 'qr_' prefix removed if present.
-    """
-    if key.startswith("qr_"):
-        return key[3:]
-    return key
-
-
-def validate_extra_args(extra_args: dict[str, Any]) -> None:
-    """Validate all qr_* keys in extra_args without creating a config.
-
-    This is called by validate_params() at request creation time to
-    reject bad keys early, before the request enters the batch.
-
-    ``qr_preset`` is accepted here as a special case (the preset itself
-    is not a per-request-overridable field, but selecting a preset *by
-    name* is the supported per-request surface; resolve_config()
-    expands it into concrete overrides before merging). The preset name
-    is validated against ``BUILTIN_PRESETS`` so unknown names fail at
-    the same point as unknown qr_* keys.
-
-    Args:
-        extra_args: Dictionary of extra arguments, potentially with qr_ prefix.
-
-    Raises:
-        ConfigValidationError: If any qr_* key is unknown or non-overridable,
-            or if ``qr_preset`` names an unknown preset.
-    """
-    # Imported lazily to mirror resolve_config's import-cycle workaround.
-    from qr_sampler.presets import BUILTIN_PRESETS
-
-    for key in extra_args:
-        if not key.startswith("qr_"):
-            continue
-        if key == "qr_preset":
-            preset_name = extra_args[key]
-            if preset_name not in BUILTIN_PRESETS:
-                raise ConfigValidationError(
-                    f"Unknown preset {preset_name!r}; known: {sorted(BUILTIN_PRESETS)}"
-                )
-            continue
-        field_name = _strip_prefix(key)
-        if field_name not in _ALL_FIELDS:
-            raise ConfigValidationError(
-                f"Unknown config field: '{key}' (no field '{field_name}' exists)"
-            )
-        if field_name not in _PER_REQUEST_FIELDS:
-            raise ConfigValidationError(
-                f"Field '{field_name}' is an infrastructure field and cannot be "
-                f"overridden per-request via extra_args"
-            )
-
-
-def resolve_config(
-    defaults: QRSamplerConfig,
-    extra_args: dict[str, Any] | None,
-) -> QRSamplerConfig:
-    """Create a new config instance merging defaults with per-request overrides.
-
-    The extra_args keys use 'qr_' prefix (e.g., 'qr_top_k': 100).
-    Only fields in _PER_REQUEST_FIELDS are overridable. Keys without the
-    'qr_' prefix are silently ignored (they belong to other processors).
-
-    Preset expansion runs first: ``qr_preset`` in extra_args (or
-    ``defaults.preset`` from QR_PRESET) is expanded into concrete
-    ``qr_*`` overrides before the normal field-merge path.
-
-    Args:
-        defaults: The base configuration loaded from environment.
-        extra_args: Per-request overrides from SamplingParams.extra_args.
-
-    Returns:
-        A new QRSamplerConfig with overrides applied.
-
-    Raises:
-        ConfigValidationError: If any qr_* key is unknown or non-overridable.
-    """
-    # Imported here to avoid a circular import (presets -> config).
-    from qr_sampler.presets import expand_extra_args
-
-    extra_args = expand_extra_args(extra_args, defaults)
-    if not extra_args:
-        return defaults
-
-    # Validate all qr_* keys first.
-    validate_extra_args(extra_args)
-
-    # Extract and apply valid overrides.
-    overrides: dict[str, Any] = {}
-    for key, value in extra_args.items():
-        if not key.startswith("qr_"):
-            continue
-        field_name = _strip_prefix(key)
-        overrides[field_name] = value
-
-    if not overrides:
-        return defaults
-
-    # Use model_validate on a merged dict to ensure type coercion.
-    # model_copy(update=...) skips validation, so string "100" would not
-    # be coerced to int 100. model_validate runs the full validator.
-    merged = defaults.model_dump()
-    merged.update(overrides)
-    return QRSamplerConfig.model_validate(merged)
+#: Fields overridable per-request via SamplingParams.extra_args — DERIVED
+#: from the ``per_request`` field metadata, never hand-maintained.
+PER_REQUEST_FIELDS: frozenset[str] = frozenset(
+    name
+    for name, info in QRSamplerConfig.model_fields.items()
+    if isinstance(info.json_schema_extra, dict) and info.json_schema_extra.get("per_request")
+)

@@ -180,3 +180,51 @@ class TestEntropySourceRegistry:
         mapping = EntropySourceRegistry.all_sources()
         mapping.pop("copy_test", None)
         assert "copy_test" in EntropySourceRegistry._registry
+
+    def test_builtin_table_resolves_lazily(self) -> None:
+        """Builtins resolve from the lazy table on demand — no package-import
+        side effects required (invariant: registration is import-order-free)."""
+        EntropySourceRegistry._reset()
+        assert not EntropySourceRegistry._registry
+
+        from qr_sampler.entropy.system import SystemEntropySource
+
+        cls = EntropySourceRegistry.get("system")
+        assert cls is SystemEntropySource
+        # Resolution is cached.
+        assert EntropySourceRegistry._registry["system"] is SystemEntropySource
+
+    def test_builtin_table_covers_all_shipped_sources(self) -> None:
+        """The lazy table names every shipped source, quantum_grpc included."""
+        assert set(EntropySourceRegistry._BUILTINS) == {
+            "system",
+            "mock_uniform",
+            "timing_noise",
+            "openentropy",
+            "quantum_grpc",
+        }
+
+    def test_builtin_table_takes_precedence_over_entry_point(self) -> None:
+        """An entry point colliding with a builtin table name never loads."""
+        EntropySourceRegistry._reset()
+
+        mock_ep = MagicMock()
+        mock_ep.name = "system"  # collides with the builtin table
+        mock_ep.value = "evil.module:ShadowSource"
+        mock_ep.load.return_value = _DummySource
+
+        from qr_sampler.entropy.system import SystemEntropySource
+
+        with patch("importlib.metadata.entry_points", return_value=[mock_ep]):
+            EntropySourceRegistry.list_available()  # triggers EP loading
+            cls = EntropySourceRegistry.get("system")
+
+        assert cls is SystemEntropySource
+        mock_ep.load.assert_not_called()
+
+    def test_list_available_includes_unresolved_builtins(self) -> None:
+        """Builtins are listed without importing their modules."""
+        EntropySourceRegistry._reset()
+        with patch("importlib.metadata.entry_points", return_value=[]):
+            available = EntropySourceRegistry.list_available()
+        assert set(EntropySourceRegistry._BUILTINS) <= set(available)

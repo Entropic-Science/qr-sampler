@@ -27,18 +27,19 @@ Rules for anyone editing this file:
 
 from __future__ import annotations
 
-from qr_sampler.config import QRSamplerConfig, resolve_config
-from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.fallback import FallbackEntropySource
-from qr_sampler.entropy.mock import MockUniformSource
-from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
-from qr_sampler.presets import (
+from qr_sampler.config import (
     BUILTIN_PRESETS,
     PRESET_QTHOUGHT,
     PRESET_QTHOUGHT_THINK,
     PRESET_QTHOUGHT_VOICE,
+    QRSamplerConfig,
+    resolve_config,
     resolve_preset,
 )
+from qr_sampler.entropy.base import EntropySource
+from qr_sampler.entropy.fallback import FallbackEntropySource
+from qr_sampler.entropy.mock import MockUniformSource
+from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
 from qr_sampler.qthought import BindSpec, ChoiceProvenance, IntRange, QthoughtRoller
 
 #: Bumped on any breaking change to this module's ``__all__`` — a removed

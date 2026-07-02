@@ -1,12 +1,16 @@
 """Registry for temperature strategy implementations.
 
-Uses a decorator pattern for registration, mirroring the amplifier registry.
-The ``build()`` method handles the optional ``vocab_size`` constructor
-argument needed by some strategies (e.g., EDT).
+Built-in strategies are declared in an explicit lazy table
+(:data:`TemperatureStrategyRegistry._BUILTINS`) and imported on first
+``get()`` — no import-side-effect registration. Third-party strategies
+register at runtime via the ``@TemperatureStrategyRegistry.register()``
+decorator. The ``build()`` method handles the optional ``vocab_size``
+constructor argument needed by some strategies (e.g., EDT).
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -18,11 +22,18 @@ if TYPE_CHECKING:
 class TemperatureStrategyRegistry:
     """Registry mapping string names to TemperatureStrategy classes.
 
-    Built-in strategies register via the
-    ``@TemperatureStrategyRegistry.register()`` decorator. The ``build()``
-    class method instantiates the appropriate strategy, passing ``vocab_size``
-    if the constructor accepts it.
+    Lookup precedence: runtime ``register()`` registrations, then the
+    lazy builtin table. The ``build()`` class method instantiates the
+    appropriate strategy, passing ``vocab_size`` if the constructor
+    accepts it.
     """
+
+    #: Built-in strategies, resolved lazily on first ``get()``.
+    _BUILTINS: ClassVar[dict[str, str]] = {
+        "fixed": "qr_sampler.temperature.fixed:FixedTemperatureStrategy",
+        "edt": "qr_sampler.temperature.edt:EDTTemperatureStrategy",
+        "hvh_drift": "qr_sampler.temperature.hvh_drift:HVHDriftStrategy",
+    }
 
     _registry: ClassVar[dict[str, type[TemperatureStrategy]]] = {}
 
@@ -54,6 +65,8 @@ class TemperatureStrategyRegistry:
     def get(cls, name: str) -> type[TemperatureStrategy]:
         """Return the strategy class registered under *name*.
 
+        Resolves the builtin table lazily on first use of a builtin name.
+
         Args:
             name: Identifier to look up.
 
@@ -63,18 +76,23 @@ class TemperatureStrategyRegistry:
         Raises:
             KeyError: If *name* is not registered.
         """
-        if name not in cls._registry:
-            available = ", ".join(sorted(cls._registry)) or "(none)"
-            raise KeyError(f"Unknown temperature strategy '{name}'. Available: {available}")
-        return cls._registry[name]
+        if name in cls._registry:
+            return cls._registry[name]
+        if name in cls._BUILTINS:
+            module_path, _, attr = cls._BUILTINS[name].partition(":")
+            klass: type[TemperatureStrategy] = getattr(importlib.import_module(module_path), attr)
+            cls._registry[name] = klass
+            return klass
+        available = ", ".join(sorted(set(cls._registry) | set(cls._BUILTINS))) or "(none)"
+        raise KeyError(f"Unknown temperature strategy '{name}'. Available: {available}")
 
     @classmethod
     def build(cls, config: Any, vocab_size: int) -> TemperatureStrategy:
         """Instantiate the strategy specified by *config.temperature_strategy*.
 
         If the strategy constructor accepts a ``vocab_size`` argument
-        (detected via try/except), it is passed. Otherwise, the constructor
-        is called with no arguments.
+        (detected via signature inspection), it is passed. Otherwise, the
+        constructor is called with no arguments.
 
         Args:
             config: A QRSamplerConfig (or compatible object) with a
@@ -113,5 +131,5 @@ class TemperatureStrategyRegistry:
 
     @classmethod
     def list_registered(cls) -> list[str]:
-        """Return sorted list of registered strategy names."""
-        return sorted(cls._registry)
+        """Return sorted list of registered strategy names (builtins included)."""
+        return sorted(set(cls._registry) | set(cls._BUILTINS))

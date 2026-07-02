@@ -21,11 +21,15 @@ class TestEngineAdapterRegistry:
     """Test EngineAdapterRegistry decorator and lookup."""
 
     def test_vllm_registered(self) -> None:
-        """The vllm adapter is registered via decorator."""
+        """The vllm adapter resolves through the lazy builtin table."""
         cls = EngineAdapterRegistry.get("vllm")
         from qr_sampler.engines.vllm import VLLMAdapter
 
         assert cls is VLLMAdapter
+
+    def test_vllm_in_builtin_table(self) -> None:
+        """The builtin table is the explicit home of the shipped adapter."""
+        assert EngineAdapterRegistry._BUILTINS == {"vllm": "qr_sampler.engines.vllm:VLLMAdapter"}
 
     def test_unknown_adapter_raises(self) -> None:
         """Looking up an unregistered name raises KeyError."""

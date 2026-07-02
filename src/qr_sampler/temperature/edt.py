@@ -15,7 +15,6 @@ from qr_sampler.temperature.base import (
     TemperatureStrategy,
     compute_shannon_entropy,
 )
-from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 if TYPE_CHECKING:
     import numpy as np
@@ -23,7 +22,6 @@ if TYPE_CHECKING:
     from qr_sampler.config import QRSamplerConfig
 
 
-@TemperatureStrategyRegistry.register("edt")
 class EDTTemperatureStrategy(TemperatureStrategy):
     """Entropy-based Dynamic Temperature.
 

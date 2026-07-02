@@ -1,13 +1,16 @@
-"""Entropy source registry with entry-point auto-discovery.
+"""Entropy source registry with a lazy builtin table + entry-point discovery.
 
-Built-in sources are registered at module import time via the
-``@register_entropy_source`` decorator. Third-party sources from other
-packages are discovered lazily on the first :meth:`EntropySourceRegistry.get`
-call via the ``qr_sampler.entropy_sources`` entry-point group.
+Built-in sources are declared in an explicit lazy table
+(:data:`EntropySourceRegistry._BUILTINS`) and imported on first
+:meth:`EntropySourceRegistry.get` — no import-side-effect registration.
+Third-party sources from other packages are discovered lazily via the
+``qr_sampler.entropy_sources`` entry-point group; the builtin table takes
+precedence, so an entry point can never shadow a builtin name.
 """
 
 from __future__ import annotations
 
+import importlib
 import importlib.metadata
 import logging
 from typing import TYPE_CHECKING, ClassVar
@@ -25,12 +28,24 @@ _ENTRY_POINT_GROUP = "qr_sampler.entropy_sources"
 class EntropySourceRegistry:
     """Registry for entropy source classes.
 
-    Discovery chain:
+    Discovery chain (first hit wins):
 
-    1. Built-in sources registered via ``@register_entropy_source`` decorator
-    2. Third-party sources discovered via ``qr_sampler.entropy_sources``
-       entry points (loaded lazily on first ``get()`` call)
+    1. Runtime registrations via ``@register_entropy_source``
+    2. The lazy builtin table (``_BUILTINS``), imported on demand
+    3. Third-party sources discovered via ``qr_sampler.entropy_sources``
+       entry points (loaded lazily on first miss)
     """
+
+    #: Built-in sources, resolved lazily on first ``get()``. Importing a
+    #: target module never requires its optional runtime deps (e.g.
+    #: ``quantum.py`` defers its grpcio import to construction time).
+    _BUILTINS: ClassVar[dict[str, str]] = {
+        "system": "qr_sampler.entropy.system:SystemEntropySource",
+        "mock_uniform": "qr_sampler.entropy.mock:MockUniformSource",
+        "timing_noise": "qr_sampler.entropy.timing:TimingNoiseSource",
+        "openentropy": "qr_sampler.entropy.openentropy:OpenEntropySource",
+        "quantum_grpc": "qr_sampler.entropy.quantum:QuantumGrpcSource",
+    }
 
     _registry: ClassVar[dict[str, type[EntropySource]]] = {}
     _entry_points_loaded: ClassVar[bool] = False
@@ -59,10 +74,19 @@ class EntropySourceRegistry:
         return decorator
 
     @classmethod
+    def _resolve_builtin(cls, name: str) -> type[EntropySource]:
+        """Import + cache one builtin table entry."""
+        module_path, _, attr = cls._BUILTINS[name].partition(":")
+        source_cls: type[EntropySource] = getattr(importlib.import_module(module_path), attr)
+        cls._registry[name] = source_cls
+        return source_cls
+
+    @classmethod
     def get(cls, name: str) -> type[EntropySource]:
         """Look up a source class by name.
 
-        Loads entry points on the first call if not already loaded.
+        Resolves the builtin table lazily; loads entry points on the
+        first miss if not already loaded.
 
         Args:
             name: Registered identifier for the source.
@@ -75,6 +99,8 @@ class EntropySourceRegistry:
         """
         if name in cls._registry:
             return cls._registry[name]
+        if name in cls._BUILTINS:
+            return cls._resolve_builtin(name)
 
         # Lazy-load third-party entry points.
         if not cls._entry_points_loaded:
@@ -82,34 +108,39 @@ class EntropySourceRegistry:
             if name in cls._registry:
                 return cls._registry[name]
 
-        available = ", ".join(sorted(cls._registry.keys())) or "(none)"
+        available = ", ".join(sorted(set(cls._registry) | set(cls._BUILTINS))) or "(none)"
         raise KeyError(f"Unknown entropy source: {name!r}. Available: {available}")
 
     @classmethod
     def list_available(cls) -> list[str]:
-        """Return all registered source names.
+        """Return all registered source names (builtins included).
 
-        Triggers entry-point loading if not yet done.
+        Triggers entry-point loading if not yet done; builtin names are
+        listed without importing their modules.
 
         Returns:
             Sorted list of registered source identifiers.
         """
         if not cls._entry_points_loaded:
             cls._load_entry_points()
-        return sorted(cls._registry.keys())
+        return sorted(set(cls._registry) | set(cls._BUILTINS))
 
     @classmethod
     def all_sources(cls) -> dict[str, type[EntropySource]]:
         """Return a copy of the full ``name -> class`` registry mapping.
 
-        Triggers entry-point loading on first call so third-party sources
-        are included. The returned dict is a shallow copy; mutating it
-        does not affect the registry. Used by engine adapters at startup
-        to pre-initialise pipelines for every available entropy source.
+        Resolves every builtin table entry and triggers entry-point
+        loading on first call so third-party sources are included. The
+        returned dict is a shallow copy; mutating it does not affect the
+        registry. Used by engine adapters at startup to pre-initialise
+        pipelines for every available entropy source.
 
         Returns:
             A new dict mapping each registered identifier to its class.
         """
+        for name in cls._BUILTINS:
+            if name not in cls._registry:
+                cls._resolve_builtin(name)
         if not cls._entry_points_loaded:
             cls._load_entry_points()
         return dict(cls._registry)
@@ -119,8 +150,10 @@ class EntropySourceRegistry:
         """Discover and register sources from the entry-point group.
 
         Each entry point maps a name to a fully-qualified class path.
-        Errors during individual entry-point loading are logged as warnings
-        but do not prevent other sources from loading.
+        Names already claimed by a runtime registration or the builtin
+        table are skipped (builtins take precedence). Errors during
+        individual entry-point loading are logged as warnings but do not
+        prevent other sources from loading.
         """
         cls._entry_points_loaded = True
         try:
@@ -130,8 +163,8 @@ class EntropySourceRegistry:
             return
 
         for ep in eps:
-            if ep.name in cls._registry:
-                # Built-in decorator registration takes precedence.
+            if ep.name in cls._registry or ep.name in cls._BUILTINS:
+                # Builtin / runtime registration takes precedence.
                 continue
             try:
                 source_cls = ep.load()
@@ -152,5 +185,5 @@ class EntropySourceRegistry:
         cls._entry_points_loaded = False
 
 
-# Convenience alias used as a decorator in source modules.
+# Convenience alias used as a decorator by third-party source modules.
 register_entropy_source = EntropySourceRegistry.register

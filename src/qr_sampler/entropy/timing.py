@@ -20,7 +20,6 @@ import time
 import warnings
 
 from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.registry import register_entropy_source
 
 logger = logging.getLogger("qr_sampler")
 
@@ -28,7 +27,6 @@ _BITS_PER_BYTE = 8
 _HASH_ITERATIONS = 64
 
 
-@register_entropy_source("timing_noise")
 class TimingNoiseSource(EntropySource):
     """CPU timing jitter entropy source.
 

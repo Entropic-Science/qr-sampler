@@ -36,10 +36,9 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from qr_sampler.amplification.registry import AmplifierRegistry
-from qr_sampler.config import QRSamplerConfig, resolve_config
+from qr_sampler.config import PRESET_QTHOUGHT, QRSamplerConfig, resolve_config
 from qr_sampler.core.pipeline import build_entropy_source, config_hash
 from qr_sampler.entropy.fallback import FallbackEntropySource
-from qr_sampler.presets import PRESET_QTHOUGHT
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -182,39 +181,6 @@ class _Draw:
     latency_ms: float
 
 
-def _ensure_source_importable(config: QRSamplerConfig) -> QRSamplerConfig:
-    """Trigger the lazy import that registers ``quantum_grpc``, or degrade.
-
-    ``EntropySourceRegistry`` is populated by module-import side effects:
-    ``qr_sampler.entropy.quantum`` self-registers via decorator, but
-    ``qr_sampler.entropy.__init__`` deliberately does NOT import it so
-    grpcio stays an optional dependency. The vLLM containers import it
-    through the serving stack; a host that only runs the qthought roller
-    does not — without this nudge, building a roller there dies with
-    ``KeyError: Unknown entropy source: 'quantum_grpc'``.
-
-    If the import itself fails (grpcio genuinely absent), swap the
-    config to the fallback source instead of crashing: an automated mind
-    on labeled system entropy beats no mind at all, and the
-    ``is_fallback``/source labels keep the degradation honest downstream.
-    """
-    if config.entropy_source_type != "quantum_grpc":
-        return config
-    try:
-        import qr_sampler.entropy.quantum  # noqa: F401 — registers "quantum_grpc"
-    except ImportError as exc:
-        degraded = config.fallback_mode if config.fallback_mode != "error" else "system"
-        logger.warning(
-            "qthought.entropy.import_failed: quantum_grpc unavailable (%s); "
-            "degrading to %s entropy",
-            exc,
-            degraded,
-            extra={"event": "qthought.entropy.import_failed", "degraded_to": degraded},
-        )
-        return config.model_copy(update={"entropy_source_type": degraded})
-    return config
-
-
 class QthoughtRoller:
     """Rolls typed grammar decisions from the entropy stack, token-sampling style.
 
@@ -250,7 +216,6 @@ class QthoughtRoller:
         """
         if config is None:
             config = resolve_config(QRSamplerConfig(preset=PRESET_QTHOUGHT), None)
-        config = _ensure_source_importable(config)
         self._config = config
         self._config_hash = config_hash(config)
         self._source: EntropySource = (
@@ -490,8 +455,7 @@ class QthoughtRoller:
         Exactly the entropy half of a token-sampling step:
         ``get_random_bytes(sample_count)`` → ``amplify()`` → ``u``. The fallback
         source name + flag are read immediately after the fetch (the wrapper
-        records the leg it just used), mirroring ``SamplingPipeline.sample_token``
-        and ``ContseqRoller.roll``.
+        records the leg it just used), mirroring ``SamplingPipeline.sample_token``.
         """
         t_start = time.perf_counter_ns()
         raw = self._source.get_random_bytes(self._config.sample_count)

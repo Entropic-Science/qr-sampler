@@ -16,7 +16,14 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
-from qr_sampler.config import QRSamplerConfig, resolve_config, validate_extra_args
+from qr_sampler.config import (
+    BUILTIN_PRESETS,
+    QRSamplerConfig,
+    expand_extra_args,
+    resolve_config,
+    resolve_preset,
+    validate_extra_args,
+)
 from qr_sampler.core import SamplingPipeline, SamplingResult, build_pipeline
 from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.exceptions import (
@@ -26,7 +33,6 @@ from qr_sampler.exceptions import (
     SignalAmplificationError,
     TokenSelectionError,
 )
-from qr_sampler.presets import BUILTIN_PRESETS, expand_extra_args, resolve_preset
 
 __all__ = [
     "BUILTIN_PRESETS",

@@ -1,11 +1,14 @@
 """Registry for signal amplifier implementations.
 
-Uses a decorator pattern for registration, enabling both built-in and
-third-party amplifiers to register themselves at import time.
+Built-in amplifiers are declared in an explicit lazy table
+(:data:`AmplifierRegistry._BUILTINS`) and imported on first ``get()`` —
+no import-side-effect registration. Third-party amplifiers register at
+runtime via the ``@AmplifierRegistry.register()`` decorator.
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -17,10 +20,18 @@ if TYPE_CHECKING:
 class AmplifierRegistry:
     """Registry mapping string names to SignalAmplifier classes.
 
-    Built-in amplifiers register via the ``@AmplifierRegistry.register()``
-    decorator. The ``build()`` class method instantiates the appropriate
-    amplifier based on the config's ``signal_amplifier_type`` field.
+    Lookup precedence: runtime ``register()`` registrations, then the
+    lazy builtin table. The ``build()`` class method instantiates the
+    appropriate amplifier based on the config's ``signal_amplifier_type``
+    field.
     """
+
+    #: Built-in amplifiers, resolved lazily on first ``get()``.
+    _BUILTINS: ClassVar[dict[str, str]] = {
+        "zscore_mean": "qr_sampler.amplification.zscore:ZScoreMeanAmplifier",
+        "ecdf": "qr_sampler.amplification.ecdf:ECDFAmplifier",
+        "zscore_thought": "qr_sampler.amplification.zscore_thought:ZScoreThoughtAmplifier",
+    }
 
     _registry: ClassVar[dict[str, type[SignalAmplifier]]] = {}
 
@@ -50,6 +61,8 @@ class AmplifierRegistry:
     def get(cls, name: str) -> type[SignalAmplifier]:
         """Return the amplifier class registered under *name*.
 
+        Resolves the builtin table lazily on first use of a builtin name.
+
         Args:
             name: Identifier to look up.
 
@@ -59,10 +72,15 @@ class AmplifierRegistry:
         Raises:
             KeyError: If *name* is not registered.
         """
-        if name not in cls._registry:
-            available = ", ".join(sorted(cls._registry)) or "(none)"
-            raise KeyError(f"Unknown signal amplifier '{name}'. Available: {available}")
-        return cls._registry[name]
+        if name in cls._registry:
+            return cls._registry[name]
+        if name in cls._BUILTINS:
+            module_path, _, attr = cls._BUILTINS[name].partition(":")
+            klass: type[SignalAmplifier] = getattr(importlib.import_module(module_path), attr)
+            cls._registry[name] = klass
+            return klass
+        available = ", ".join(sorted(set(cls._registry) | set(cls._BUILTINS))) or "(none)"
+        raise KeyError(f"Unknown signal amplifier '{name}'. Available: {available}")
 
     @classmethod
     def build(cls, config: Any) -> SignalAmplifier:
@@ -80,5 +98,5 @@ class AmplifierRegistry:
 
     @classmethod
     def list_registered(cls) -> list[str]:
-        """Return sorted list of registered amplifier names."""
-        return sorted(cls._registry)
+        """Return sorted list of registered amplifier names (builtins included)."""
+        return sorted(set(cls._registry) | set(cls._BUILTINS))

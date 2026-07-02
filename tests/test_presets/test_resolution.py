@@ -1,4 +1,4 @@
-"""Tests for qr_sampler.presets resolution helpers.
+"""Tests for qr_sampler.config.presets resolution helpers.
 
 Covers BUILTIN_PRESETS shape, resolve_preset merge semantics, and the
 expand_extra_args entry point invoked by resolve_config().
@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import pytest
 
-from qr_sampler.config import QRSamplerConfig, resolve_config
+from qr_sampler.config import (
+    BUILTIN_PRESETS,
+    QRSamplerConfig,
+    expand_extra_args,
+    resolve_config,
+    resolve_preset,
+)
 from qr_sampler.exceptions import ConfigValidationError
-from qr_sampler.presets import BUILTIN_PRESETS, expand_extra_args, resolve_preset
 
 # Expected V6_HVD_R01_01 winner values (spec §2.3).
 _CREATIVE_EXPECTED: dict[str, object] = {
