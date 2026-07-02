@@ -510,7 +510,11 @@ class QuantumGrpcSource(EntropySource):
         self._cb_max_consecutive_failures = config.cb_max_consecutive_failures
 
         # Quota telemetry state (see _is_quota_exhausted / _QUOTA_LOG_THROTTLE_S).
-        self._last_quota_log_monotonic: float = 0.0
+        # -inf, NOT 0.0: time.monotonic() has no defined epoch (it is seconds
+        # since boot on Linux/Windows), so a 0.0 sentinel silently throttles
+        # the FIRST quota log whenever the host booted less than
+        # _QUOTA_LOG_THROTTLE_S ago (fresh CI runners, fresh VMs).
+        self._last_quota_log_monotonic: float = float("-inf")
         if config.sample_count > _QRNG_MAX_BYTES_PER_REQUEST:
             logger.warning(
                 "sample_count=%d exceeds the QRNG service's documented "
