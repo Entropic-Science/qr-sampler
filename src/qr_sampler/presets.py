@@ -26,12 +26,20 @@ sync test guards against drift).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from qr_sampler.exceptions import ConfigValidationError
 
 if TYPE_CHECKING:
     from qr_sampler.config import QRSamplerConfig
+
+#: Preset-name constants for the three qthought lanes, re-exported via
+#: ``qr_sampler.contract`` as the canonical spelling qthought binds against
+#: (rather than hand-copied string literals that could drift from the keys
+#: below).
+PRESET_QTHOUGHT: Final[str] = "qthought"
+PRESET_QTHOUGHT_THINK: Final[str] = "qthought_think"
+PRESET_QTHOUGHT_VOICE: Final[str] = "qthought_voice"
 
 # Single source of truth for preset -> field-override mapping.
 # Keys are field names (no ``qr_`` prefix); values are the override values.
@@ -66,7 +74,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # entropy half. Pins the quantum source and the optional thought-level
     # amplifier (zscore_thought) so a per-thought aggregate bias rides alongside
     # the unchanged per-decision draws; the lineage is explicit in config_hash.
-    "qthought": {
+    PRESET_QTHOUGHT: {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_thought",
         "sample_count": 10000,
@@ -76,7 +84,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # terms inherit the V6_HVD_R01_01 field defaults), with a hotter base for
     # divergent reflection and a smaller fetch. Plain zscore_mean: the
     # thought-level aggregate lives on the qthought decode lane, not the model lane.
-    "qthought_think": {
+    PRESET_QTHOUGHT_THINK: {
         "temperature_strategy": "hvh_drift",
         "hvh_t_base": 1.45,
         "top_k": 0,
@@ -88,7 +96,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # Qthought SPEAK lane — the user-visible voice. EDT temperature with nucleus
     # + top-k truncation for fluent, focused speech (cooler and tighter than the
     # REFLECT lane). Full-size fetch on the quantum source + zscore_mean.
-    "qthought_voice": {
+    PRESET_QTHOUGHT_VOICE: {
         "temperature_strategy": "edt",
         "edt_base_temp": 0.8,
         "top_k": 50,
