@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from qr_sampler.engines.vllm import VLLMAdapter, _RequestState
+from qr_sampler.engines.vllm.adapter import VLLMAdapter, _RequestState
 from qr_sampler.temperature.hvh_drift import HVHDriftStrategy
 
 # ---------------------------------------------------------------------------

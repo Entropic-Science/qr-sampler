@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from qr_sampler.entropy import status_file
+from qr_sampler.telemetry import status_file
 
 
 @pytest.fixture()

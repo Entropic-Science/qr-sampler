@@ -50,8 +50,8 @@ import time
 from typing import Any
 
 from qr_sampler.entropy.base import EntropySource
-from qr_sampler.entropy.status_file import write_entropy_status
 from qr_sampler.exceptions import EntropyUnavailableError
+from qr_sampler.telemetry.status_file import write_entropy_status
 
 logger = logging.getLogger("qr_sampler")
 

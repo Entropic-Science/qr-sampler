@@ -2,19 +2,15 @@
 
 iter-53 (2026-06-09). vLLM runs the qr-sampler in two separate processes:
 the **EngineCore** (logits processors, where ``FallbackEntropySource``
-actually observes per-token fallbacks) and the **APIServer** (FastAPI,
-where the ``/health/entropy`` middleware answers health probes). Module
-globals do not cross that boundary — ``set_fallback_source()`` called in
-EngineCore is invisible to the middleware (see the
-``health_entropy_middleware`` module docstring for the iter-49 history of
-this limitation).
-
-This module is the file-based bridge sketched in that docstring:
+actually observes per-token fallbacks) and the **APIServer** (where an
+out-of-process health reader can answer probes). Module globals do not
+cross that boundary, so this module is the file-based bridge:
 ``FallbackEntropySource`` writes a small JSON snapshot of its state here
 on every state transition (and throttled count refreshes during a
-degraded window); the middleware reads it on each ``/health/entropy``
-hit. Both processes share the container filesystem, so a tmpdir file is
-the cheapest reliable channel.
+degraded window); any health reader in another process reads it. Both
+processes share a filesystem, so a tmpdir file is the cheapest reliable
+channel. Only the write side ships in-tree today; the read side is kept
+so a deliberate reader can be reintroduced.
 
 Atomicity: writes go to a same-directory temp file followed by
 ``os.replace`` (atomic on POSIX and Windows), so a reader can never

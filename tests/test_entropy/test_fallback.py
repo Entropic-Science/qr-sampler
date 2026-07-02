@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from qr_sampler.entropy import fallback as fallback_module
-from qr_sampler.entropy import status_file
 from qr_sampler.entropy.base import EntropySource
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.exceptions import EntropyUnavailableError
+from qr_sampler.telemetry import status_file
 
 
 class _AlwaysFailSource(EntropySource):
@@ -216,7 +216,7 @@ class _FlakySource(EntropySource):
 
 
 class TestStatusPublishing:
-    """iter-53: cross-process status-file writes (see entropy/status_file.py)."""
+    """iter-53: cross-process status-file writes (see telemetry/status_file.py)."""
 
     @pytest.fixture()
     def status_path(self, tmp_path, monkeypatch):

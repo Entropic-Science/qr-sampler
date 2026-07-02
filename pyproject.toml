@@ -157,7 +157,7 @@ ignore_missing_imports = true
 # flipping which of the shim's branches needs a type-ignore — so unused-ignore
 # warnings are disabled to keep mypy green in both environments.
 [[tool.mypy.overrides]]
-module = ["qr_sampler.engines.vllm"]
+module = ["qr_sampler.engines.vllm.adapter"]
 disallow_subclassing_any = false
 warn_unused_ignores = false
 

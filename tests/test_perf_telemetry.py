@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 
 import qr_sampler.selection.selector as selector_module
-from qr_sampler.entropy.status_file import read_perf_status, write_perf_status
 from qr_sampler.logging.types import TokenSamplingRecord
 from qr_sampler.selection.selector import TokenSelector
+from qr_sampler.telemetry.status_file import read_perf_status, write_perf_status
 
 
 def _record(**overrides) -> TokenSamplingRecord:
@@ -133,7 +133,7 @@ class TestPerfStatusFile:
 
 class TestPerfAggregator:
     def test_snapshot_shape_and_ratios(self) -> None:
-        from qr_sampler.engines.vllm import _PerfAggregator
+        from qr_sampler.engines.vllm.telemetry import _PerfAggregator
 
         agg = _PerfAggregator()
         agg.PUBLISH_EVERY_TOKENS = 10**9  # no publication during this test
@@ -156,7 +156,7 @@ class TestPerfAggregator:
             assert snap["stage_ms"][stage]["avg"] > 0
 
     def test_publishes_to_status_file(self, tmp_path, monkeypatch) -> None:
-        from qr_sampler.engines.vllm import _PerfAggregator
+        from qr_sampler.engines.vllm.telemetry import _PerfAggregator
 
         monkeypatch.setenv("QR_SAMPLER_PERF_FILE", str(tmp_path / "perf.json"))
         agg = _PerfAggregator()

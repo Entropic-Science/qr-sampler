@@ -15,7 +15,7 @@ import pytest
 from qr_sampler.config import QRSamplerConfig
 from qr_sampler.core.pipeline import SamplingPipeline
 from qr_sampler.engines.base import EngineAdapter
-from qr_sampler.engines.vllm import _DEFAULT_VOCAB_SIZE, VLLMAdapter
+from qr_sampler.engines.vllm.adapter import _DEFAULT_VOCAB_SIZE, VLLMAdapter
 from qr_sampler.exceptions import ConfigValidationError
 
 # ---------------------------------------------------------------------------
