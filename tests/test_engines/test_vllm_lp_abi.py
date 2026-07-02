@@ -29,21 +29,15 @@ from pathlib import Path
 import pytest
 
 from qr_sampler.engines.vllm import VLLMAdapter
-from qr_sampler.processor import QRSamplerLogitsProcessor
-
-
-def test_processor_alias_matches_adapter() -> None:
-    """``QRSamplerLogitsProcessor`` is the canonical re-export name."""
-    assert QRSamplerLogitsProcessor is VLLMAdapter
 
 
 def test_formal_inheritance_from_vllm_lp_base_when_available() -> None:
     """``VLLMAdapter`` formally inherits from vLLM's V1 LogitsProcessor.
 
-    Phase 2 R1: vLLM 0.17.0 entry-point discovery validates plugins via
+    vLLM 0.17.0 entry-point discovery validates plugins via
     ``issubclass`` checks, not duck-typing. The ``try/except ImportError``
     shim in ``qr_sampler.engines.vllm`` makes the formal base available
-    inside Modal containers (where vLLM IS installed) while falling back
+    where vLLM IS installed (serving hosts) while falling back
     to ``object`` in dev/test environments (where vLLM is NOT installed).
 
     This test asserts the formal-inheritance pathway in BOTH branches:
@@ -125,7 +119,7 @@ def test_entry_point_registered_in_pyproject() -> None:
     """``vllm serve`` discovers LPs via the ``vllm.logits_processors`` group.
 
     Asserts the entry-point line in ``pyproject.toml`` so a future
-    refactor that renames ``qr_sampler.processor`` doesn't silently
+    refactor that moves ``qr_sampler.engines.vllm`` doesn't silently
     break LP discovery at deploy time.
     """
     pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
@@ -133,9 +127,8 @@ def test_entry_point_registered_in_pyproject() -> None:
     assert '[project.entry-points."vllm.logits_processors"]' in text, (
         'pyproject.toml missing [project.entry-points."vllm.logits_processors"]'
     )
-    assert "qr_sampler.processor:QRSamplerLogitsProcessor" in text, (
-        "pyproject.toml entry-point target drift — expected "
-        "qr_sampler.processor:QRSamplerLogitsProcessor"
+    assert "qr_sampler.engines.vllm:VLLMAdapter" in text, (
+        "pyproject.toml entry-point target drift — expected qr_sampler.engines.vllm:VLLMAdapter"
     )
 
 

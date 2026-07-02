@@ -56,10 +56,6 @@ dev = [
     "types-PyYAML>=6.0",
     "click>=8.0",
     "jinja2>=3.1",
-    # Imported by the OWUI connector tests + health-entropy middleware; must be
-    # present in CI so pytest collection and mypy resolution succeed.
-    "httpx>=0.27",
-    "fastapi>=0.110",
 ]
 cli = [
     "click>=8.0",
@@ -70,10 +66,9 @@ openentropy = [
 ]
 vllm = []
 vllm-metal = []
-modal = ["modal>=0.66,<1.0"]
 
 [project.entry-points."vllm.logits_processors"]
-qr_sampler = "qr_sampler.processor:QRSamplerLogitsProcessor"
+qr_sampler = "qr_sampler.engines.vllm:VLLMAdapter"
 
 [project.entry-points."qr_sampler.engine_adapters"]
 vllm = "qr_sampler.engines.vllm:VLLMAdapter"
@@ -90,7 +85,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "qr_sampler" = ["profiles/**/*.yaml", "templates/**/*.j2", "py.typed"]
-"qr_sampler.connectors.modal" = ["Dockerfile.vllm", "modal_secrets.md", "README.md"]
 
 [tool.setuptools_scm]
 fallback_version = "0.1.0.dev0"
@@ -98,9 +92,6 @@ fallback_version = "0.1.0.dev0"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
-markers = [
-    "modal: tests that require a real Modal deploy + GPU container — skipped unless --run-modal is passed (Phase 2 R15(b))",
-]
 
 [tool.ruff]
 target-version = "py310"
@@ -150,53 +141,30 @@ ignore_missing_imports = true
 module = ["jinja2", "jinja2.*"]
 ignore_missing_imports = true
 
-# Runtime-only / GPU / cross-package deps that are not installed in the CI
-# typecheck job (vllm can't install without a GPU; modal/huggingface_hub are
-# optional; obs + qr_llm_chat are mounted alongside only at Modal runtime).
-# Treat them as untyped so `mypy --strict src/` resolves the connector code.
+# vLLM is a runtime-only GPU dependency that is not installed in the CI
+# typecheck job. Treat it as untyped so `mypy --strict src/` resolves the
+# engine adapter.
 [[tool.mypy.overrides]]
 module = [
     "vllm",
     "vllm.*",
-    "modal",
-    "modal.*",
-    "fastapi",
-    "fastapi.*",
-    "httpx",
-    "huggingface_hub",
-    "huggingface_hub.*",
-    "obs",
-    "obs.*",
-    "qr_llm_chat",
-    "qr_llm_chat.*",
 ]
 ignore_missing_imports = true
 
-# The Modal connector methods are wrapped by untyped framework decorators
-# (@app.cls, @modal.method, @modal.enter, ...); under --strict these otherwise
-# trip disallow_untyped_decorators for every decorated method.
-[[tool.mypy.overrides]]
-module = ["qr_sampler.connectors.modal.*"]
-disallow_untyped_decorators = false
-
 # The vLLM V1 logits-processor base class resolves to Any (vllm untyped above),
-# so subclassing it trips disallow_subclassing_any under --strict.
+# so subclassing it trips disallow_subclassing_any under --strict. When vLLM
+# IS installed (a serving host), the base resolves to the real class instead,
+# flipping which of the shim's branches needs a type-ignore — so unused-ignore
+# warnings are disabled to keep mypy green in both environments.
 [[tool.mypy.overrides]]
 module = ["qr_sampler.engines.vllm"]
 disallow_subclassing_any = false
+warn_unused_ignores = false
 
 [tool.coverage.run]
 source = ["src/qr_sampler"]
 omit = [
     "src/qr_sampler/proto/*",
-    # Modal-deployment connectors run only inside the Modal image (they need
-    # modal + vllm + a GPU), so the CI unit-test job can't exercise them — they
-    # are validated by actual deploys, not unit tests. The unit-testable
-    # health_entropy_middleware stays measured.
-    "src/qr_sampler/connectors/modal/app.py",
-    "src/qr_sampler/connectors/modal/cloudflared_sidecar.py",
-    "src/qr_sampler/connectors/modal/vllm_serve.py",
-    "src/qr_sampler/connectors/modal/vllm_patches.py",
 ]
 
 [tool.coverage.report]
@@ -204,18 +172,8 @@ fail_under = 90
 show_missing = true
 
 [tool.bandit]
-# Every skipped check below is contextually justified for this Modal-hosted,
-# subprocess-spawning, HF-downloading codebase:
-#   B101 assert_used            - asserts guard internal invariants
-#   B104 hardcoded_bind_all     - vllm serve MUST bind 0.0.0.0; Modal's
-#                                 web_server proxies via the external iface and
-#                                 loopback silently hangs (LEARNINGS iter-08)
-#   B110 try_except_pass        - deliberate best-effort catches in lifecycle
-#                                 / cleanup paths
-#   B404 import_subprocess      - subprocess spawns `vllm serve` + the
-#   B603 subprocess_no_shell    - cloudflared sidecar, always with a fixed
-#   B607 start_process_partial  - list of args (shell=False, no injection)
-#   B615 huggingface_download   - snapshot_download's revision is pinned by the
-#                                 qr-llm-chat predeploy gate (the conditional
-#                                 assignment is invisible to bandit statically)
-skips = ["B101", "B104", "B110", "B404", "B603", "B607", "B615"]
+# Both skips are contextually justified:
+#   B101 assert_used     - asserts guard internal invariants
+#   B110 try_except_pass - deliberate best-effort catches in lifecycle
+#                          / cleanup / telemetry paths
+skips = ["B101", "B110"]

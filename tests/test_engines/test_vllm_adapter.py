@@ -1,8 +1,7 @@
 """Tests for VLLMAdapter — the vLLM engine adapter.
 
-Verifies that VLLMAdapter delegates sampling to SamplingPipeline,
-handles batch state management, and maintains backward compatibility
-with QRSamplerLogitsProcessor.
+Verifies that VLLMAdapter delegates sampling to SamplingPipeline
+and handles batch state management.
 """
 
 from __future__ import annotations
@@ -517,27 +516,15 @@ class TestDiagnosticLogging:
 
 
 # ---------------------------------------------------------------------------
-# Tests: Backward compatibility
+# Tests: Public exports
 # ---------------------------------------------------------------------------
 
 
-class TestBackwardCompatibility:
-    """Test that the re-export structure preserves backward compatibility."""
+class TestPublicExports:
+    """Test the top-level package export surface."""
 
-    def test_processor_re_export(self) -> None:
-        """QRSamplerLogitsProcessor in processor.py resolves to VLLMAdapter."""
-        from qr_sampler.processor import QRSamplerLogitsProcessor
-
-        assert QRSamplerLogitsProcessor is VLLMAdapter
-
-    def test_top_level_re_export(self) -> None:
-        """QRSamplerLogitsProcessor in __init__.py resolves to VLLMAdapter."""
-        from qr_sampler import QRSamplerLogitsProcessor
-
-        assert QRSamplerLogitsProcessor is VLLMAdapter
-
-    def test_new_exports_available(self) -> None:
-        """New exports are available from the top-level package."""
+    def test_exports_available(self) -> None:
+        """Core exports are available from the top-level package."""
         from qr_sampler import (
             EngineAdapter,
             SamplingPipeline,

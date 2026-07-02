@@ -27,7 +27,6 @@ from qr_sampler.exceptions import (
     TokenSelectionError,
 )
 from qr_sampler.presets import BUILTIN_PRESETS, expand_extra_args, resolve_preset
-from qr_sampler.processor import QRSamplerLogitsProcessor
 
 __all__ = [
     "BUILTIN_PRESETS",
@@ -36,7 +35,6 @@ __all__ = [
     "EntropyUnavailableError",
     "QRSamplerConfig",
     "QRSamplerError",
-    "QRSamplerLogitsProcessor",
     "SamplingPipeline",
     "SamplingResult",
     "SignalAmplificationError",

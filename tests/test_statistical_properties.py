@@ -419,12 +419,12 @@ class TestOneHotCorrectness:
             os.environ[k] = v
 
         try:
-            from qr_sampler.processor import QRSamplerLogitsProcessor
+            from qr_sampler.engines.vllm import VLLMAdapter
 
             class _VConfig:
                 vocab_size = 20
 
-            proc = QRSamplerLogitsProcessor(vllm_config=_VConfig())
+            proc = VLLMAdapter(vllm_config=_VConfig())
 
             rng = np.random.default_rng(42)
             batch_size = 10
@@ -459,12 +459,12 @@ class TestOneHotCorrectness:
             os.environ[k] = v
 
         try:
-            from qr_sampler.processor import QRSamplerLogitsProcessor
+            from qr_sampler.engines.vllm import VLLMAdapter
 
             class _VConfig:
                 vocab_size = 50
 
-            proc = QRSamplerLogitsProcessor(vllm_config=_VConfig())
+            proc = VLLMAdapter(vllm_config=_VConfig())
 
             rng = np.random.default_rng(99)
             for _ in range(20):

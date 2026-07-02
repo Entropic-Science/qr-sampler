@@ -12,7 +12,7 @@ Internally delegates all sampling to ``SamplingPipeline``.
 Registered via entry point::
 
     [project.entry-points."vllm.logits_processors"]
-    qr_sampler = "qr_sampler.processor:QRSamplerLogitsProcessor"
+    qr_sampler = "qr_sampler.engines.vllm:VLLMAdapter"
 
 The processor applies globally to all requests in a vLLM instance. Deploy
 separate instances for different sampling strategies.
@@ -54,8 +54,11 @@ try:
     from vllm.v1.sample.logits_processor import (
         LogitsProcessor as _VLLMLogitsProcessorBase,
     )
-except ImportError:  # pragma: no cover - exercised only outside Modal
-    _VLLMLogitsProcessorBase = object
+except ImportError:  # pragma: no cover - exercised where vLLM is not installed
+    # The ignore is only "used" when mypy runs in an env where vLLM IS
+    # installed (LogitsProcessor then resolves to a real class instead of
+    # Any); warn_unused_ignores is disabled for this module in pyproject.
+    _VLLMLogitsProcessorBase = object  # type: ignore[assignment,misc]
 
 if TYPE_CHECKING:
     from qr_sampler.amplification.base import SignalAmplifier
@@ -354,44 +357,18 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                     },
                 )
 
-        # iter-53 (2026-06-09): designate the DEFAULT pipeline's source as
-        # the owner of the cross-process entropy-status file. This is the
-        # channel that actually reaches the /health/entropy middleware in
-        # production — vLLM keeps this LogitsProcessor in the EngineCore
-        # process while the middleware lives in APIServer, so module
-        # globals (the iter-49 set_fallback_source below) never cross.
-        # Only the default pipeline publishes: the pre-init loop also
-        # builds a system-primary wrapper whose always-healthy state must
-        # not clobber the quantum lane's file.
+        # Designate the DEFAULT pipeline's source as the owner of the
+        # cross-process entropy-status file (telemetry IPC for
+        # out-of-process health readers). Only the default pipeline
+        # publishes: the pre-init loop also builds a system-primary
+        # wrapper whose always-healthy state must not clobber the
+        # quantum lane's file.
         try:
             enable = getattr(self._pipeline.entropy_source, "enable_status_publishing", None)
             if callable(enable):
                 enable()
         except Exception:
             # Telemetry plumbing must never break the LogitsProcessor.
-            pass
-
-        # iter-49 (2026-05-25): publish the active FallbackEntropySource
-        # to the /health/entropy middleware so the qr-llm-chat OWUI side
-        # can snapshot fallback_count before/after a request and emit
-        # the regenerate-banner when QRNG degraded mid-request. The
-        # middleware module is imported lazily so a non-Modal dev/test
-        # context (no fastapi installed) does not break adapter import.
-        # iter-53: in the split-process vLLM layout this only serves
-        # same-process consumers (unit tests); the status file above is
-        # the production channel.
-        try:
-            from qr_sampler.connectors.modal.health_entropy_middleware import (
-                set_fallback_source as _qr_set_fallback_source,
-            )
-
-            _qr_set_fallback_source(self._pipeline.entropy_source)
-        except Exception:
-            # Defensive: missing fastapi, missing connectors.modal, or any
-            # other transient ImportError must not break the LogitsProcessor.
-            # The endpoint then returns 503 / unknown, and the qr-llm-chat
-            # side's snapshot-before-after no-ops with no banner — degraded
-            # but safe.
             pass
 
         # --- Pre-compute default state ---
@@ -869,38 +846,3 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 continue
             seen.add(id(pipeline))
             pipeline.close()
-
-
-# Phase 2 R3: hoist the MM-probe monkey-patch to module-import side effect.
-#
-# vLLM 0.17.0 V1's profile_run runs a multimodal dummy probe unconditionally
-# for HF models with a populated vision_config (Qwen3.5-9B + Qwen3.6-27B),
-# crashing in transformers.get_text_with_replacements with StopIteration. The
-# patch lives in qr_sampler.connectors.modal.vllm_serve._install_mm_probe_skip_patch
-# but Phase 2's _start_and_sleep launches ``vllm serve`` as a subprocess that
-# does NOT execute that module — it would only fire if someone ran
-# ``python -m qr_sampler.connectors.modal.vllm_serve`` (the legacy entrypoint).
-#
-# The subprocess DOES, however, discover this LogitsProcessor via the
-# ``vllm.logits_processors`` entry-point, which causes vLLM to import
-# qr_sampler.processor → qr_sampler.engines.vllm (this module). Calling
-# ``_install_mm_probe_skip_patch()`` here makes the patch a guaranteed side
-# effect of plugin discovery — exactly when we need it, before profile_run.
-#
-# Guarded by try/except so non-Modal contexts (dev/test where vllm and/or
-# obs.* are unavailable) still import this module cleanly. The helper itself
-# is idempotent and gracefully no-ops if vllm.v1.worker.gpu_model_runner is
-# not importable.
-try:
-    from qr_sampler.connectors.modal.vllm_serve import (
-        _install_mm_probe_skip_patch as _qr_install_mm_probe_skip_patch,
-    )
-
-    _qr_install_mm_probe_skip_patch()
-except Exception:
-    # Any failure here (missing obs.*, missing vllm, missing connectors.modal,
-    # syntax error in a transitively-imported module) MUST NOT break LP
-    # discovery. The patch is defence-in-depth; the absence of a
-    # ``vllm.mm.probe_skipped`` event in cold-start logs is the canary the
-    # operator should watch.
-    pass

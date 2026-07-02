@@ -54,21 +54,5 @@ services:
     restart: unless-stopped
 
 {% endif %}
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    ports:
-      - "${WEBUI_PORT:-3000}:8080"
-    environment:
-      - OPENAI_API_BASE_URL=http://inference:8000/v1
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-dummy}
-{% if engine.docker.base_image %}
-    depends_on:
-      - inference
-{% endif %}
-    volumes:
-      - open-webui-data:/app/backend/data
-    restart: unless-stopped
-
 volumes:
   huggingface-cache:
-  open-webui-data:

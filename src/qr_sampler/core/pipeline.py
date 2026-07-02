@@ -137,20 +137,13 @@ def build_entropy_source(config: QRSamplerConfig) -> EntropySource:
     if config.fallback_mode == "error":
         return primary
 
-    # Build fallback source.
-    if config.fallback_mode == "system":
-        from qr_sampler.entropy.system import SystemEntropySource
-
-        fallback: EntropySource = SystemEntropySource()
-    elif config.fallback_mode == "mock_uniform":
+    # Build fallback source. The ``fallback_mode`` field validator already
+    # coerced anything unknown to "system", so two branches are total here.
+    if config.fallback_mode == "mock_uniform":
         from qr_sampler.entropy.mock import MockUniformSource
 
-        fallback = MockUniformSource()
-    else:
-        logger.warning(
-            "Unknown fallback_mode %r, using system fallback",
-            config.fallback_mode,
-        )
+        fallback: EntropySource = MockUniformSource()
+    else:  # "system"
         from qr_sampler.entropy.system import SystemEntropySource
 
         fallback = SystemEntropySource()

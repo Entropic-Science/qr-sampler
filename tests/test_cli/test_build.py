@@ -53,6 +53,8 @@ class TestBuildCommand:
         assert result.exit_code == 0
         assert "docker-compose.yml" in result.output
         assert "services:" in result.output
+        # The generated stack is engine + optional entropy server only.
+        assert "open-webui" not in result.output
 
     def test_dry_run_prints_env(self, runner: CliRunner) -> None:
         """--dry-run includes .env content."""
@@ -91,6 +93,7 @@ class TestBuildCommand:
         compose_text = (tmp_path / "docker-compose.yml").read_text()
         assert "services:" in compose_text
         assert "inference:" in compose_text
+        assert "open-webui" not in compose_text
 
     def test_grpc_entropy_includes_server(self, runner: CliRunner, tmp_path: Path) -> None:
         """When entropy source uses gRPC transport, entropy-server is included."""
