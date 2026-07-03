@@ -51,7 +51,11 @@ def decode_reply(raw: bytes) -> tuple[bytes, int, int]:
     yield ``(payload, 0, 0)``).
 
     Field-number collision with the production qbert server (its
-    ``qrng.proto``, 2026-06-10): ``RandomResponse`` defines field 2 as
+    ``qrng.proto``, 2026-06-10; still served as its public
+    ``qrng.QuantumRNG`` service in Qbert0G >= 1.0, which ALSO serves this
+    package's native ``qr_entropy.EntropyService`` — point
+    ``grpc_method_path`` at the default and none of this applies):
+    ``RandomResponse`` defines field 2 as
     ``uint64 timestamp`` (epoch MICROSECONDS) and field 3 as ``string
     device_id``. Against that server, the value this decoder returns in
     the ``sequence_id`` slot is actually the server timestamp — it can

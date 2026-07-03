@@ -225,7 +225,11 @@ qr-sampler build --engine vllm --entropy timing_noise --force --output ./deploy
 
 ### Quantum gRPC
 
-Connect any entropy server that speaks gRPC. qr-sampler ships example servers and an annotated template:
+Connect any entropy server that speaks gRPC. The production QRNG server is
+[Qbert0G](https://github.com/Entropic-Science/Qbert0G) (>= 1.0), which serves this
+package's native `qr_entropy.EntropyService` protocol directly — the defaults
+below just work against it, including `sequence_id` echo verification and
+`bidi_streaming`. qr-sampler also ships example servers and an annotated template:
 
 ```bash
 # Run the built-in urandom-over-gRPC example server
@@ -500,7 +504,7 @@ qr-sampler is designed to connect *any* randomness source to LLM token sampling.
 
 ### Approach A: gRPC server (recommended)
 
-Implement a gRPC server. You can use the built-in `qr_entropy.EntropyService` protocol (example servers provided), or your own proto as long as field 1 carries the byte count (request) and random bytes (response).
+Implement a gRPC server. You can use the built-in `qr_entropy.EntropyService` protocol (example servers provided; [Qbert0G](https://github.com/Entropic-Science/Qbert0G) is the production reference implementation), or your own proto as long as field 1 carries the byte count (request) and random bytes (response).
 
 #### 5-minute walkthrough
 

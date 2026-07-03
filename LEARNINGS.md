@@ -33,7 +33,11 @@ payload raises `EntropyUnavailableError` in the transport (test-pinned in
 - Known field collision (qbert-style servers): response field 2 may be a
   server timestamp in µs rather than a `sequence_id` echo, so
   `echo_verified` stays `False` by construction there. The note lives on
-  the decode site (`entropy/qgrpc/transport.py`).
+  the decode site (`entropy/qgrpc/transport.py`). As of Qbert0G 1.0 the
+  production server ALSO serves the native `qr_entropy.EntropyService`
+  (echo + `generation_timestamp_ns` + bidi), so the collision path only
+  applies when `grpc_method_path` is pointed at the legacy
+  `/qrng.QuantumRNG/GetRandomBytes` method.
 
 ### Lazy channel creation is load-bearing
 
