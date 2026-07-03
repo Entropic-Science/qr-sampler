@@ -42,7 +42,7 @@ FORBIDDEN_PREFIXES = (
 
 
 def _module_name(path: Path) -> str:
-    """``src/qr_sampler/entropy/quantum/source.py`` -> dotted module name."""
+    """``src/qr_sampler/entropy/qgrpc/source.py`` -> dotted module name."""
     rel = path.relative_to(SRC).with_suffix("")
     parts = list(rel.parts)
     if parts[-1] == "__init__":

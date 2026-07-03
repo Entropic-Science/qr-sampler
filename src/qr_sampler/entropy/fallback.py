@@ -256,9 +256,9 @@ class FallbackEntropySource(EntropySource):
             "ENTROPY DEGRADED: quantum source %r is unavailable; "
             "serving %r (urandom-class) for sampling. "
             "Total fallbacks since process start: %d. "
-            "Last error: %s. Operator action: check the cloudflared "
-            "sidecar (qr_sampler.cloudflared logs) and the QRNG service "
-            "health.",
+            "Last error: %s. Operator action: check the entropy server's "
+            "health and the gRPC channel to it (qr_sampler.entropy.qgrpc "
+            "logs).",
             self._primary.name,
             self._fallback.name,
             self._fallback_count,

@@ -147,7 +147,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
     external-entropy-driven selection.
 
     Formally subclasses ``vllm.v1.sample.logits_processor.LogitsProcessor``
-    when vLLM is importable (the Modal runtime path); falls back to a
+    when vLLM is importable (the production serving path); falls back to a
     plain object base in dev/test environments where vLLM is unavailable.
     The dual base list keeps ``EngineAdapter``'s ABC contract first so
     its abstractmethod checks still apply.

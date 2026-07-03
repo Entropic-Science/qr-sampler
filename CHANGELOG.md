@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sockets, no file writes (test-pinned).
 - **The `contseq` roller and preset** (`contseq.py`, `BUILTIN_PRESETS["contseq"]`,
   its YAML profile and tests). `qthought.py` is the only roller.
+- **`deployments/entropic-science/`** — the compose profile existed to
+  smoke-test the removed Open WebUI filter/Pipe path against a local vLLM; with
+  `examples/open-webui/` gone it was dead. (Recorded divergence: the refactor
+  spec said non-Modal `deployments/*` profiles are kept; delete-over-deprecate
+  won once its only consumer was removed.)
 - **The hand-rolled protobuf codec** in the quantum source. One wire format
   remains: `proto/wire.py` primitives + the pb2 stubs.
 - **Root import paths**: `qr_sampler.processor`, `qr_sampler.presets`,
@@ -83,8 +88,8 @@ mirrored in its `PRD.md` divergence addendum.
 ### Fixed
 
 - QRNG quota-log throttle silently swallowed the first event on young hosts.
-- Duplicate `OPENAI_API_BASE_URL` key in
-  `deployments/entropic-science/docker-compose.yml`.
+- Duplicate `OPENAI_API_BASE_URL` key in the entropic-science compose profile
+  (the whole profile was subsequently removed — see Removed above).
 
 ### Changed (iter-57) — stop hammering the QRNG gRPC
 
