@@ -36,10 +36,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/alchemystack/qr-sampler"
-Repository = "https://github.com/alchemystack/qr-sampler"
-Issues = "https://github.com/alchemystack/qr-sampler/issues"
-Changelog = "https://github.com/alchemystack/qr-sampler/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Entropic-Science/qr-sampler"
+Repository = "https://github.com/Entropic-Science/qr-sampler"
+Issues = "https://github.com/Entropic-Science/qr-sampler/issues"
+Changelog = "https://github.com/Entropic-Science/qr-sampler/blob/main/CHANGELOG.md"
 
 [project.scripts]
 qr-sampler = "qr_sampler.cli.main:cli"

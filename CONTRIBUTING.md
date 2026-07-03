@@ -12,7 +12,7 @@ Thank you for your interest in contributing to qr-sampler. This document covers 
 ### Install
 
 ```bash
-git clone https://github.com/alchemystack/qr-sampler.git
+git clone https://github.com/Entropic-Science/qr-sampler.git
 cd qr-sampler
 pip install -e ".[dev]"
 ```
@@ -40,7 +40,7 @@ pytest tests/test_temperature/ -v
 pytest tests/test_selection/ -v
 pytest tests/test_logging/ -v
 pytest tests/test_entropy/ -v
-pytest tests/test_processor.py -v
+pytest tests/test_qthought_roller.py -v
 pytest tests/test_statistical_properties.py -v
 pytest tests/test_core/ -v
 pytest tests/test_engines/ -v
@@ -72,7 +72,10 @@ ruff format src/ tests/
 mypy --strict src/
 
 # Security scan
-bandit -r src/
+bandit -c pyproject.toml -r src/ -q
+
+# Or run every oracle at once (what CI runs)
+python scripts/check.py
 ```
 
 ## Coding conventions
@@ -119,7 +122,7 @@ These are fundamental design rules. Do not break them:
 2. Implement `get_pipeline(self) -> SamplingPipeline`
 3. Use `build_pipeline(config, vocab_size)` from `core/pipeline.py` to construct the pipeline
 4. Implement engine-specific hook methods (e.g., `apply()` for vLLM)
-5. Register with `@EngineAdapterRegistry.register("my_engine")`
+5. Built-in: add it to `EngineAdapterRegistry._BUILTINS` in `engines/registry.py`. Third-party: `@EngineAdapterRegistry.register("my_engine")` or an entry point
 6. Add entry point in `pyproject.toml` under `[project.entry-points."qr_sampler.engine_adapters"]`
 7. Create a YAML profile in `src/qr_sampler/profiles/engines/my_engine.yaml`
 8. Add tests in `tests/test_engines/`
@@ -129,8 +132,8 @@ These are fundamental design rules. Do not break them:
 1. Create a class in `src/qr_sampler/entropy/` subclassing `EntropySource`
 2. Implement `name`, `is_available`, `get_random_bytes(n)`, `close()`
 3. Raise `EntropyUnavailableError` from `get_random_bytes()` on failure
-4. Register with `@register_entropy_source("my_name")`
-5. Add entry point in `pyproject.toml` under `[project.entry-points."qr_sampler.entropy_sources"]`
+4. Built-in: add it to `EntropySourceRegistry._BUILTINS` in `entropy/registry.py`. Third-party: register with `@register_entropy_source("my_name")` or an entry point
+5. Optionally mirror it in `pyproject.toml` under `[project.entry-points."qr_sampler.entropy_sources"]` (the builtin table wins on collisions)
 6. Create a YAML profile in `src/qr_sampler/profiles/entropy/my_name.yaml`
 7. Add tests in `tests/test_entropy/`
 
@@ -138,7 +141,7 @@ These are fundamental design rules. Do not break them:
 
 1. Create a class in `src/qr_sampler/amplification/` subclassing `SignalAmplifier`
 2. Implement `amplify(raw_bytes) -> AmplificationResult`
-3. Register with `@AmplifierRegistry.register("my_name")`
+3. Built-in: add it to the `_BUILTINS` table in `amplification/registry.py`. Third-party: `@AmplifierRegistry.register("my_name")`
 4. Create a YAML profile in `src/qr_sampler/profiles/amplifiers/my_name.yaml`
 5. Add tests in `tests/test_amplification/`
 
@@ -147,14 +150,14 @@ These are fundamental design rules. Do not break them:
 1. Create a class in `src/qr_sampler/temperature/` subclassing `TemperatureStrategy`
 2. Implement `compute_temperature(logits, config) -> TemperatureResult`
 3. Always compute and return Shannon entropy (the logging subsystem depends on it)
-4. Register with `@TemperatureStrategyRegistry.register("my_name")`
+4. Built-in: add it to the `_BUILTINS` table in `temperature/registry.py`. Third-party: `@TemperatureStrategyRegistry.register("my_name")`
 5. Create a YAML profile in `src/qr_sampler/profiles/samplers/my_name.yaml`
 6. Add tests in `tests/test_temperature/`
 
 ### New config field
 
-1. Add the field to `QRSamplerConfig` in `config.py` with a default and description
-2. If per-request overridable, add to `_PER_REQUEST_FIELDS`
+1. Add the field to `QRSamplerConfig` in `config/model.py` with a default and description
+2. If per-request overridable, mark it with `Field(json_schema_extra={"per_request": True})` — the per-request set is derived from that metadata
 3. Environment variable `QR_{FIELD_NAME_UPPER}` is auto-supported
 4. Extra args key `qr_{field_name}` is auto-supported
 5. Add tests in `tests/test_config.py`
@@ -173,7 +176,7 @@ These are fundamental design rules. Do not break them:
 3. Add or update tests for your changes
 4. Run the full quality gate:
    ```bash
-   ruff check src/ tests/ && ruff format --check src/ tests/ && mypy --strict src/ && pytest tests/ -v
+   python scripts/check.py
    ```
 5. Write a clear PR description explaining *what* and *why*
 6. Submit the PR for review

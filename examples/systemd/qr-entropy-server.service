@@ -25,7 +25,7 @@
 
 [Unit]
 Description=qr-sampler Entropy Server (gRPC)
-Documentation=https://github.com/alchemystack/qr-sampler
+Documentation=https://github.com/Entropic-Science/qr-sampler
 After=network-online.target
 Wants=network-online.target
 

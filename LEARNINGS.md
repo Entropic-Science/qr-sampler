@@ -2,342 +2,167 @@
 
 Cross-cutting notes about architectural pivots, observed runtime quirks,
 and decisions whose rationale is too long for a commit message.
-
-Each entry that mirrors a Claude auto-memory record names it by ID. Do
-not duplicate the auto-memory body verbatim — these notes assume the
-reader can resolve cross-references against the live auto-memory. See
-also `../Entropic-Science/qr-llm-chat/LEARNINGS.md` for the OWUI-running
-half of the same production stack.
-
-Cross-cutting auto-memory entries relevant to this repo:
-`vllm_not_in_modal_python`, `vllm_model_arch_mismatch`,
-`modal_add_python_layering_trap`, `feedback_owui_filter_cross_repo_drift`,
-`qrng_colocation_constraint`, `qrng_tcp_preprobe`, `modal_secrets_layout`,
-`vllm_modal_host_binding`, `vllm_cli_flag_churn`.
+Companion to `AGENTS.md` (structure + invariants) and `README.md`
+(end-user documentation).
 
 ---
 
-## Cross-repo integration contract
+## Live lessons (constrain current code)
 
-This section is the authoritative record of the integration seam.
-`qr-llm-chat/LEARNINGS.md` mirrors the OWUI-facing half (Pipe streaming
-protocol, filter Valves shape); facts that constrain qr-sampler's own
-code live here.
+### QRNG wire contract
 
-### QRNG wire contract (Cipherstone)
+The quantum gRPC client (`entropy/qgrpc/`) is protocol-agnostic via
+configurable method paths, but field numbers MUST stay at 1 for both the
+request byte count (varint) and the response `data` (length-delimited
+bytes). Other proto fields can be added freely; field 1 changes are
+breaking. Decoding follows proto3/pb2 semantics since the 2026-07
+refactor: the LAST field-1 occurrence wins, and an explicitly empty
+payload raises `EntropyUnavailableError` in the transport (test-pinned in
+`tests/test_wire_format.py`).
 
-`qr_sampler.entropy.quantum.QuantumGrpcSource` uses a
-**protocol-agnostic** wire decoder (no generated stubs). Field numbers
-MUST stay at 1 for both the request `num_bytes` (uint32 / varint) and
-the response `data` (bytes / length-delimited). Other proto fields can
-be added freely; field 1 changes are breaking.
+- Third-party QRNG protos are mapped via `QR_GRPC_METHOD_PATH` (and
+  `QR_GRPC_STREAM_METHOD_PATH`, empty when the proto defines no
+  streaming RPC).
+- Auth is a single gRPC metadata entry, header `QR_GRPC_API_KEY_HEADER`
+  (default `api-key`), value `QR_GRPC_API_KEY`. The client never logs
+  the key — `health_check()` redacts it.
+- Some providers define no Healthcheck RPC: liveness is observed
+  implicitly via per-token fetches; the circuit breaker + fallback
+  wrapper own degraded conditions. The one deliberate liveness check is
+  `QuantumGrpcSource.warmup()` at process start.
+- Known field collision (qbert-style servers): response field 2 may be a
+  server timestamp in µs rather than a `sequence_id` echo, so
+  `echo_verified` stays `False` by construction there. The note lives on
+  the decode site (`entropy/qgrpc/transport.py`).
 
-- Proto in production: package `qrng`, service `QuantumRNG`, method
-  `GetRandomBytes(RandomRequest) returns (RandomResponse)` — mapped
-  via `QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes` (unary).
-  `QR_GRPC_STREAM_METHOD_PATH` is the empty string (QRNG proto defines
-  no streaming RPC).
-- gRPC metadata: single entry, header `api-key` (configurable via
-  `QR_GRPC_API_KEY_HEADER`), value = `QR_GRPC_API_KEY`. Bearer-secret
-  semantics: client never logs it; cloudflared never sees it (api-key
-  is end-to-end between qr-sampler and the QRNG server).
-- Transport: `cloudflared access tcp` sidecar binds loopback
-  `127.0.0.1:50051`. The gRPC channel is `grpc.aio.insecure_channel(...)`
-  and is safe **only because** the cloudflared sidecar runs in the
-  same container bound to loopback. Do not change channel construction
-  to TLS unless cloudflared is removed.
-- No `Healthcheck` RPC: liveness is observed implicitly via the
-  per-token `GetRandomBytes` call; the circuit breaker + fallback
-  wrapper handle degraded conditions.
+### Lazy channel creation is load-bearing
+
+`QuantumGrpcSource` creates its gRPC channel lazily, never in
+`__init__`. This started as a Modal-snapshot requirement (see History),
+but it remains the right shape for any freeze/restore or fork-based
+deployment, and it keeps `import qr_sampler` side-effect-free
+(test-pinned by the import-time socket guard). Do not "optimise" channel
+construction into the constructor.
+
+### QRNG adaptive-timeout ratchet (iter-53)
+
+Only successful fetches originally fed the adaptive-timeout P99 window,
+so once P99 converged fast (~96 ms via a tunnel → ~145 ms ceiling) every
+tail fetch was cut off and discarded — the ceiling could never re-learn
+upward and the source flapped timeout↔fallback indefinitely. Fixes that
+remain in `entropy/qgrpc/breaker.py`:
+
+- timeout-shaped failures (≥0.8× the budget) count as latency samples;
+- the half-open attempt resets the gRPC channel first (the dominant
+  open cause was a stale channel — testing recovery on the suspect
+  channel wasted whole cycles);
+- `QR_CB_MIN_TIMEOUT_MS` defaults to 5 ms, a **localhost assumption** —
+  floor it at ~300 ms for tunnelled/remote backends.
+
+### Circuit-breaker recovery backs off exponentially (iter-57)
+
+A short fixed recovery window is right for the stale-channel case but
+hammers a genuinely-down server (each half-open rebuilds the channel and
+fires fresh connects). `QR_CB_RECOVERY_WINDOW_S` is therefore the BASE
+only: consecutive opens without an intervening success double the wait
+(`base × 2^opens`) up to `QR_CB_RECOVERY_WINDOW_MAX_S` (60 s), reset on
+first success. Pair with `QR_GRPC_RETRY_COUNT=0` in deploys where the
+QRNG can be down for long stretches — each per-token retry is another
+connect against a dead server; the breaker + fallback are the correct
+resilience layer. Degraded logging is throttled (first-of-window + at
+most once/min); the running `fallback_count` rides every record.
+
+### Entropy health reporting is PASSIVE (iter-57 lesson)
+
+vLLM runs the API server and EngineCore as separate processes; module
+globals don't cross. The only correct channel for "is entropy degraded?"
+is the cross-process status file (`telemetry/status_file.py`, written by
+`FallbackEntropySource` on transitions + throttled count refreshes;
+publishing is opt-in via `enable_status_publishing()` and enabled by the
+vLLM adapter on the DEFAULT pipeline only, so a preinit `system` wrapper
+can't clobber the quantum lane's file). **Do not add a live gRPC probe
+or recurring poll to any health path** — a status consumer needs
+last-known state, not a fresh measurement; the 2026-07 refactor removed
+the HTTP reader middleware, and any future reader should stay passive.
 
 ### Per-request entropy-source override (`qr_entropy_source_type`)
 
-Enables comparison mode (quantum vs system) on a single GPU without
-renting a second one. Implementation contract:
+Enables comparison mode (quantum vs system) on a single GPU. Contract:
 
-- `src/qr_sampler/config.py`: `entropy_source_type` is in
-  `_PER_REQUEST_FIELDS`.
-- `src/qr_sampler/entropy/registry.py`: `all_sources()` helper used
-  by `VLLMAdapter` during pre-init.
-- `src/qr_sampler/engines/vllm.py`:
-  - At adapter construction (called from `@modal.enter(snap=True)`),
-    build a `dict[str, SamplingPipeline]` keyed by entropy-source-type,
-    one entry per source listed in env `QR_PREINIT_ENTROPY_SOURCES`
-    (default `"quantum_grpc,system"`).
-  - `update_state(req)` reads `qr_entropy_source_type` from
-    `extra_args`; defaults to env `QR_ENTROPY_SOURCE_TYPE` if absent;
-    rejects unknown / un-preinit'd values with a clean 400.
-  - `apply(logits)` looks up the per-request pipeline by source key
-    and runs `sample_token()`. **Just-in-time invariant preserved**:
-    entropy fetched *after* logits are computed.
-- Env: `QR_PREINIT_ENTROPY_SOURCES` — comma-separated. Operators
-  wanting only one source set this to e.g. `"quantum_grpc"`.
+- `entropy_source_type` carries per-request metadata in
+  `config/model.py`;
+- the vLLM adapter pre-initialises one pipeline per source in
+  `QR_PREINIT_ENTROPY_SOURCES` (default `"quantum_grpc,system"`) at
+  construction and rejects un-preinit'd values cleanly;
+- `apply()` looks up the per-request pipeline by source key. The
+  just-in-time invariant is preserved: entropy fetched after logits.
 
-### Service-token format (filter + pipe sign their requests)
+### vLLM reasoning field naming
 
-- Header: `X-Service-Token: <unix_ts>.<hmac>`.
-- `hmac = HMAC-SHA256(<secret>, unix_ts + path)`. The signer always
-  uses the **first** entry of `SERVICE_TOKEN_SECRETS`; the verifier
-  accepts a match against **any** entry. Rolling-secret rotation:
-  prepend new → redeploy at leisure → remove old next deploy. No
-  lockstep redeploy required.
-- 60 s timestamp window enforced server-side.
-- `SERVICE_TOKEN_SECRETS` is **plural** and comma-separated. The
-  filter's Valves field is also plural and follows the same pattern
-  (signs with the first secret if multiple are passed).
+vLLM 0.17+ with `--reasoning-parser` extracts `<think>...</think>` into
+a separate field on chat-completion deltas — but names it
+`delta.reasoning`, while the spec name is `delta.reasoning_content`.
+Consumers should read both (the qthought client's
+`_extract_content_delta` does).
 
-### Snapshot integrity invariants (load-bearing)
+### vLLM CLI flag churn
 
-These constrain how qr-sampler init code is written. Modal memory
-snapshots in the production deploy depend on them.
-
-- **No live gRPC channel captured in the snapshot.** `quantum_grpc`
-  source already uses lazy channel creation. Do NOT "optimise" by
-  moving channel construction into `__init__` — it would freeze a
-  dead socket into the snapshot, and the first post-restore request
-  would fail. Auto-memory `qrng_tcp_preprobe` documents the related
-  fast-fail TCP pre-probe that converts ~15 s gRPC retry timeouts
-  into ~500 ms fallback engagement.
-- **No process-relative state captured.** Avoid `os.getpid()`-based
-  caches, in-process locks, or anything that assumes the process
-  started fresh.
-- **Secrets are mounted after restore** — Modal honours this
-  automatically. qr-sampler's config layer reads env at construction
-  time, which is fine **as long as** construction happens inside
-  `@modal.enter(snap=True)`, not at module import.
-
-### Region pinning (auto-memory `qrng_colocation_constraint`)
-
-vLLM `@app.cls` `region=` must stay in `["us-east", "us-west"]`.
-Cipherstone's gRPC endpoint is east-US-hosted, and every generated
-token issues an entropy RPC; cross-region backbone RTT becomes a
-per-token cost. Do not relax without measuring.
-
-### Modal Secret split (auto-memory `modal_secrets_layout`)
-
-QRNG / Cipherstone vars live in **`qr-sampler-prod`**, NOT in
-`qr-llm-chat-prod`. The vLLM containers (`VllmQrQwen`) are the gRPC
-consumers and only `qr-sampler-prod` is mounted on those classes.
-Mounting QRNG vars in `qr-llm-chat-prod` on `OWUIService` would be
-useless (OWUI doesn't call the gRPC client) and a leak hazard.
-qr-llm-chat ships `scripts/dump_modal_secret.py` (mounts both secrets,
-allow-list disclosure policy) as the operator-side read path.
-
-### Modal `@modal.web_server` needs `--host 0.0.0.0` (auto-memory `vllm_modal_host_binding`)
-
-`@modal.web_server(port=N)` proxies inbound traffic via the
-container's external network interface, NOT loopback. vllm serve must
-bind `0.0.0.0` in the spawn argv or every external request silently
-hangs (Modal's edge accepts TLS then never receives a response).
-Internal `_start_and_sleep` / `_wake` probes can still hit
-`127.0.0.1:8000` — they share the process's network namespace. See
-the full discovery + symptom set in `qr-llm-chat/LEARNINGS.md` § *Modal
-@modal.web_server needs --host 0.0.0.0* (the bug was diagnosed there
-during iter-08).
-
-### vLLM reasoning parser (iter-11)
-
-The spawn argv passes `--reasoning-parser qwen3`. vLLM 0.17+ extracts
-inline `<think>...</think>` blocks from Qwen3-family responses into a
-separate `reasoning` field on the OpenAI chat-completion response,
-distinct from `content`. Open WebUI 0.9.5 renders it as a collapsible
-"Thinking" panel. The qr-llm-chat comparison Pipe's `_extract_delta_text`
-reads both `delta.reasoning` (vLLM 0.17's actual field name) and
-`delta.reasoning_content` (the spec name) for forward-compat.
+vLLM removes CLI flags between minor releases (e.g. PR #21739 dropped
+`--disable-log-requests` in v0.10/v0.11). If you script `vllm serve`
+argv anywhere, validate flags against
+`vllm.entrypoints.openai.cli_args:make_arg_parser` at startup rather
+than discovering renames in production tracebacks.
 
 ---
 
-## vLLM 0.17 / Modal-specific gotchas
+## History (Modal / Open WebUI / Cipherstone era — surface removed 2026-07)
 
-### `add_python` + Dockerfile pip-install layering (auto-memory `modal_add_python_layering_trap` + `vllm_not_in_modal_python`)
+> The Modal deployment connectors, Open WebUI integration, and the
+> Cipherstone-specific deploy glue were deleted in the 2026-07 refactor
+> (see `CHANGELOG.md`). These notes are kept for lineage and for anyone
+> resurrecting a snapshot/serverless deploy from git history. Path
+> references below are to deleted files.
 
-`Image.from_dockerfile(...).add_python("3.12")` does NOT layer
-Dockerfile-side pip installs into Modal's auto-injected Python 3.12.
-The Dockerfile's `pip install` lands in the base image's Python;
-Modal's 3.12 sees a different `site-packages` and can't import them.
-
-Vllm itself was a victim — fixed by dropping `add_python` and adding
-a `python` symlink in `Dockerfile.vllm` (auto-memory
-`vllm_not_in_modal_python`). The fact pattern recurs whenever a new
-Python dep is added; check whether it needs `.pip_install(...)` even
-if it's already in the Dockerfile.
-
-### vLLM model architecture mismatch — CLOSED 2026-05-22 (auto-memory `vllm_model_arch_mismatch`)
-
-`Qwen/Qwen3.6-27B` (and the FP8 build below) has a populated
-`vision_config` in its HF config
-(`architectures=['Qwen3_5ForConditionalGeneration']`). vLLM V1's
-`profile_run` raises `StopIteration` when iterating
-`vision_config.merge_size`. Affects vLLM 0.17.0 + 0.21.0. The
-`_install_mm_probe_skip_patch` monkey-patch in `vllm_serve.py` flips
-`mm_config.skip_mm_profiling=True` at `profile_run` entry. The patch
-fires `vllm.mm.probe_skipped` when active; absence of that event on a
-cold-start means the patch lost its hook.
-
-### FP8 switch + snapshot-restore tuning — iter-12 (2026-05-22, auto-memory `modal_snapshot_tuning`)
-
-`MODEL_HF_REPO_ID` is `Qwen/Qwen3.6-27B-FP8` (HF-published FP8 build,
-~27 GiB resident weights). The bf16 build was tried first but its
-~54 GiB resident weights exceeded Modal's CRIU+CUDA checkpointer's
-practical ceiling — every cold-cold restore raised
-`CudaCheckpointException: Failed to restore 1 processes: PID: 29 Get
-state command timed out` (cuda-checkpoint's hardcoded 180 s
-enumeration timeout in `modal/_runtime/gpu_memory_snapshot.py:22`).
-
-The FP8 build shrank resident state enough that the **warm-cache
-restore** path (Modal worker still has the snapshot hot, within
-~3-5 min of last request) now reliably wakes in **~2 s** as
-`vllm.wake.ok`. The **cold-cold path** (snapshot fetched from cold
-storage after >5 min idle) is still intermittent — ~30 % succeed in
-~20 s, the rest hit the same timeout and Modal falls back to a fresh
-start (~5 min full bootstrap). This is the structural limit for our
-configuration; see the auto-memory entry for the full enumeration of
-knobs explored.
-
-Applied alongside the FP8 switch (kept because empirically helpful):
-
-- `TORCHINDUCTOR_COMPILE_THREADS=1` env var in `Dockerfile.vllm` — the
-  Modal-documented workaround for torch.compile producing
-  unenumerable inductor state.
-- Warmup phase in `_start_and_sleep` — 3 chat completion requests
-  with `max_tokens=8, temperature=0` between `/health` and `/sleep`,
-  bakes the compile + cudagraph artefacts INTO the snapshot.
-- `--max-num-seqs 4` (was 16) — fewer KV-cache pages = fewer CUDA
-  allocations to enumerate.
-- `--max-cudagraph-capture-size 4` — belt-and-braces alignment with
-  Modal's `lfm_snapshot.py` example pattern.
-- `--gpu-memory-utilization 0.8` (was 0.9) — matches Modal example;
-  leaves headroom for cuda-checkpoint's own state buffer.
-
-Reverted (proved not load-bearing):
-
-- `--enforce-eager` — empirical cold-cold restores still timed out
-  with eager mode, so compile/CUDA-graph state was NOT the marginal
-  cost; reverting restored ~10-20 % inference throughput.
-- Dropping `--enable-prefix-caching` — 2/3 restores still failed
-  without it (A/B tested 2026-05-22). Re-enabled for multi-turn KV
-  reuse.
-
-If a future Modal release exposes `CUDA_CHECKPOINT_TIMEOUT` as a
-tunable, or NVIDIA ships a cuda-checkpoint with faster enumeration
-for FP8 + custom-ops workloads, revisit and consider re-enabling
-larger `--max-num-seqs` for higher concurrency.
-
-### /health/entropy is PASSIVE — iter-57 (2026-06-17, auto-memory `iter53_entropy_health_ipc`)
-
-vLLM runs APIServer (middlewares) and EngineCore (LogitsProcessor,
-where fallbacks happen) as separate processes; module globals don't
-cross, so iter-49's `set_fallback_source` channel left `/health/entropy`
-503ing unconditionally. iter-53 closed that gap by folding a status
-file with a per-poll live gRPC probe. **iter-57 then removed the live
-probe entirely** — the endpoint is now PASSIVE:
-
-1. **Status file (the only source)** — `FallbackEntropySource` writes
-   `<tempdir>/qr_entropy_status.json` (atomic tmp+`os.replace`) on
-   degraded/recovered transitions + 1 s-throttled count refreshes.
-   Publishing is opt-in (`enable_status_publishing()`, called by
-   `VLLMAdapter` on the DEFAULT pipeline only — the preinit `system`
-   wrapper must not clobber the quantum lane's file). The middleware
-   reads this file (or an in-process `FallbackEntropySource` ref in
-   single-process tests) and reports `rpc_ok = not currently_degraded`;
-   `null`+503 only when no state exists yet.
-
-**Why passive (the cost lesson):** every `GET /health/entropy` is an
-external request that resets Modal's idle-scaledown timer — an
-always-on OWUI status chip polling it kept an idle H100 warm 24/7. The
-old design *also* fired an 8-byte gRPC round-trip at the QRNG on every
-poll. A status chip needs neither. The one-and-only gRPC liveness check
-is `QuantumGrpcSource.warmup()` at container start (verify → log → fall
-back); after that we "just go" and report what real token-sampling
-observed. `tcp_ok` is now always `null` (no live TCP probe) and the
-`probe` block was dropped; the `fallback_count` regenerate-banner
-already read the status file, not the probe, so consumers are
-unaffected. **Do not re-add a live probe or recurring poll to this
-path.** The chat side was fixed in lockstep: `qr_status.py` no longer
-probes upstreams (`/api/qr-status` is a local preset read) and the
-OWUI chip polls once instead of every 30 s.
-
-### Circuit-breaker recovery backs off exponentially — iter-57
-
-A short fixed recovery window (`QR_CB_RECOVERY_WINDOW_S=3`) was tuned
-for the post-wake stale-channel case (recover in one half-open cycle),
-but against a genuinely-down QRNG it re-probed every 3 s forever — each
-half-open tears down + rebuilds the gRPC channel and fires fresh
-connects, i.e. it hammers a dead server. `QuantumGrpcSource` now treats
-that value as the BASE only: consecutive opens without an intervening
-success double the wait (`base × 2^opens`) up to
-`QR_CB_RECOVERY_WINDOW_MAX_S=60`, reset to base on the first success.
-Paired with `QR_GRPC_RETRY_COUNT=0` (no per-token retries — each retry
-is another connect against a dead server) and the throttled
-`entropy.degraded` WARNING (first-of-window + once/min, was per-token),
-a sustained outage now settles at ~1 probe/min and a handful of log
-lines instead of a connect-storm + log flood.
-
-### QRNG adaptive-timeout ratchet — iter-53 (auto-memory `qrng_adaptive_timeout_ratchet`)
-
-Only successful fetches fed the adaptive-timeout P99 window, so once
-P99 converged fast (~96 ms via the tunnel → ~145 ms ceiling) every
-tail fetch was cut off and discarded — the ceiling could never
-re-learn upward and the source flapped timeout↔fallback indefinitely.
-Fixes: timeout-shaped failures (≥0.8× the budget) now count as
-latency samples; `app.py` floors the deploy at
-`QR_CB_MIN_TIMEOUT_MS=300` (library default 5 ms is a localhost
-assumption); the circuit-breaker half-open attempt resets the gRPC
-channel first (the dominant open cause is a stale post-/sleep channel
-— testing recovery on the suspect channel wasted whole 10 s cycles)
-and `QR_CB_RECOVERY_WINDOW_S=3` tightens the cadence.
-
-### vLLM CLI flag churn (auto-memory `vllm_cli_flag_churn`)
-
-vLLM removes CLI flags between minor releases (PR #21739 dropped
-`--disable-log-requests` in v0.10/v0.11). iter-10 added an argv
-validator in `connectors/modal/app.py:_start_and_sleep` that imports
-`vllm.entrypoints.openai.cli_args:make_arg_parser` directly and
-asserts every `--xxx` in the spawn cmd is in the parser's action
-list. Fires `vllm.argv.validated` on the happy path; `vllm.argv.unrecognized`
-+ `RuntimeError` on a real flag rename, naming the offending flag in
-the traceback.
-
-### Region pin + multi-region scheduling
-
-`_CLS_KWARGS["region"]` is `["us-east", "us-west"]`. Single-region
-pinning (`"us-east-1"`) hit "waiting to be scheduled on GPU_H200
-worker" when H200 capacity was tight; the multi-region form lets the
-scheduler pick any available H200 zone within the listed groups.
-QRNG entropy reaches every container via Cloudflare's global edge,
-so there is no per-token latency penalty for staying inside the
-US-only group.
-
-### Container-restore tolerance for top-level code
-
-`Modal._container_entrypoint` runs the entire module body of
-`connectors/modal/app.py` to find the `@app.cls` definitions. Any
-top-level code that depends on the deploy host's filesystem must
-tolerate running inside container restore where only the package's
-own files are present. `_qr_llm_chat_functions_dir()` is the canonical
-example — gated on `MODAL_TASK_ID` being unset (deploy host) vs set
-(container).
-
----
-
-## Cleanup history
-
-`connectors/modal/vllm_serve.py` was reduced from 997 → 157 lines in
-iter-10 by retiring the pre-iter-07 architecture
-(`build_engine`/`build_app`/`build_dispatcher_for` +
-`_SECRET_DIAG_*` allow-list + `_emit_modal_secret_diag`). Surviving
-helpers: `_install_mm_probe_skip_patch` (still invoked from
-`engines/vllm.py` at LP-import time) and the bearer-auth utilities
-(`_accepted_bearer_secrets` / `_verify_bearer` / `_check_vllm_api_key`)
-which remain test-pinned for the future in-container auth-gate
-restoration. The current `@modal.web_server` + `vllm serve` subprocess
-deployment does NOT route through the bearer helpers — vLLM owns the
-FastAPI app — but the helpers' rolling-secret semantics are pinned by
-`tests/connectors/modal/test_vllm_serve_bearer.py` against the next
-time an auth gate lands in front of the engine.
-
-For the iter-by-iter narrative of how the Modal deploy went from
-broken to green (iter-01..iter-11, 2026-05-21..22), see
-`../Entropic-Science/qr-llm-chat/CLEANUP_REPORT.md` and the matching
-git history. The integration contract above is the load-bearing record;
-the iteration journey is in commits.
+- **Production QRNG (Cipherstone)**: proto package `qrng`, service
+  `QuantumRNG`, method `GetRandomBytes` — mapped via
+  `QR_GRPC_METHOD_PATH=/qrng.QuantumRNG/GetRandomBytes` (unary; no
+  streaming RPC). Transport was a `cloudflared access tcp` sidecar
+  binding loopback `127.0.0.1:50051`; the insecure channel was safe
+  ONLY because the sidecar was in-container. Quota ceilings from that
+  provider survive as the `qrng_max_*` config defaults.
+- **Modal snapshot integrity**: no live gRPC channel captured in the
+  snapshot (hence lazy channel creation, still live above); no
+  process-relative state; secrets mounted after restore, so config had
+  to be constructed inside `@modal.enter(snap=True)`, never at import.
+- **Modal `@modal.web_server` needs `--host 0.0.0.0`**: inbound traffic
+  proxies via the external interface, not loopback; vllm serve binding
+  loopback made every external request hang after TLS accept.
+- **`add_python` + Dockerfile pip layering trap**: Modal's auto-injected
+  Python does not see Dockerfile-side pip installs; deps needed
+  `.pip_install(...)` even when already in the image.
+- **FP8 + CRIU snapshot ceiling**: bf16 27B (~54 GiB resident) exceeded
+  cuda-checkpoint's 180 s enumeration timeout on every cold-cold
+  restore; the FP8 build (~27 GiB) made warm restores reliable (~2 s)
+  while cold-cold stayed intermittent. Warmup requests were baked into
+  the snapshot; `--enforce-eager` proved NOT load-bearing.
+- **Post-wake CUDA-graph recapture (iter-55)**: sleep→snapshot→restore
+  silently dropped captured CUDA graphs (~14× slower tokens); `_wake`
+  re-ran `compile_or_warm_up_model` via `/collective_rpc` and A/B'd
+  decode speed per boot.
+- **`/health/entropy` cost lesson**: every external GET reset Modal's
+  idle-scaledown timer — an always-on OWUI status chip polling the
+  endpoint kept an idle H100 warm 24/7, and the endpoint's live 8-byte
+  gRPC probe poked the QRNG just to tint a chip. Root of the "passive
+  health" rule above.
+- **Region pinning**: vLLM classes stayed in `["us-east", "us-west"]`
+  because the QRNG endpoint was east-US and every token issued an RPC;
+  single-zone pinning starved GPU scheduling.
+- **Service tokens (OWUI filter/pipe)**: `X-Service-Token:
+  <unix_ts>.<hmac>` with HMAC-SHA256 over `ts + path`; signer used the
+  FIRST secret of a comma-separated list, verifier accepted ANY —
+  rolling rotation without lockstep redeploys. 60 s window.
+- **Secret split**: QRNG vars lived in the `qr-sampler-prod` Modal
+  Secret, mounted only on the vLLM classes; the chat-side secret never
+  carried them (leak-surface minimisation).
+- The iter-by-iter Modal deploy narrative (iter-01..iter-57) lives in
+  git history and the sibling qr-llm-chat repo's records.

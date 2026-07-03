@@ -78,21 +78,10 @@ docker compose --profile ui up --build
 Open http://localhost:3000 to start chatting. Open WebUI connects to vLLM
 automatically — no configuration needed.
 
-### Controlling qr-sampler parameters from the UI
+### Controlling qr-sampler parameters
 
-A pre-built filter function lets you adjust sampling parameters (temperature,
-top-k, top-p, sample count, etc.) directly from the Open WebUI admin panel
-instead of editing environment variables or API calls.
-
-To install the filter:
-
-1. Open http://localhost:3000 and go to **Admin Panel > Functions**.
-2. Click **Import** and select [`examples/open-webui/qr_sampler_filter.json`](../../examples/open-webui/qr_sampler_filter.json).
-3. Toggle the function to **Global** so it applies to all chats.
-4. Click the **gear icon** to open Valves and adjust parameters.
-
-See [`examples/open-webui/README.md`](../../examples/open-webui/README.md) for
-the full guide.
+Use per-request `extra_args` (`qr_*` keys) or `QR_*` environment
+variables — see the configuration reference in the top-level README.
 
 ### Customizing the UI
 

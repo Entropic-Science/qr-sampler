@@ -55,8 +55,8 @@ connects to it directly over the network.
 ## Important notes
 
 - **Sample count**: `QR_SAMPLE_COUNT` is set to 13,312 (13 KB) to stay within
-  the server's max-bytes-per-request limit. The default of 20,480 would be
-  rejected.
+  the server's max-bytes-per-request limit. The default of 10,000 fits, but the
+  larger values used in some experiments would be rejected.
 - **Unary only**: `QR_GRPC_STREAM_METHOD_PATH` is empty because this server
   only supports unary RPC. Do not set `QR_GRPC_MODE` to `server_streaming` or
   `bidi_streaming`.
@@ -87,20 +87,10 @@ docker compose --profile ui up --build
 Open http://localhost:3000 to start chatting. Open WebUI connects to vLLM
 automatically.
 
-### Controlling qr-sampler parameters from the UI
+### Controlling qr-sampler parameters
 
-A pre-built filter function lets you adjust sampling parameters (temperature,
-top-k, top-p, sample count, etc.) from the Open WebUI admin panel.
-
-To install the filter:
-
-1. Open http://localhost:3000 and go to **Admin Panel > Functions**.
-2. Click **Import** and select [`examples/open-webui/qr_sampler_filter.json`](../../examples/open-webui/qr_sampler_filter.json).
-3. Toggle the function to **Global** so it applies to all chats.
-4. Click the **gear icon** to open Valves and adjust parameters.
-
-See [`examples/open-webui/README.md`](../../examples/open-webui/README.md) for
-the full guide.
+Use per-request `extra_args` (`qr_*` keys) or `QR_*` environment
+variables — see the configuration reference in the top-level README.
 
 ### Customizing the UI
 

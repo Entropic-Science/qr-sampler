@@ -15,8 +15,8 @@ description: |
   (0, 1) by the probability integral transform. A small per-byte mean bias
   accumulates across N samples and shifts u away from 0.5:
 
-    Example: 20,480 bytes with +0.003 mean bias per byte
-    M ~ 127.56, SEM ~ 0.514, z ~ 0.12, u ~ 0.548
+    Example: 10,000 bytes with +0.06 mean bias per byte
+    M ~ 127.56, SEM ~ 0.736, z ~ 0.08, u ~ 0.53
 
   This makes even tiny biases statistically observable while maintaining a
   well-defined distribution for token selection.

@@ -113,9 +113,9 @@ docker run -d -p 3000:3000 --name open-webui ghcr.io/open-webui/open-webui:lates
 
 Then point it at your vLLM instance running on `localhost:8000`.
 
-A pre-built filter function for controlling qr-sampler parameters from the UI is
-available at [`examples/open-webui/`](../../examples/open-webui/). See that
-directory's README for import instructions.
+Adjust qr-sampler parameters with per-request `extra_args` (`qr_*` keys) or
+`QR_*` environment variables — see the configuration reference in the
+top-level README.
 
 ## Next steps
 

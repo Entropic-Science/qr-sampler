@@ -42,9 +42,8 @@ ChatGPT-style web interface), add `--profile ui`:
 docker compose --profile ui up --build
 ```
 
-Then open http://localhost:3000. See each profile's README for UI setup details
-and the optional [qr-sampler filter function](../examples/open-webui/) for
-controlling sampling parameters from the UI.
+Then open http://localhost:3000. See each profile's README for UI setup
+details.
 
 ## Creating your own profile
 

@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (2026-07 refactor) — BREAKING, no compatibility kept
+
+- **The entire Modal deployment surface**: `src/qr_sampler/connectors/`
+  (Modal app, cloudflared sidecar, vllm_serve patches, health-entropy
+  middleware), `deployments/modal/`, and the Modal extra / pytest marker /
+  mypy overrides. The status-file *write* side survives in
+  `telemetry/status_file.py` + `entropy/fallback.py` so a future reader can
+  be reintroduced deliberately.
+- **The Open WebUI integration**: `examples/open-webui/` and its tests.
+- **`processor.py` and the `QRSamplerLogitsProcessor` alias.** The
+  `vllm.logits_processors` and `qr_sampler.engine_adapters` entry points now
+  target `qr_sampler.engines.vllm:VLLMAdapter` directly. `import qr_sampler`
+  and `import qr_sampler.engines.vllm` are 100% side-effect-free — no
+  monkey-patches (the mm-probe patch chain was already a silent no-op), no
+  sockets, no file writes (test-pinned).
+- **The `contseq` roller and preset** (`contseq.py`, `BUILTIN_PRESETS["contseq"]`,
+  its YAML profile and tests). `qthought.py` is the only roller.
+- **The hand-rolled protobuf codec** in the quantum source. One wire format
+  remains: `proto/wire.py` primitives + the pb2 stubs.
+- **Root import paths**: `qr_sampler.processor`, `qr_sampler.presets`,
+  `qr_sampler.contseq`, `qr_sampler.entropy.quantum`,
+  `qr_sampler.entropy.status_file` are gone (see Changed below for the new
+  homes). Downstream consumers import through `qr_sampler.contract` only.
+
+### Changed (2026-07 refactor) — BREAKING
+
+- `config.py` + `presets.py` -> `config/` package (`model.py`, `presets.py`,
+  `resolve.py`); the config<->presets import cycle is dead. The per-request
+  field set is derived from `Field(json_schema_extra={"per_request": True})`
+  metadata instead of a hand-maintained frozenset.
+- `entropy/quantum.py` (1257 LOC) -> `entropy/qgrpc/` package (`source.py`,
+  `transport.py`, `channel.py`, `breaker.py`, `preprobe.py`); prefetch
+  ordering, echo verification, and API-key redaction preserved bit-for-bit.
+  Cipherstone quota constants became config fields
+  (`qrng_max_bytes_per_request`, `qrng_max_requests_per_minute`,
+  `qrng_max_bytes_per_day`).
+- `engines/vllm.py` -> `engines/vllm/` package (`adapter.py`,
+  `telemetry.py`); entry-point strings unchanged.
+- `entropy/status_file.py` -> `telemetry/status_file.py` (it is cross-process
+  IPC, not an entropy source).
+- All four registries (entropy, amplification, temperature, engines) use
+  explicit lazy `_BUILTINS` tables resolved on first `get()` instead of
+  package-`__init__` import side effects; the builtin table takes precedence
+  over entry points.
+
+### Added (2026-07 refactor)
+
+- `qr_sampler.contract` — the cross-repo seam (`CONTRACT_VERSION`, roller +
+  provenance types, config + preset names, entropy primitives, exceptions),
+  drift-guarded by `tests/test_contract.py` and the consumer-side
+  `test_sampler_contract.py` in qr-llm-qthought.
+- `QthoughtRoller.draw_u()` / `draw_index(k)` — buffer-free single draws with
+  provenance returned directly (replaces the downstream `coin(0.0)` probe
+  hack), and the `QthoughtRoller(config, *, entropy_source=...)` injection
+  seam.
+- `scripts/check.py` — the one-command verification runner (CI and
+  pre-commit invoke it too).
+
+### Behavior-change ledger (2026-07 refactor, final state)
+
+Every intended behavior change of the refactor; anything not listed here is
+preserved behavior. Items 2 and 3 land in the qr-llm-qthought repo and are
+mirrored in its `PRD.md` divergence addendum.
+
+| # | Change | Justification |
+|---|---|---|
+| 1 | `qr_oe_conditioning` rejected as a per-request override (`ConfigValidationError`) | was a silent no-op (read only at source construction) that falsified `config_hash` provenance |
+| 2 | `QTHOUGHT_ENTROPY_DEGRADED/RECOVERED` fire exactly once per transition, from the broker (qthought) | duplicate per-engine state machine deleted |
+| 3 | no warmth GET before each completion; `probe_warmth` = `GET /health`, 200 = warm (qthought) | Modal-era wake logic deleted |
+| 4 | `import qr_sampler` no longer monkey-patches vLLM | shim + Modal surface removed (mm-probe patch was already a no-op) |
+| 5 | `contseq` preset/roller gone | no consumer |
+| 6 | proto decode: LAST field-1 occurrence wins; explicitly empty payload raises `EntropyUnavailableError` | pb2/proto3 semantics; byte-identical for every real server (test-asserted) |
+
+### Fixed
+
+- QRNG quota-log throttle silently swallowed the first event on young hosts.
+- Duplicate `OPENAI_API_BASE_URL` key in
+  `deployments/entropic-science/docker-compose.yml`.
+
 ### Changed (iter-57) — stop hammering the QRNG gRPC
 
 - **`/health/entropy` is now PASSIVE**: the middleware reports last-known
