@@ -1,6 +1,6 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -10,28 +10,29 @@ repos:
       - id: check-added-large-files
         args: ["--maxkb=500"]
 
+  # Pinned to the ruff version installed by the dev extra so hook results and
+  # `scripts/check.py --only lint,format` results cannot drift apart.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.5.0
+    rev: v0.15.8
     hooks:
       - id: ruff
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.10.0
-    hooks:
-      - id: mypy
-        args: [--strict]
-        additional_dependencies:
-          - pydantic>=2.0.0
-          - pydantic-settings>=2.0.0
-          - numpy>=1.24.0
-        pass_filenames: false
-        entry: mypy --strict src/
-
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.7.9
+    rev: 1.8.6
     hooks:
       - id: bandit
-        args: [-r, src/]
+        args: [-c, pyproject.toml, -r, src/, -q]
+        pass_filenames: false
+
+  # mypy runs from the dev environment (not an isolated hook env) so it sees
+  # the real installed dependency set — the same invocation as CI.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy --strict src/ (via scripts/check.py)
+        entry: python scripts/check.py --only types
+        language: system
+        types: [python]
         pass_filenames: false
