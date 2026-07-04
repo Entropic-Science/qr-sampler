@@ -85,10 +85,16 @@ class TestQuantumGrpcSourceUnary:
         assert source.is_available is False
 
     def test_unary_uses_configured_method_path(self, source: Any) -> None:
-        """channel.unary_unary() should be called with the configured method path."""
-        source._mock_channel.unary_unary.assert_called_once()
-        call_args = source._mock_channel.unary_unary.call_args
-        assert call_args[0][0] == "/qr_entropy.EntropyService/GetEntropy"
+        """channel.unary_unary() should be called with the configured method path.
+
+        Two unary handles exist since the draw path landed: the entropy
+        handle (first) and the PurityService draw handle (second).
+        """
+        calls = source._mock_channel.unary_unary.call_args_list
+        assert [c[0][0] for c in calls] == [
+            "/qr_entropy.EntropyService/GetEntropy",
+            "/qr_purity.PurityService/GetDraw",
+        ]
 
 
 class TestCircuitBreakerOrchestration:
@@ -330,6 +336,146 @@ class TestQuantumGrpcSourcePrefetch:
             source.close()
 
 
+class TestQuantumGrpcSourceDraw:
+    """Server-integrated draw path (get_draw / prefetch_draw)."""
+
+    def _make_source(self, unary_handle: Any, **overrides: Any) -> Any:
+        source, _ = make_mocked_source(
+            unary_handle=unary_handle, grpc_mode="unary", grpc_retry_count=0, **overrides
+        )
+        return source
+
+    @staticmethod
+    def _echoing_draw_handle(u: float = 0.625) -> Any:
+        from qr_sampler.proto.purity_service_pb2 import DrawRequest, DrawResponse
+
+        async def handle(request: bytes, **kwargs: Any) -> bytes:
+            req = DrawRequest.FromString(request)
+            return DrawResponse(
+                u=u,
+                z=1.5,
+                sequence_id=req.sequence_id,
+                generation_timestamp_ns=777,
+                source_id=req.source_id or "bound-source",
+                coherence_z=3.9,
+                coherence_valid=True,
+                coherence_r=0.4,
+                purity_label="quantum/intact/raw/qf:device",
+                integrated_bytes=req.block_bytes or 2_097_152,
+                integrator="bit_z",
+            ).SerializeToString()
+
+        return handle
+
+    def test_supports_server_draw_classvar(self) -> None:
+        from qr_sampler.entropy.qgrpc import QuantumGrpcSource
+
+        assert QuantumGrpcSource.supports_server_draw is True
+
+    def test_serial_get_draw_maps_response_to_meta(self) -> None:
+        source = self._make_source(self._echoing_draw_handle())
+        try:
+            u, meta = source.get_draw(2_097_152, "qrng-a")
+            assert u == 0.625
+            assert meta.z == 1.5
+            assert meta.coherence_z == 3.9
+            assert meta.coherence_valid is True
+            assert meta.coherence_r == 0.4
+            assert meta.purity_label == "quantum/intact/raw/qf:device"
+            assert meta.integrated_bytes == 2_097_152
+            assert meta.integrator == "bit_z"
+            assert meta.source_id == "qrng-a"
+            assert meta.generation_timestamp_ns == 777
+            # Serial path: no commitment nonce, no echo verdict.
+            assert meta.echo_verified is None
+        finally:
+            source.close()
+
+    def test_prefetch_draw_and_redeem_with_echo(self) -> None:
+        """Happy path: draw ticket redeems; echo verifies the nonce exactly
+        like the byte path (nonce rides DrawRequest.sequence_id)."""
+        nonce = 123456789
+        source = self._make_source(self._echoing_draw_handle())
+        try:
+            ticket = source.prefetch_draw(2_097_152, "qrng-a", nonce=nonce)
+            assert ticket is not None
+            assert ticket.nonce == nonce
+            u, meta = source.get_draw(2_097_152, "qrng-a", ticket)
+            assert u == 0.625
+            assert ticket.hit is True
+            assert ticket.echo_verified is True
+            assert meta.echo_verified is True
+            assert ticket.server_timestamp_ns == 777
+            assert source._prefetch_hits == 1
+        finally:
+            source.close()
+
+    def test_failed_draw_redeem_falls_back_to_serial_draw(self) -> None:
+        calls: list[str] = []
+        real_handle = self._echoing_draw_handle()
+
+        async def flaky_handle(request: bytes, **kwargs: Any) -> bytes:
+            if not calls:
+                calls.append("prefetch")
+                raise RuntimeError("stream reset mid-flight")
+            calls.append("serial")
+            return await real_handle(request)
+
+        source = self._make_source(flaky_handle)
+        try:
+            ticket = source.prefetch_draw(0, "", nonce=1)
+            assert ticket is not None
+            u, meta = source.get_draw(0, "", ticket)
+            assert u == 0.625
+            assert ticket.hit is False
+            assert calls == ["prefetch", "serial"]
+            assert source._prefetch_misses == 1
+            assert meta.echo_verified is None  # served serially, nonce-less
+        finally:
+            source.close()
+
+    def test_get_draw_absent_u_raises_entropy_unavailable(self) -> None:
+        """A server that never serves u (e.g. EntropyService-only backend)
+        surfaces as EntropyUnavailableError — the pipeline's degradation
+        trigger."""
+        from qr_sampler.proto.purity_service_pb2 import DrawResponse
+
+        handle = AsyncMock(return_value=DrawResponse(u=0.0, z=1.0).SerializeToString())
+        source = self._make_source(handle)
+        try:
+            with pytest.raises(EntropyUnavailableError):
+                source.get_draw(0, "")
+        finally:
+            source.close()
+
+    def test_prefetch_draw_returns_none_when_circuit_open(self) -> None:
+        source = self._make_source(self._echoing_draw_handle())
+        try:
+            source._breaker.circuit_open = True
+            source._breaker.circuit_open_until = time.monotonic() + 100.0
+            assert source.prefetch_draw(0, "", nonce=1) is None
+        finally:
+            source.close()
+
+    def test_get_draw_when_closed_raises(self) -> None:
+        source = self._make_source(self._echoing_draw_handle())
+        source.close()
+        with pytest.raises(EntropyUnavailableError, match="closed"):
+            source.get_draw(0, "")
+
+    def test_get_draw_failure_counts_against_breaker(self) -> None:
+        """Draw failures feed the same breaker as byte failures."""
+        handle = AsyncMock(side_effect=Exception("connection refused"))
+        source = self._make_source(handle)
+        try:
+            for _ in range(source._breaker.max_consecutive_failures):
+                with pytest.raises(EntropyUnavailableError):
+                    source.get_draw(0, "")
+            assert source._breaker.circuit_open is True
+        finally:
+            source.close()
+
+
 class TestPreprobeHealthySuppression:
     """A recent successful fetch suppresses the per-token TCP pre-probe."""
 
@@ -453,7 +599,8 @@ class TestCustomMethodPath:
             grpc_stream_method_path="",
         )
         try:
-            call_args = mock_channel.unary_unary.call_args
+            # First unary handle = the entropy path (the draw handle follows).
+            call_args = mock_channel.unary_unary.call_args_list[0]
             assert call_args[0][0] == "/qrng.QuantumRNG/GetRandomBytes"
         finally:
             source.close()
@@ -465,7 +612,8 @@ class TestCustomMethodPath:
             grpc_stream_method_path="/custom.Service/StreamData",
         )
         try:
-            call_args = mock_channel.stream_stream.call_args
+            # First stream handle = the entropy path (the draw stream follows).
+            call_args = mock_channel.stream_stream.call_args_list[0]
             assert call_args[0][0] == "/custom.Service/StreamData"
         finally:
             source.close()

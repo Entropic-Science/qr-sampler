@@ -31,6 +31,7 @@ class AmplifierRegistry:
         "zscore_mean": "qr_sampler.amplification.zscore:ZScoreMeanAmplifier",
         "ecdf": "qr_sampler.amplification.ecdf:ECDFAmplifier",
         "zscore_thought": "qr_sampler.amplification.zscore_thought:ZScoreThoughtAmplifier",
+        "server": "qr_sampler.amplification.server_side:ServerDrawAmplifier",
     }
 
     _registry: ClassVar[dict[str, type[SignalAmplifier]]] = {}

@@ -61,6 +61,18 @@ The only requirement is that:
 
 Any proto definition following this convention works without code changes.
 
+## Preset default & fail-safe
+
+The compose file defaults to `QR_PRESET=qthought_purity` (server-draw mode via
+`qr_purity.PurityService`). Against a server that only implements an
+entropy-bytes protocol, the draw path degrades fail-safe to local byte
+amplification (`entropy_is_fallback: true` in the token records) — sampling
+keeps working. To opt out, set `QR_PRESET` to another preset name (e.g.
+`qthought_think`) in `.env` — note that Compose's `${QR_PRESET:-…}` default
+treats an *empty* value the same as unset, so `QR_PRESET=` does NOT opt out.
+To run with no preset at all, remove the `QR_PRESET` line from the compose
+`environment:` block.
+
 ## Web UI (optional)
 
 This template includes [Open WebUI](https://github.com/open-webui/open-webui), a

@@ -9,12 +9,17 @@ gRPC server (including ``grpcurl`` and the user's ``qrng.QuantumRNG``).
 
 from __future__ import annotations
 
+import hashlib
+import math
+from pathlib import Path
+
 import pytest
 
 from qr_sampler.entropy.qgrpc.transport import decode_reply, encode_request
 from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.proto.entropy_service_pb2 import EntropyRequest, EntropyResponse
-from qr_sampler.proto.wire import decode_varint, encode_varint
+from qr_sampler.proto.purity_service_pb2 import DrawRequest, DrawResponse
+from qr_sampler.proto.wire import decode_fixed64, decode_varint, encode_fixed64, encode_varint
 
 # ---------------------------------------------------------------------------
 # Varint encoding/decoding
@@ -447,3 +452,292 @@ class TestGrpcStubs:
             servicer.GetEntropy(EntropyRequest(), MagicMock())
         with pytest.raises(NotImplementedError):
             servicer.StreamEntropy(iter(()), MagicMock())
+
+
+# ---------------------------------------------------------------------------
+# Fixed64 encoding/decoding (the double codec for qr_purity draws)
+# ---------------------------------------------------------------------------
+
+
+class TestFixed64:
+    """Test the low-level fixed64 (IEEE-754 double, little-endian) codec."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected_bytes"),
+        [
+            (0.0, b"\x00\x00\x00\x00\x00\x00\x00\x00"),
+            (1.0, b"\x00\x00\x00\x00\x00\x00\xf0\x3f"),
+            (0.5, b"\x00\x00\x00\x00\x00\x00\xe0\x3f"),
+            (-1.0, b"\x00\x00\x00\x00\x00\x00\xf0\xbf"),
+        ],
+    )
+    def test_encode_known_values(self, value: float, expected_bytes: bytes) -> None:
+        assert encode_fixed64(value) == expected_bytes
+
+    @pytest.mark.parametrize(
+        ("encoded", "expected_value"),
+        [
+            (b"\x00\x00\x00\x00\x00\x00\xf0\x3f", 1.0),
+            (b"\x00\x00\x00\x00\x00\x00\xe0\x3f", 0.5),
+            (b"\x00\x00\x00\x00\x00\x00\xf0\xbf", -1.0),
+        ],
+    )
+    def test_decode_known_values(self, encoded: bytes, expected_value: float) -> None:
+        value, offset = decode_fixed64(encoded, 0)
+        assert value == expected_value
+        assert offset == 8
+
+    def test_decode_respects_offset(self) -> None:
+        data = b"\xff\xff" + encode_fixed64(0.5)
+        value, offset = decode_fixed64(data, 2)
+        assert value == 0.5
+        assert offset == 10
+
+    def test_nan_roundtrips(self) -> None:
+        """NaN survives encode/decode (payload bits preserved by struct)."""
+        encoded = encode_fixed64(float("nan"))
+        assert len(encoded) == 8
+        value, offset = decode_fixed64(encoded, 0)
+        assert math.isnan(value)
+        assert offset == 8
+
+    def test_roundtrip(self) -> None:
+        for v in [0.0, 1e-10, 1.0 - 1e-10, 0.25, -3.5, 1e308, -1e-308, math.pi]:
+            encoded = encode_fixed64(v)
+            decoded, _ = decode_fixed64(encoded, 0)
+            assert decoded == v
+
+
+# ---------------------------------------------------------------------------
+# DrawRequest wire format (qr_purity.DrawRequest)
+# ---------------------------------------------------------------------------
+
+
+class TestDrawRequestWireFormat:
+    """Test that DrawRequest produces standard protobuf encoding."""
+
+    def test_empty_request_serializes_to_empty(self) -> None:
+        """Proto3: all-default-valued fields produce empty bytes."""
+        req = DrawRequest(sequence_id=0, source_id="", block_bytes=0)
+        assert req.SerializeToString() == b""
+
+    def test_known_encoding_sequence_id_only(self) -> None:
+        """Field 1, varint 42 -> tag=0x08, value=0x2a."""
+        req = DrawRequest(sequence_id=42)
+        assert req.SerializeToString() == b"\x08\x2a"
+
+    def test_known_encoding_all_fields(self) -> None:
+        """sequence_id=42, source_id='dev', block_bytes=2 MiB."""
+        req = DrawRequest(sequence_id=42, source_id="dev", block_bytes=2_097_152)
+        wire = req.SerializeToString()
+        # Field 1: tag=0x08, value=42 (0x2a)
+        # Field 2: tag=0x12, len=3, "dev"
+        # Field 3: tag=0x18, value=2097152 = 0x80 0x80 0x80 0x01
+        assert wire == b"\x08\x2a" + b"\x12\x03dev" + b"\x18\x80\x80\x80\x01"
+
+    def test_roundtrip(self) -> None:
+        req = DrawRequest(sequence_id=0x7FFFFFFFFFFFFFFF, source_id="dragonfly-0", block_bytes=1024)
+        decoded = DrawRequest.FromString(req.SerializeToString())
+        assert decoded == req
+
+    def test_roundtrip_defaults(self) -> None:
+        decoded = DrawRequest.FromString(DrawRequest().SerializeToString())
+        assert decoded.sequence_id == 0
+        assert decoded.source_id == ""
+        assert decoded.block_bytes == 0
+
+    def test_from_string_skips_unknown_fields(self) -> None:
+        """Unknown varint/fixed64/len-delimited fields are silently skipped."""
+        wire = (
+            b"\x08\x2a"  # field 1 varint = 42
+            + b"\x28\x63"  # unknown field 5 varint
+            + b"\x31"
+            + b"\x00" * 8  # unknown field 6 fixed64
+            + b"\x3a\x02ab"  # unknown field 7 length-delimited
+        )
+        decoded = DrawRequest.FromString(wire)
+        assert decoded.sequence_id == 42
+        assert decoded.source_id == ""
+        assert decoded.block_bytes == 0
+
+    def test_from_string_empty_bytes(self) -> None:
+        decoded = DrawRequest.FromString(b"")
+        assert decoded == DrawRequest()
+
+
+# ---------------------------------------------------------------------------
+# DrawResponse wire format (qr_purity.DrawResponse)
+# ---------------------------------------------------------------------------
+
+
+class TestDrawResponseWireFormat:
+    """Test that DrawResponse produces standard protobuf encoding."""
+
+    def test_empty_response_serializes_to_empty(self) -> None:
+        assert DrawResponse().SerializeToString() == b""
+
+    def test_known_encoding_u_only(self) -> None:
+        """Field 1 (double), wire type 1 -> tag=(1<<3)|1=0x09 + 8 LE bytes."""
+        resp = DrawResponse(u=0.5)
+        assert resp.SerializeToString() == b"\x09" + b"\x00\x00\x00\x00\x00\x00\xe0\x3f"
+
+    def test_known_encoding_selected_fields(self) -> None:
+        """u=1.0, sequence_id=7, coherence_valid=True."""
+        resp = DrawResponse(u=1.0, sequence_id=7, coherence_valid=True)
+        wire = resp.SerializeToString()
+        # Field 1: tag=0x09 + fixed64(1.0)
+        # Field 3: tag=0x18, value=7
+        # Field 7: tag=0x38, value=1
+        assert wire == (b"\x09" + b"\x00\x00\x00\x00\x00\x00\xf0\x3f" + b"\x18\x07" + b"\x38\x01")
+
+    def test_roundtrip_all_fields(self) -> None:
+        resp = DrawResponse(
+            u=0.734,
+            z=0.625,
+            sequence_id=987654321,
+            generation_timestamp_ns=1_700_000_000_000_000_000,
+            source_id="dragonfly-0",
+            coherence_z=4.25,
+            coherence_valid=True,
+            purity_label="quantum/intact/raw/amplified:2097152/qf:99+/QV",
+            integrated_bytes=2_097_152,
+            integrator="bit_z",
+            coherence_r=0.125,
+        )
+        decoded = DrawResponse.FromString(resp.SerializeToString())
+        assert decoded == resp
+
+    def test_roundtrip_defaults(self) -> None:
+        decoded = DrawResponse.FromString(DrawResponse().SerializeToString())
+        assert decoded == DrawResponse()
+        assert decoded.u == 0.0
+        assert decoded.coherence_valid is False
+
+    def test_last_field_occurrence_wins(self) -> None:
+        """Repeated scalar field: LAST occurrence wins (proto3 semantics)."""
+        first = DrawResponse(u=0.25).SerializeToString()
+        last = DrawResponse(u=0.75).SerializeToString()
+        decoded = DrawResponse.FromString(first + last)
+        assert decoded.u == 0.75
+
+    def test_from_string_skips_unknown_fields(self) -> None:
+        """Unknown fields of every wire type are silently skipped."""
+        wire = DrawResponse(u=0.5, integrator="bit_z").SerializeToString()
+        wire += b"\x60\x63"  # unknown field 12 varint
+        wire += b"\x69" + b"\x00" * 8  # unknown field 13 fixed64
+        wire += b"\x72\x02xy"  # unknown field 14 length-delimited
+        wire += b"\x7d" + b"\x00" * 4  # unknown field 15 fixed32
+        decoded = DrawResponse.FromString(wire)
+        assert decoded.u == 0.5
+        assert decoded.integrator == "bit_z"
+
+    def test_from_string_empty_bytes(self) -> None:
+        assert DrawResponse.FromString(b"") == DrawResponse()
+
+    def test_clamped_u_boundaries_roundtrip_exactly(self) -> None:
+        """The server's clamp bounds survive the wire bit-for-bit."""
+        for u in (1e-10, 1.0 - 1e-10):
+            decoded = DrawResponse.FromString(DrawResponse(u=u).SerializeToString())
+            assert decoded.u == u
+
+
+# ---------------------------------------------------------------------------
+# Proto byte-identity (cross-repo pin with Qbert0G)
+# ---------------------------------------------------------------------------
+
+#: sha256 over the CRLF->LF-normalized bytes of ``purity_service.proto``.
+#: The SAME constant is pinned in Qbert0G's ``tests/test_purity_service.py``,
+#: so both repos' copies are transitively byte-identical without cross-repo
+#: file access. Never change one pin without the other.
+PURITY_PROTO_SHA256 = "738af813b298c5ee8f161afb0e69cfe44f12e0dbb9fe0d3cfc754e05574c0bc3"
+
+
+class TestPurityProtoIdentity:
+    """``purity_service.proto`` is byte-identical to Qbert0G's copy."""
+
+    def test_proto_file_sha256_pin(self) -> None:
+        proto_path = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "qr_sampler"
+            / "proto"
+            / "purity_service.proto"
+        )
+        normalized = proto_path.read_bytes().replace(b"\r\n", b"\n")
+        assert hashlib.sha256(normalized).hexdigest() == PURITY_PROTO_SHA256
+
+
+# ---------------------------------------------------------------------------
+# PurityService gRPC stubs (client stub + servicer registration)
+# ---------------------------------------------------------------------------
+
+
+class TestPurityGrpcStubs:
+    """The hand-written PurityService stub / servicer helpers stay wire-compatible."""
+
+    def test_stub_binds_method_paths_and_codec(self) -> None:
+        from unittest.mock import MagicMock
+
+        from qr_sampler.proto.purity_service_pb2_grpc import PurityServiceStub
+
+        channel = MagicMock()
+        PurityServiceStub(channel)
+        unary_args = channel.unary_unary.call_args
+        stream_args = channel.stream_stream.call_args
+        assert unary_args[0][0] == "/qr_purity.PurityService/GetDraw"
+        assert stream_args[0][0] == "/qr_purity.PurityService/StreamDraws"
+
+        # The registered (de)serializers round-trip real messages.
+        ser = unary_args.kwargs["request_serializer"]
+        deser = unary_args.kwargs["response_deserializer"]
+        req = DrawRequest(sequence_id=9, source_id="dev", block_bytes=64)
+        assert DrawRequest.FromString(ser(req)) == req
+        resp = DrawResponse(u=0.5, z=1.0, sequence_id=9)
+        assert deser(resp.SerializeToString()) == resp
+
+    def test_servicer_serializers_roundtrip(self) -> None:
+        pytest.importorskip("grpc", reason="grpcio not installed")
+        from unittest.mock import MagicMock, patch
+
+        from qr_sampler.proto import purity_service_pb2_grpc as grpc_mod
+        from qr_sampler.proto.purity_service_pb2_grpc import (
+            PurityServiceServicer,
+            add_PurityServiceServicer_to_server,
+        )
+
+        # The server-side (de)serializer pair mirrors the client stub's.
+        req = DrawRequest(sequence_id=3, source_id="dev")
+        assert grpc_mod._draw_request_deserializer(req.SerializeToString()) == req
+        resp = DrawResponse(u=0.5, sequence_id=3)
+        assert grpc_mod._draw_response_serializer(resp) == resp.SerializeToString()
+
+        server = MagicMock()
+        with patch("grpc.method_handlers_generic_handler") as handler_fn:
+            add_PurityServiceServicer_to_server(PurityServiceServicer(), server)
+            assert handler_fn.call_args[0][0] == "qr_purity.PurityService"
+        server.add_generic_rpc_handlers.assert_called_once()
+
+    def test_servicer_registration(self) -> None:
+        pytest.importorskip("grpc", reason="grpcio not installed")
+        from unittest.mock import MagicMock
+
+        from qr_sampler.proto.purity_service_pb2_grpc import (
+            PurityServiceServicer,
+            add_PurityServiceServicer_to_server,
+        )
+
+        server = MagicMock()
+        add_PurityServiceServicer_to_server(PurityServiceServicer(), server)
+        server.add_generic_rpc_handlers.assert_called_once()
+
+    def test_default_servicer_methods_are_unimplemented(self) -> None:
+        pytest.importorskip("grpc", reason="grpcio not installed")
+        from unittest.mock import MagicMock
+
+        from qr_sampler.proto.purity_service_pb2_grpc import PurityServiceServicer
+
+        servicer = PurityServiceServicer()
+        with pytest.raises(NotImplementedError):
+            servicer.GetDraw(DrawRequest(), MagicMock())
+        with pytest.raises(NotImplementedError):
+            servicer.StreamDraws(iter(()), MagicMock())

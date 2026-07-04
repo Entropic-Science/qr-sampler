@@ -200,6 +200,146 @@ class TestPipelinePrefetch:
             assert 0 < nonce <= 0x7FFFFFFFFFFFFFFF
 
 
+class FakeDrawTicket:
+    """Stand-in for a draw ``PrefetchTicket`` carrying a scripted (u, meta)."""
+
+    def __init__(self, u: float, meta: Any, nonce: int) -> None:
+        self.u = u
+        self.meta = meta
+        self.nonce = nonce
+        self.hit: bool | None = None
+        self.echo_verified: bool | None = None
+        self.server_timestamp_ns: int | None = None
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class FakeDrawAsyncSource(EntropySource):
+    """Draw-prefetch-capable in-memory source recording every interaction."""
+
+    supports_server_draw = True
+
+    def __init__(self) -> None:
+        from qr_sampler.entropy.base import DrawMeta
+
+        self.events: list[tuple[Any, ...]] = []
+        self.tickets: list[FakeDrawTicket] = []
+        self._meta = DrawMeta(
+            z=1.2,
+            coherence_z=0.0,
+            coherence_valid=False,
+            coherence_r=0.0,
+            purity_label="quantum/intact/raw/qf:device",
+            integrated_bytes=2_097_152,
+            integrator="bit_z",
+            source_id="qrng-a",
+        )
+        self._closed = False
+
+    @property
+    def name(self) -> str:
+        return "fake_draw_async"
+
+    @property
+    def is_available(self) -> bool:
+        return not self._closed
+
+    def get_random_bytes(self, n: int) -> bytes:
+        self.events.append(("serial_bytes", n))
+        return os.urandom(n)
+
+    def prefetch_draw(
+        self, block_bytes: int, source_id: str, nonce: int | None = None
+    ) -> FakeDrawTicket:
+        self.events.append(("prefetch_draw", block_bytes, source_id, nonce))
+        ticket = FakeDrawTicket(0.618, self._meta, nonce or 0)
+        self.tickets.append(ticket)
+        return ticket
+
+    def get_draw(
+        self, block_bytes: int, source_id: str, ticket: Any | None = None
+    ) -> tuple[float, Any]:
+        if ticket is None:
+            self.events.append(("serial_draw", block_bytes, source_id))
+            return 0.618, self._meta
+        self.events.append(("redeem_draw", block_bytes, source_id, ticket.nonce))
+        ticket.hit = True
+        ticket.echo_verified = True
+        ticket.server_timestamp_ns = 43
+        return ticket.u, ticket.meta
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class TestPipelineDrawPrefetch:
+    """The commit-then-fetch chain, draw-shaped (spec §4.3, FR-S3)."""
+
+    def _draw_pipeline(self, source: EntropySource, **config_overrides: Any) -> SamplingPipeline:
+        config = QRSamplerConfig(  # type: ignore[call-arg]
+            _env_file=None,
+            sample_count=128,
+            signal_amplifier_type="server",
+            draw_source_id="qrng-a",
+            draw_block_bytes=2_097_152,
+            **config_overrides,
+        )
+        return SamplingPipeline(
+            entropy_source=source,
+            amplifier=AmplifierRegistry.build(config),
+            strategy=TemperatureStrategyRegistry.build(config, VOCAB),
+            selector=TokenSelector(),
+            sampling_logger=SamplingLogger(config),
+            config=config,
+        )
+
+    def test_redeems_draw_ticket_then_fires_next_draw_prefetch(self) -> None:
+        """Draw mode mirrors the byte path: redeem, select, fire next —
+        via prefetch_draw, never the byte prefetch."""
+        source = FakeDrawAsyncSource()
+        pipeline = self._draw_pipeline(source)
+        salt = b"\x03" * 16
+
+        first_nonce = derive_commit_nonce(salt, 0, -1)
+        ticket = source.prefetch_draw(2_097_152, "qrng-a", first_nonce)
+        ctx = PrefetchContext(salt=salt, step=0, ticket=ticket)
+
+        result = pipeline.sample_token(_logits(), prefetch_ctx=ctx, build_onehot=False)
+
+        kinds = [e[0] for e in source.events]
+        assert kinds == ["prefetch_draw", "redeem_draw", "prefetch_draw"]
+        assert result.next_ticket is source.tickets[-1]
+        # The next draw's nonce commits to the token JUST selected.
+        expected = derive_commit_nonce(salt, 1, result.token_id)
+        assert result.next_ticket.nonce == expected
+        # Draw request shape flows through: block bytes + source id.
+        assert source.events[-1] == ("prefetch_draw", 2_097_152, "qrng-a", expected)
+        # Verification diagnostics ride the record exactly like bytes.
+        assert result.record.entropy_prefetch_hit is True
+        assert result.record.entropy_echo_verified is True
+        assert result.record.entropy_server_timestamp_ns == 43
+        assert result.record.entropy_nonce == f"{first_nonce:016x}"
+        assert result.record.u_value == 0.618
+        assert result.draw_meta is not None
+
+    def test_serial_draw_without_context_fires_no_prefetch(self) -> None:
+        source = FakeDrawAsyncSource()
+        pipeline = self._draw_pipeline(source)
+        result = pipeline.sample_token(_logits(), build_onehot=False)
+        assert [e[0] for e in source.events] == ["serial_draw"]
+        assert result.next_ticket is None
+
+    def test_prefetch_config_switch_disables_next_draw_prefetch(self) -> None:
+        source = FakeDrawAsyncSource()
+        pipeline = self._draw_pipeline(source, entropy_prefetch=False)
+        ctx = PrefetchContext(salt=b"\x04" * 16, step=0, ticket=None)
+        result = pipeline.sample_token(_logits(), prefetch_ctx=ctx, build_onehot=False)
+        assert [e[0] for e in source.events] == ["serial_draw"]
+        assert result.next_ticket is None
+
+
 # ---------------------------------------------------------------------------
 # Fallback layer
 # ---------------------------------------------------------------------------

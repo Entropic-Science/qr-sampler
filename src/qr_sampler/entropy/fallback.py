@@ -49,7 +49,7 @@ import logging
 import time
 from typing import Any
 
-from qr_sampler.entropy.base import EntropySource
+from qr_sampler.entropy.base import DrawMeta, EntropySource
 from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.telemetry.status_file import write_entropy_status
 
@@ -175,6 +175,30 @@ class FallbackEntropySource(EntropySource):
         if ticket is None:
             return self.get_random_bytes(n)
         return self._fetch_via(n, lambda: self._primary.get_random_bytes_with_ticket(n, ticket))
+
+    def get_draw(
+        self, block_bytes: int, source_id: str, ticket: Any | None = None
+    ) -> tuple[float, DrawMeta]:
+        """Delegate a server-integrated draw to the PRIMARY only.
+
+        Local fallback sources cannot draw — there is no server to
+        integrate for them — so a primary draw failure raises
+        ``EntropyUnavailableError`` upward instead of engaging the
+        fallback. Degradation (fallback bytes + a local amplifier) is the
+        sampling pipeline's job; keeping it there leaves this wrapper's
+        failover bookkeeping (``fallback_count``, ``last_source_used``)
+        meaning exactly "who provided BYTES".
+        """
+        return self._primary.get_draw(block_bytes, source_id, ticket)
+
+    def prefetch_draw(
+        self, block_bytes: int, source_id: str, nonce: int | None = None
+    ) -> Any | None:
+        """Delegate draw prefetch to the primary source. Never raises."""
+        try:
+            return self._primary.prefetch_draw(block_bytes, source_id, nonce)
+        except Exception:
+            return None
 
     def _fetch_via(self, n: int, fetch_fn: Any) -> bytes:
         """Shared primary-then-fallback flow for serial and ticket fetches."""

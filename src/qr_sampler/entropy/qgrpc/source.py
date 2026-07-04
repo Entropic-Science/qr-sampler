@@ -31,17 +31,24 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
-from qr_sampler.entropy.base import EntropySource
+from qr_sampler.entropy.base import DrawMeta, EntropySource
 from qr_sampler.entropy.qgrpc.breaker import AdaptiveCircuitBreaker
 from qr_sampler.entropy.qgrpc.channel import GrpcChannel
 from qr_sampler.entropy.qgrpc.preprobe import TcpPreprobe
-from qr_sampler.entropy.qgrpc.transport import GrpcTransport, _FetchReply
+from qr_sampler.entropy.qgrpc.transport import GrpcTransport, _DrawFetchReply, _FetchReply
 from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+
     from qr_sampler.config import QRSamplerConfig
+    from qr_sampler.proto.purity_service_pb2 import DrawResponse
+
+#: Reply types the shared retry/breaker orchestration can carry — both
+#: expose ``elapsed_ms`` for the circuit breaker's latency window.
+_ReplyT = TypeVar("_ReplyT", _FetchReply, _DrawFetchReply)
 
 logger = logging.getLogger("qr_sampler")
 
@@ -129,6 +136,10 @@ class QuantumGrpcSource(EntropySource):
             ``grpc_stream_method_path`` is empty.
     """
 
+    #: Server-integrated draws are served over the same channel via the
+    #: ``qr_purity.PurityService`` protocol (see ``get_draw``).
+    supports_server_draw: ClassVar[bool] = True
+
     def __init__(self, config: QRSamplerConfig) -> None:
         try:
             import grpc.aio  # noqa: F401 — availability check
@@ -173,6 +184,8 @@ class QuantumGrpcSource(EntropySource):
             timeout_ms=config.grpc_timeout_ms,
             method_path=config.grpc_method_path,
             stream_method_path=config.grpc_stream_method_path,
+            draw_method_path=config.grpc_draw_method_path,
+            draw_stream_method_path=config.grpc_draw_stream_method_path,
         )
         self._transport = GrpcTransport(
             self._channel,
@@ -311,6 +324,20 @@ class QuantumGrpcSource(EntropySource):
             EntropyUnavailableError: If the server is unreachable or the
                 circuit breaker is open.
         """
+        reply = self._fetch_with_recovery(lambda: self._fetch_sync(n), what="entropy fetch")
+        return reply.payload
+
+    def _fetch_with_recovery(self, fetch_fn: Callable[[], _ReplyT], *, what: str) -> _ReplyT:
+        """Shared retry + circuit-breaker orchestration for serial fetches.
+
+        Used by both the byte path (``get_random_bytes``) and the
+        server-integrated draw path (``get_draw``) so the breaker times
+        and gates draws exactly like byte fetches.
+
+        Raises:
+            EntropyUnavailableError: If the source is closed, the circuit
+                breaker is open, or every attempt failed.
+        """
         if self._closed:
             raise EntropyUnavailableError("QuantumGrpcSource is closed")
 
@@ -338,14 +365,15 @@ class QuantumGrpcSource(EntropySource):
         last_error: Exception | None = None
         for attempt in range(1 + self._retry_count):
             try:
-                reply = self._fetch_sync(n)
+                reply = fetch_fn()
                 self._breaker.note_success(reply.elapsed_ms)
                 self._preprobe.note_fetch_success()
-                return reply.payload
+                return reply
             except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    "gRPC entropy fetch attempt %d/%d failed: %s",
+                    "gRPC %s attempt %d/%d failed: %s",
+                    what,
                     attempt + 1,
                     1 + self._retry_count,
                     exc,
@@ -374,7 +402,7 @@ class QuantumGrpcSource(EntropySource):
             logger.warning("channel reset after retry-exhaust failed: %s", reset_exc)
 
         raise EntropyUnavailableError(
-            f"gRPC entropy fetch failed after {1 + self._retry_count} attempts: {last_error}"
+            f"gRPC {what} failed after {1 + self._retry_count} attempts: {last_error}"
         ) from last_error
 
     def prefetch(self, n: int, nonce: int | None = None) -> PrefetchTicket | None:
@@ -453,8 +481,128 @@ class QuantumGrpcSource(EntropySource):
         self._preprobe.note_fetch_success()
         return reply.payload
 
+    # --- Server-integrated draws (qr_purity.PurityService) ---
+
+    def get_draw(
+        self, block_bytes: int, source_id: str, ticket: Any | None = None
+    ) -> tuple[float, DrawMeta]:
+        """Fetch one server-integrated draw ``(u, meta)``.
+
+        Mirrors the byte path exactly: a ``prefetch_draw()`` ticket is
+        redeemed when provided (blocking only for the residual wait,
+        degrading to the serial draw fetch on any ticket failure), and
+        the serial path carries the full retry, pre-probe and
+        circuit-breaker machinery via :meth:`_fetch_with_recovery`.
+
+        Raises:
+            EntropyUnavailableError: If the source is closed, the circuit
+                breaker is open, the server refuses/cannot serve a draw,
+                or every attempt failed.
+        """
+        if ticket is not None:
+            redeemed = self._redeem_draw_ticket(ticket)
+            if redeemed is not None:
+                return redeemed
+        reply = self._fetch_with_recovery(
+            lambda: self._draw_fetch_sync(source_id, block_bytes), what="draw fetch"
+        )
+        return self._draw_result(reply.response, echo_verified=None)
+
+    def prefetch_draw(
+        self, block_bytes: int, source_id: str, nonce: int | None = None
+    ) -> PrefetchTicket | None:
+        """Fire an asynchronous draw fetch; return a redeemable ticket.
+
+        The draw twin of :meth:`prefetch` — identical dispatch guards
+        (closed / raw ``circuit_open`` / pre-probe backoff), identical
+        never-raise contract, and the same :class:`PrefetchTicket` shape.
+        The commitment *nonce* rides ``DrawRequest.sequence_id``; the
+        server's echo makes the post-selection ordering verifiable
+        exactly like the byte path.
+        """
+        if self._closed or self._breaker.circuit_open:
+            return None
+        if self._preprobe.backoff_active():
+            return None
+        try:
+            self._channel.ensure()
+            future = self._channel.submit(
+                self._transport.fetch_draw(source_id, block_bytes, nonce or 0)
+            )
+        except Exception as exc:
+            logger.debug("draw prefetch dispatch failed: %s", exc)
+            return None
+        self._prefetch_fired += 1
+        return PrefetchTicket(future=future, nonce=nonce or 0, n=block_bytes)
+
+    def _redeem_draw_ticket(self, ticket: Any) -> tuple[float, DrawMeta] | None:
+        """Redeem a draw ticket; ``None`` means "degrade to serial".
+
+        Success bookkeeping (breaker latency, pre-probe, hit counters,
+        echo verification) mirrors ``get_random_bytes_with_ticket``.
+
+        Raises:
+            EntropyUnavailableError: If the source is closed.
+        """
+        if self._closed:
+            ticket.cancel()
+            raise EntropyUnavailableError("QuantumGrpcSource is closed")
+
+        timeout_s = self._breaker.timeout_ms() / 1000.0
+        t0 = time.perf_counter()
+        already_done = bool(ticket.future.done())
+        try:
+            reply: _DrawFetchReply = ticket.future.result(timeout=timeout_s)
+        except Exception as exc:
+            ticket.cancel()
+            ticket.hit = False
+            self._prefetch_misses += 1
+            logger.debug("draw prefetch redeem failed (%s); falling back to serial draw", exc)
+            return None
+
+        response = reply.response
+        ticket.hit = True
+        ticket.wait_ms = 0.0 if already_done else (time.perf_counter() - t0) * 1000.0
+        ticket.echo_verified = bool(ticket.nonce) and response.sequence_id == ticket.nonce
+        ticket.server_timestamp_ns = response.generation_timestamp_ns or None
+        self._prefetch_hits += 1
+        self._breaker.note_success(reply.elapsed_ms)
+        self._preprobe.note_fetch_success()
+        return self._draw_result(response, echo_verified=ticket.echo_verified)
+
+    @staticmethod
+    def _draw_result(
+        response: DrawResponse, *, echo_verified: bool | None
+    ) -> tuple[float, DrawMeta]:
+        """Map a decoded ``DrawResponse`` to the source-level ``(u, meta)``."""
+        meta = DrawMeta(
+            z=response.z,
+            coherence_z=response.coherence_z,
+            coherence_valid=response.coherence_valid,
+            coherence_r=response.coherence_r,
+            purity_label=response.purity_label,
+            integrated_bytes=response.integrated_bytes,
+            integrator=response.integrator,
+            source_id=response.source_id,
+            generation_timestamp_ns=response.generation_timestamp_ns or None,
+            echo_verified=echo_verified,
+        )
+        return response.u, meta
+
     def _fetch_sync(self, n: int) -> _FetchReply:
-        """Dispatch an async fetch to the background loop and block.
+        """Dispatch an async byte fetch to the background loop and block."""
+        return self._submit_and_wait(self._transport.fetch(n), n=n, what="entropy fetch")
+
+    def _draw_fetch_sync(self, source_id: str, block_bytes: int) -> _DrawFetchReply:
+        """Dispatch an async draw fetch to the background loop and block."""
+        return self._submit_and_wait(
+            self._transport.fetch_draw(source_id, block_bytes),
+            n=block_bytes,
+            what="draw fetch",
+        )
+
+    def _submit_and_wait(self, coro: Coroutine[Any, Any, _ReplyT], *, n: int, what: str) -> _ReplyT:
+        """Submit *coro* to the background loop, block, classify failures.
 
         Fronts the dispatch with a bounded-time TCP-connect pre-probe so
         an unreachable server fails the request in ~500 ms rather than
@@ -469,15 +617,15 @@ class QuantumGrpcSource(EntropySource):
         self._channel.ensure()
 
         timeout_s = self._breaker.timeout_ms() / 1000.0
-        future = self._channel.submit(self._transport.fetch(n))
+        future = self._channel.submit(coro)
         t0 = time.perf_counter()
         try:
-            result: _FetchReply = future.result(timeout=timeout_s)
+            result: _ReplyT = future.result(timeout=timeout_s)
             return result
         except TimeoutError as exc:
             self._breaker.record_censored_latency(time.perf_counter() - t0, timeout_s)
             raise EntropyUnavailableError(
-                f"gRPC entropy fetch timed out after {timeout_s * 1000:.0f}ms"
+                f"gRPC {what} timed out after {timeout_s * 1000:.0f}ms"
             ) from exc
         except Exception as exc:
             self._breaker.record_censored_latency(time.perf_counter() - t0, timeout_s)
@@ -509,7 +657,7 @@ class QuantumGrpcSource(EntropySource):
                     f"QRNG quota exhausted (RESOURCE_EXHAUSTED) for n={n}; "
                     "rate/byte limit hit, connectivity is fine"
                 ) from exc
-            raise EntropyUnavailableError(f"gRPC entropy fetch failed: {exc}") from exc
+            raise EntropyUnavailableError(f"gRPC {what} failed: {exc}") from exc
 
     # --- Lifecycle ---
 

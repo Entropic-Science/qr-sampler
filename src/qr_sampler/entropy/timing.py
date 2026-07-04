@@ -8,7 +8,7 @@ least-significant bits of the nanosecond timing deltas.
 
     This source is **experimental and educational**. Timing noise is
     deterministic under classical physics — it is not suitable for
-    consciousness-research experiments that require true quantum randomness.
+    weak-signal integration experiments that require true quantum randomness.
     Use for testing, demos, and as an example of a non-gRPC entropy source.
 """
 
@@ -35,7 +35,7 @@ class TimingNoiseSource(EntropySource):
     extracting the least-significant bits of the timing deltas.
 
     Warning:
-        This is EXPERIMENTAL. Not suitable for consciousness-research
+        This is EXPERIMENTAL. Not suitable for weak-signal integration
         experiments (timing noise is deterministic under classical physics).
         Useful for testing, demos, and as an example of a non-gRPC source.
     """
@@ -43,7 +43,7 @@ class TimingNoiseSource(EntropySource):
     def __init__(self) -> None:
         warnings.warn(
             "TimingNoiseSource is experimental. Timing jitter is not quantum-random "
-            "and should not be used for consciousness-research experiments.",
+            "and is not suitable for weak-signal integration experiments.",
             stacklevel=2,
             category=UserWarning,
         )

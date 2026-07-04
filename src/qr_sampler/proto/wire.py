@@ -1,13 +1,16 @@
 """Primitive protobuf wire-format codec — the single home of varint/tag math.
 
 These helpers implement the proto3 wire primitives used by the hand-written
-message stubs in :mod:`qr_sampler.proto.entropy_service_pb2`:
+message stubs in :mod:`qr_sampler.proto.entropy_service_pb2` and
+:mod:`qr_sampler.proto.purity_service_pb2`:
 
 - Varint fields: tag = ``(field_number << 3 | 0)``, then LEB128-encoded value
+- Fixed64 fields: tag = ``(field_number << 3 | 1)``, then 8 bytes
+  little-endian (IEEE-754 double for proto ``double`` fields)
 - Length-delimited fields: tag = ``(field_number << 3 | 2)``, then varint
   length, then raw bytes
-- Default-valued fields (0, empty bytes, empty string) are omitted from the
-  wire
+- Default-valued fields (0, 0.0, empty bytes, empty string) are omitted
+  from the wire
 
 Everything that needs to touch raw wire bytes (message stubs, tests,
 example servers) imports these public names; no private copies exist
@@ -15,6 +18,8 @@ elsewhere in the package.
 """
 
 from __future__ import annotations
+
+import struct
 
 
 def encode_varint(value: int) -> bytes:
@@ -56,12 +61,38 @@ def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
     return result, offset
 
 
+def encode_fixed64(value: float) -> bytes:
+    """Encode a float as a protobuf fixed64 (little-endian IEEE-754 double).
+
+    Args:
+        value: The float to encode (proto ``double`` fields).
+
+    Returns:
+        Exactly 8 little-endian bytes.
+    """
+    return struct.pack("<d", value)
+
+
+def decode_fixed64(data: bytes, offset: int) -> tuple[float, int]:
+    """Decode a fixed64 double from bytes at the given offset.
+
+    Args:
+        data: Raw bytes.
+        offset: Starting position.
+
+    Returns:
+        Tuple of (decoded_value, new_offset).
+    """
+    value: float = struct.unpack_from("<d", data, offset)[0]
+    return value, offset + 8
+
+
 def encode_tag(field_number: int, wire_type: int) -> bytes:
     """Encode a protobuf field tag.
 
     Args:
         field_number: The proto field number (1-based).
-        wire_type: 0 = varint, 2 = length-delimited.
+        wire_type: 0 = varint, 1 = fixed64, 2 = length-delimited.
 
     Returns:
         Varint-encoded tag bytes.

@@ -49,6 +49,10 @@ class GrpcChannel:
         method_path: gRPC method path for the unary RPC.
         stream_method_path: gRPC method path for the streaming RPC
             (empty string disables the streaming handle).
+        draw_method_path: gRPC method path for the unary server-draw RPC
+            (empty string disables the draw handle).
+        draw_stream_method_path: gRPC method path for the bidi-streaming
+            server-draw RPC (empty string disables the draw stream handle).
     """
 
     def __init__(
@@ -58,11 +62,15 @@ class GrpcChannel:
         timeout_ms: float,
         method_path: str,
         stream_method_path: str,
+        draw_method_path: str = "",
+        draw_stream_method_path: str = "",
     ) -> None:
         self._address = address
         self._timeout_ms = timeout_ms
         self._method_path = method_path
         self._stream_method_path = stream_method_path
+        self._draw_method_path = draw_method_path
+        self._draw_stream_method_path = draw_stream_method_path
 
         # Background event loop + gRPC channel are LAZILY initialized on
         # the first fetch. The prior eager init opened a thread + an
@@ -76,6 +84,8 @@ class GrpcChannel:
         self._grpc_channel: Any = None
         self._unary_method: Any = None
         self._stream_method: Any | None = None
+        self._draw_unary_method: Any | None = None
+        self._draw_stream_method: Any | None = None
 
     @property
     def initialized(self) -> bool:
@@ -96,6 +106,16 @@ class GrpcChannel:
     def stream_method(self) -> Any | None:
         """The generic streaming method handle (None when path is empty)."""
         return self._stream_method
+
+    @property
+    def draw_unary_method(self) -> Any | None:
+        """The generic unary draw method handle (None when path is empty)."""
+        return self._draw_unary_method
+
+    @property
+    def draw_stream_method(self) -> Any | None:
+        """The generic draw stream method handle (None when path is empty)."""
+        return self._draw_stream_method
 
     def ensure(self) -> None:
         """Start the background loop + open the gRPC channel on first call.
@@ -175,6 +195,24 @@ class GrpcChannel:
                 response_deserializer=identity_deserializer,
             )
 
+        # Server-draw method handles (PurityService) — only created when the
+        # respective path is non-empty. Same identity codecs: the transport
+        # pre-encodes DrawRequest bytes and decodes DrawResponse bytes itself.
+        self._draw_unary_method = None
+        if self._draw_method_path:
+            self._draw_unary_method = self._grpc_channel.unary_unary(
+                self._draw_method_path,
+                request_serializer=identity_serializer,
+                response_deserializer=identity_deserializer,
+            )
+        self._draw_stream_method = None
+        if self._draw_stream_method_path:
+            self._draw_stream_method = self._grpc_channel.stream_stream(
+                self._draw_stream_method_path,
+                request_serializer=identity_serializer,
+                response_deserializer=identity_deserializer,
+            )
+
     def reset(self) -> None:
         """Tear down the channel + loop so the next call re-inits cleanly.
 
@@ -202,6 +240,8 @@ class GrpcChannel:
             self._grpc_channel = None
             self._unary_method = None
             self._stream_method = None
+            self._draw_unary_method = None
+            self._draw_stream_method = None
 
     def close(self, pre_close: Callable[[], None] | None = None) -> None:
         """Release the channel, event loop, and background thread.

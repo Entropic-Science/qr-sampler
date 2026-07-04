@@ -1,0 +1,32 @@
+id: qthought_purity
+name: "Qthought purity lane"
+description: |
+  Server-integrated draw lane: instead of fetching raw bytes and amplifying
+  locally, each token asks the entropy server's ``qr_purity.PurityService``
+  for one integrated draw ``(u, z)`` plus the cross-device coherence
+  statistic (``coherence_z`` / ``coherence_valid`` / ``coherence_r``) and a
+  canonical purity label.
+
+  Temperature is the ``coherence_gate`` strategy composed over a ``fixed``
+  inner at T=1.0: when the PREVIOUS draw's coherence is significant
+  (``coherence_valid`` and ``z_c >= coherence_threshold``), the base
+  temperature is boosted by ``coherence_t_boost_max * max(0, r)``, smoothed
+  by an EMA (``coherence_ema_alpha``). Fail-safe by construction — a draw
+  failure degrades to fallback bytes + a local ``zscore_mean`` amplifier,
+  and every gate failure path yields exactly the unboosted temperature.
+
+experimental: false
+origin: null
+overrides:
+  entropy_source_type: quantum_grpc
+  signal_amplifier_type: server
+  temperature_strategy: coherence_gate
+  coherence_inner_strategy: fixed
+  fixed_temperature: 1.0
+  coherence_threshold: 3.5
+  coherence_t_boost_max: 0.5
+  coherence_ema_alpha: 0.3
+  # 0 = server default block size (2 MiB per Amendment 1.3).
+  draw_block_bytes: 0
+  top_k: 0
+  top_p: 1.0

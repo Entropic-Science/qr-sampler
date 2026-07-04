@@ -11,9 +11,54 @@ abstract members: ``name``, ``is_available``, ``get_random_bytes()``, and
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 import numpy as np
+
+from qr_sampler.exceptions import EntropyUnavailableError
+
+
+@dataclass(frozen=True, slots=True)
+class DrawMeta:
+    """Per-draw metadata returned alongside a server-integrated ``u``.
+
+    Mirrors the ``qr_purity.DrawResponse`` fields that matter downstream:
+    the temperature layer reads the coherence triple (duck-typed, one-draw
+    lag), and the logging layer copies everything onto the per-token
+    record for audit.
+
+    Attributes:
+        z: Baseline-referenced statistic the server integrated (``u`` is
+            its Phi transform, clamped server-side).
+        coherence_z: Fisher-transformed cross-device coherence statistic;
+            meaningless unless ``coherence_valid``.
+        coherence_valid: ``False`` means the coherence monitor was
+            disabled, stale, or never produced a value — consumers must
+            then ignore ``coherence_z`` and ``coherence_r``.
+        coherence_r: Peak lag-scanned Pearson r behind ``coherence_z``.
+        purity_label: Canonical purity label of the serving source.
+        integrated_bytes: Raw bytes the server integrated into this draw.
+        integrator: Server-side integrator registry name (e.g. ``bit_z``).
+        source_id: The SERVING source id (server-resolved when the request
+            deferred with ``""``).
+        generation_timestamp_ns: Timestamp of the last contributing raw
+            measurement, when the server provides one.
+        echo_verified: ``True`` when the server echoed this draw's
+            commitment nonce back (pipelined path only) — same
+            post-selection causal contract as the byte path.
+    """
+
+    z: float
+    coherence_z: float
+    coherence_valid: bool
+    coherence_r: float
+    purity_label: str
+    integrated_bytes: int
+    integrator: str
+    source_id: str
+    generation_timestamp_ns: int | None = None
+    echo_verified: bool | None = None
 
 
 class EntropySource(ABC):
@@ -37,7 +82,21 @@ class EntropySource(ABC):
     Both hooks have safe defaults: sources without an async transport
     return ``None`` from ``prefetch()`` and fall through to the plain
     synchronous fetch, so callers can treat the capability as optional.
+
+    Server-integrated draw extension
+    --------------------------------
+    ``get_draw()`` / ``prefetch_draw()`` mirror the byte-path pair for
+    servers that expose the ``qr_purity.PurityService`` protocol: the
+    server integrates a raw block itself and returns a single uniform
+    ``u`` plus :class:`DrawMeta`. Sources without draw support keep the
+    defaults (``supports_server_draw = False``, ``get_draw()`` raises
+    ``EntropyUnavailableError``) so the pipeline's degradation path
+    engages transparently.
     """
+
+    #: Whether this source can serve ``get_draw()`` (server-integrated
+    #: draws via the ``qr_purity.PurityService`` protocol).
+    supports_server_draw: ClassVar[bool] = False
 
     @property
     @abstractmethod
@@ -139,6 +198,57 @@ class EntropySource(ABC):
             EntropyUnavailableError: If the source cannot provide bytes.
         """
         return self.get_random_bytes(n)
+
+    def get_draw(
+        self, block_bytes: int, source_id: str, ticket: Any | None = None
+    ) -> tuple[float, DrawMeta]:
+        """Fetch one server-integrated draw ``(u, meta)``.
+
+        Args:
+            block_bytes: Raw block size the server should integrate;
+                ``0`` defers to the server default.
+            source_id: Server-side source id; ``""`` defers to the API
+                key's binding.
+            ticket: Optional ticket from a prior ``prefetch_draw()``
+                call, or ``None`` for a serial fetch.
+
+        Returns:
+            Tuple of the served uniform ``u`` in (0, 1) and its
+            :class:`DrawMeta`.
+
+        Raises:
+            EntropyUnavailableError: Always, in this default
+                implementation — the source has no draw support. The
+                sampling pipeline degrades to the local byte path.
+        """
+        raise EntropyUnavailableError(
+            f"Entropy source {self.name!r} does not support server-integrated draws"
+        )
+
+    def prefetch_draw(
+        self, block_bytes: int, source_id: str, nonce: int | None = None
+    ) -> Any | None:
+        """Begin an asynchronous draw fetch; return an opaque ticket.
+
+        The draw twin of :meth:`prefetch` — fire-and-return, redeemed by
+        passing the ticket to :meth:`get_draw`. The *nonce* rides the
+        ``DrawRequest.sequence_id`` field exactly like the byte path's
+        commitment nonce, preserving the post-selection causal contract.
+
+        Default: returns ``None`` (no draw support). Implementations must
+        never raise and never block — any failure is reported as ``None``
+        so the caller degrades to the serial draw fetch.
+
+        Args:
+            block_bytes: Raw block size for the draw (``0`` = server default).
+            source_id: Server-side source id (``""`` = key binding).
+            nonce: Optional 63-bit commitment nonce (``None``/0 = omit).
+
+        Returns:
+            An opaque ticket object with a ``cancel()`` method, or
+            ``None`` when draw prefetch is unsupported or unavailable.
+        """
+        return None
 
     @abstractmethod
     def close(self) -> None:

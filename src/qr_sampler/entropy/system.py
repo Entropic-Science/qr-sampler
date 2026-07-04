@@ -15,7 +15,7 @@ class SystemEntropySource(EntropySource):
     """``os.urandom()`` wrapper — always available, cryptographically secure.
 
     Suitable as a fallback when the primary QRNG source is unreachable.
-    Not suitable for consciousness-research experiments that require true
+    Not suitable for weak-signal integration experiments that require true
     quantum randomness.
     """
 

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import numpy as np
 
+    from qr_sampler.entropy.base import DrawMeta
     from qr_sampler.logging.types import TokenSamplingRecord
 
 
@@ -38,12 +39,19 @@ class SamplingResult:
             source has no async transport. The engine adapter stores it in
             per-request state and threads it back in via
             ``PrefetchContext.ticket`` on the next step.
+        draw_meta: Metadata of the server-integrated draw that produced
+            this token's ``u`` (server-draw mode only). ``None`` on the
+            local byte-amplification path and when the draw path degraded
+            to fallback bytes. Temperature strategies observe it via the
+            duck-typed ``observe_draw_meta`` hook — the pipeline invokes
+            that directly, so most consumers only need the record fields.
     """
 
     token_id: int
     one_hot: np.ndarray | None
     record: TokenSamplingRecord
     next_ticket: Any | None = None
+    draw_meta: DrawMeta | None = None
 
 
 @dataclass(slots=True)

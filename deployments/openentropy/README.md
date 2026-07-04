@@ -94,8 +94,8 @@ lower memory overhead).
 
 ## When to use this profile
 
-- **Consciousness research**: Study whether intent influences quantum-random
-  processes using native hardware entropy.
+- **Weak-signal integration research**: Study whether small statistical
+  biases in native hardware entropy are detectable end-to-end.
 - **Local experiments**: No network latency, no external dependencies.
 - **Apple Silicon development**: Leverage Metal GPU and native hardware sensors.
 - **Research baseline**: Compare hardware entropy against system entropy

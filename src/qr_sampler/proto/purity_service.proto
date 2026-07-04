@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package qr_purity;
+
+// Server-side integrated draw service (the QPI layer).
+//
+// One draw = one freshly measured raw block, integrated server-side
+// against the source's frozen fingerprint baseline into a z-score and
+// a uniform value u = Phi(z), served together with the device-pair
+// coherence snapshot and the source's canonical purity label.
+//
+// Invariants carried over from the entropy seam:
+//   - sequence_id is echoed verbatim (commitment-nonce echo);
+//   - a success response never carries u outside (0, 1) — the server
+//     clamps to (1e-10, 1 - 1e-10), so u = 0.0 on the wire is
+//     unambiguously "absent";
+//   - coherence_valid = false whenever the coherence gate cannot be
+//     computed (monitor disabled, stale, or never computed) — never a
+//     fake zero.
+
+service PurityService {
+  // Simple request-response (unary mode).
+  rpc GetDraw (DrawRequest) returns (DrawResponse);
+
+  // Persistent bidirectional stream: one response per request.
+  rpc StreamDraws (stream DrawRequest) returns (stream DrawResponse);
+}
+
+message DrawRequest {
+  int64  sequence_id  = 1;  // commitment nonce; echoed verbatim
+  string source_id    = 2;  // source id to integrate over; "" = API key binding
+  uint32 block_bytes  = 3;  // 0 = server default (integration.block_bytes)
+}
+
+message DrawResponse {
+  double u                       = 1;  // Phi(z), clamped to (1e-10, 1-1e-10)
+  double z                       = 2;  // baseline-referenced statistic
+  int64  sequence_id             = 3;  // echoed verbatim
+  uint64 generation_timestamp_ns = 4;  // last contributing raw measurement
+  string source_id               = 5;  // the SERVING source id
+  double coherence_z             = 6;  // Fisher z_c; meaningless unless field 7
+  bool   coherence_valid         = 7;  // false => ignore fields 6 and 11
+  string purity_label            = 8;  // canonical label string (purity.py)
+  uint32 integrated_bytes        = 9;  // raw bytes integrated into this draw
+  string integrator              = 10; // registry name, e.g. "bit_z"
+  double coherence_r             = 11; // peak lag-scanned Pearson r
+}

@@ -19,7 +19,7 @@ description: |
     - Exploring timing-based randomness as a research topic
 
   Not recommended for:
-    - Production consciousness-research experiments (use quantum_grpc or
+    - Production weak-signal integration experiments (use quantum_grpc or
       openentropy instead)
     - High-throughput scenarios (timing measurement adds latency per byte)
 

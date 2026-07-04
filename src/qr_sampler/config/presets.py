@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 PRESET_QTHOUGHT: Final[str] = "qthought"
 PRESET_QTHOUGHT_THINK: Final[str] = "qthought_think"
 PRESET_QTHOUGHT_VOICE: Final[str] = "qthought_voice"
+PRESET_QTHOUGHT_PURITY: Final[str] = "qthought_purity"
 
 # Single source of truth for preset -> field-override mapping.
 # Keys are field names (no ``qr_`` prefix); values are the override values.
@@ -105,6 +106,25 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
     },
+    # Qthought purity lane — server-integrated draws (qr_purity.PurityService)
+    # with the coherence-gated temperature strategy. The server integrates the
+    # raw block and returns (u, z) plus the cross-device coherence statistic;
+    # the gate boosts the inner fixed temperature when the previous draw's
+    # coherence is significant. Fail-safe by construction: a draw failure
+    # degrades to fallback bytes + a local zscore_mean amplifier.
+    PRESET_QTHOUGHT_PURITY: {
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "server",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "fixed",
+        "fixed_temperature": 1.0,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
+        "draw_block_bytes": 0,  # 0 = server default (2 MiB per Amendment 1.3)
+        "top_k": 0,
+        "top_p": 1.0,
+    },
 }
 
 
@@ -168,7 +188,10 @@ def expand_extra_args(
         remaining = {key: value for key, value in extra_args.items() if key != "qr_preset"}
         return resolve_preset(preset_name, remaining)
 
-    if default_config.preset is not None:
+    # Truthiness (not ``is not None``): ``QR_PRESET=""`` in the environment
+    # ingests as ``""``, which must mean "no preset" rather than a hard
+    # ``Unknown preset ''`` error on every request (review fix 2026-07).
+    if default_config.preset:
         return resolve_preset(default_config.preset, extra_args)
 
     return extra_args

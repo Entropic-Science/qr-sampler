@@ -19,7 +19,7 @@ class MockUniformSource(EntropySource):
 
     Usage:
         - **Null hypothesis testing**: ``mean=127.5`` (no bias)
-        - **Consciousness bias simulation**: ``mean=128.0`` (positive bias)
+        - **Weak-signal bias simulation**: ``mean=128.0`` (positive bias)
 
     Args:
         mean: Centre of the normal distribution for byte generation.

@@ -12,7 +12,7 @@ description: |
     - Verifying the full pipeline works before connecting hardware
     - Baseline experiments (pseudorandom control group)
 
-  For consciousness-research experiments requiring true physical randomness,
+  For weak-signal integration experiments requiring true physical randomness,
   use quantum_grpc (with a QRNG server) or openentropy (local hardware noise)
   instead.
 

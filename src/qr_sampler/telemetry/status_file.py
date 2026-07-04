@@ -107,14 +107,31 @@ def _read_json(path: str | None) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+# Coherence-gate keys published by ``write_gate_status``; the fallback
+# writer (``write_entropy_status``) preserves them when rewriting the
+# snapshot so a fallback/recovery transition does not silently erase gate
+# state until the next gate CHANGE (QPI refactor 2026-07 review fix).
+_GATE_STATUS_KEYS = ("gate_open", "gate_boost", "coherence_valid")
+
+
 def write_entropy_status(payload: dict[str, Any]) -> bool:
     """Atomically persist *payload* (plus an ``updated_at`` stamp).
+
+    Preserves any coherence-gate keys (:data:`_GATE_STATUS_KEYS`) already
+    present in the snapshot — the two writers share one file, and each
+    must merge around the other's keys rather than erase them.
 
     Returns ``True`` on success, ``False`` when disabled or on any I/O
     failure. Never raises — this sits on the per-token sampling hot
     path's failure branch and must not add failure modes of its own.
     """
-    return _write_json(status_file_path(), payload)
+    path = status_file_path()
+    existing = _read_json(path)
+    if existing is not None:
+        merged = {key: existing[key] for key in _GATE_STATUS_KEYS if key in existing}
+        merged.update(payload)
+        payload = merged
+    return _write_json(path, payload)
 
 
 def read_entropy_status() -> dict[str, Any] | None:
@@ -126,6 +143,29 @@ def read_entropy_status() -> dict[str, Any] | None:
     NOT as "degraded".
     """
     return _read_json(status_file_path())
+
+
+def write_gate_status(*, gate_open: bool, gate_boost: float, coherence_valid: bool) -> bool:
+    """Merge the latest coherence-gate fields into the entropy-status file.
+
+    QPI refactor 2026-07 (FR-T3 enabler): the sampling pipeline publishes
+    the latest token record's ``gate_open`` / ``gate_boost`` /
+    ``coherence_valid`` (numeric/boolean only — content-free) so an
+    out-of-process consumer (qthought's ``entropy`` event projector) can
+    surface gate state without touching the sampler. Merges into the
+    existing snapshot so the fallback writer's degraded/recovered keys are
+    preserved; ``write_entropy_status`` symmetrically preserves the gate
+    keys, so neither writer erases the other. A genuinely concurrent
+    read-modify-write race can still drop one side's update, which is
+    fail-safe (readers default to a closed gate) and self-heals on the
+    pipeline's gate-status heartbeat. Never raises.
+    """
+    path = status_file_path()
+    payload = _read_json(path) or {}
+    payload["gate_open"] = bool(gate_open)
+    payload["gate_boost"] = float(gate_boost)
+    payload["coherence_valid"] = bool(coherence_valid)
+    return _write_json(path, payload)
 
 
 def write_perf_status(payload: dict[str, Any]) -> bool:

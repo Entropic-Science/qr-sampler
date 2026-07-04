@@ -12,6 +12,7 @@ from qr_sampler.telemetry.status_file import (
     read_perf_status,
     status_file_path,
     write_entropy_status,
+    write_gate_status,
     write_perf_status,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "read_perf_status",
     "status_file_path",
     "write_entropy_status",
+    "write_gate_status",
     "write_perf_status",
 ]

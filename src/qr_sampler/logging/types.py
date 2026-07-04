@@ -10,7 +10,7 @@ class TokenSamplingRecord:
     """Immutable record of a single token sampling event.
 
     Captures all information about one token's sampling pipeline execution
-    for diagnostic analysis and consciousness-influence research.
+    for diagnostic analysis and weak-signal integration research.
 
     Attributes:
         timestamp_ns: Wall-clock time of sampling (nanoseconds since epoch).
@@ -19,7 +19,10 @@ class TokenSamplingRecord:
         entropy_source_used: Name of the entropy source that provided bytes.
         entropy_is_fallback: True if a fallback source was used.
         sample_mean: Mean of raw entropy bytes (expected ~127.5 unbiased).
-        z_score: Z-score from signal amplification.
+            ``math.nan`` on the server-draw path — no byte mean exists
+            when the server integrates the block itself.
+        z_score: Z-score from signal amplification (``draw_z`` on the
+            server-draw path).
         u_value: Uniform value from amplification, in (0, 1).
         temperature_strategy: Name of the temperature strategy used.
         shannon_entropy: Shannon entropy of the logit distribution (nats).
@@ -49,6 +52,23 @@ class TokenSamplingRecord:
             could only exist after the previous token's selection.
         entropy_server_timestamp_ns: Server-reported physical generation
             timestamp (``generation_timestamp_ns``), when provided.
+        draw_z: Server-integrated draw statistic z (server-draw mode only;
+            equals ``z_score`` on the draw path). ``None`` elsewhere.
+        draw_coherence_z: Fisher coherence statistic reported with the
+            draw; meaningless unless ``draw_coherence_valid``.
+        draw_coherence_valid: Whether the server's coherence monitor had a
+            fresh value for this draw (``False``/``None`` => ignore the
+            coherence numbers).
+        draw_coherence_r: Peak lag-scanned Pearson r behind
+            ``draw_coherence_z``.
+        purity_label: Canonical purity label of the serving source.
+        integrated_bytes: Raw bytes the server integrated into this draw.
+        integrator: Server-side integrator registry name (e.g. ``bit_z``).
+        draw_source_id: The SERVING source id echoed by the server.
+        gate_open: Whether the coherence gate applied a positive
+            temperature boost this token (coherence_gate strategy only).
+        gate_boost: The EMA-smoothed temperature boost applied pre-inner
+            strategy (coherence_gate strategy only).
     """
 
     # Timing
@@ -101,3 +121,21 @@ class TokenSamplingRecord:
     temperature_ms: float | None = field(default=None)
     amplify_ms: float | None = field(default=None)
     select_ms: float | None = field(default=None)
+
+    # Server-integrated draw diagnostics (qr_purity.PurityService). ``None``
+    # on the local byte-amplification path (and on the degraded-draw path,
+    # where no DrawMeta exists) so existing consumers stay
+    # backward-compatible — same precedent as the prefetch block above.
+    draw_z: float | None = field(default=None)
+    draw_coherence_z: float | None = field(default=None)
+    draw_coherence_valid: bool | None = field(default=None)
+    draw_coherence_r: float | None = field(default=None)
+    purity_label: str | None = field(default=None)
+    integrated_bytes: int | None = field(default=None)
+    integrator: str | None = field(default=None)
+    draw_source_id: str | None = field(default=None)
+
+    # Coherence-gate temperature diagnostics, copied from the strategy's
+    # TemperatureResult diagnostics when present (coherence_gate only).
+    gate_open: bool | None = field(default=None)
+    gate_boost: float | None = field(default=None)

@@ -101,6 +101,14 @@ class TestExpandExtraArgs:
         defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
         assert expand_extra_args(None, defaults) == {}
 
+    def test_empty_string_preset_means_no_preset(self) -> None:
+        """``QR_PRESET=""`` ingests as ``""`` -- must mean "no preset", not
+        an ``Unknown preset ''`` error on every request (review fix)."""
+        defaults = QRSamplerConfig(_env_file=None, preset="")  # type: ignore[call-arg]
+        extra = {"qr_top_k": 50}
+        assert expand_extra_args(extra, defaults) == {"qr_top_k": 50}
+        assert expand_extra_args(None, defaults) == {}
+
     def test_env_var_preset_picked_up_via_default_config(self) -> None:
         defaults = QRSamplerConfig(  # type: ignore[call-arg]
             _env_file=None,

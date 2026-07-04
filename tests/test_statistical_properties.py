@@ -1,7 +1,7 @@
 """Statistical validation tests for the qr-sampler pipeline.
 
 These tests verify the mathematical properties that make the pipeline
-suitable for consciousness-influence research:
+suitable for weak-signal integration research:
 
 1. **U-value uniformity**: Under the null hypothesis (unbiased entropy),
    the amplified u-values should follow Uniform(0, 1).

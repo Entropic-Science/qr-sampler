@@ -17,6 +17,7 @@ from qr_sampler.config.model import ALL_FIELDS, PER_REQUEST_FIELDS, QRSamplerCon
 from qr_sampler.config.presets import (
     BUILTIN_PRESETS,
     PRESET_QTHOUGHT,
+    PRESET_QTHOUGHT_PURITY,
     PRESET_QTHOUGHT_THINK,
     PRESET_QTHOUGHT_VOICE,
     expand_extra_args,
@@ -29,6 +30,7 @@ __all__ = [
     "BUILTIN_PRESETS",
     "PER_REQUEST_FIELDS",
     "PRESET_QTHOUGHT",
+    "PRESET_QTHOUGHT_PURITY",
     "PRESET_QTHOUGHT_THINK",
     "PRESET_QTHOUGHT_VOICE",
     "QRSamplerConfig",

@@ -29,7 +29,7 @@ hardware.
      -H "Content-Type: application/json" \
      -d '{
        "model": "Qwen/Qwen2.5-1.5B-Instruct",
-       "prompt": "The nature of consciousness is",
+       "prompt": "The nature of randomness is",
        "max_tokens": 50
      }'
    ```
@@ -43,6 +43,16 @@ hardware.
 
 Both containers start together. The entropy server starts first; vLLM waits
 for it via `depends_on`.
+
+> **Preset default & fail-safe:** the compose file defaults to
+> `QR_PRESET=qthought_purity` (server-draw mode). The urandom example server
+> only implements `EntropyService`, so the draw path degrades fail-safe to
+> local byte amplification (`entropy_is_fallback: true` in the records) —
+> everything keeps working. To opt out, set `QR_PRESET` to another preset
+> name (e.g. `qthought_think`) in `.env` — Compose's `${QR_PRESET:-…}`
+> default treats an *empty* value the same as unset, so `QR_PRESET=` does
+> NOT opt out. To run with no preset at all, remove the `QR_PRESET` line
+> from the compose `environment:` block.
 
 ## Switching to bidirectional streaming
 

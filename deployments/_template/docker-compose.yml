@@ -49,6 +49,9 @@ services:
       QR_FALLBACK_MODE: "${QR_FALLBACK_MODE:-system}"
 
       # --- qr-sampler: sampling parameters ---
+      # Server-draw preset by default; degrades fail-safe to local
+      # byte amplification when the server has no PurityService.
+      QR_PRESET: "${QR_PRESET:-qthought_purity}"
       QR_SAMPLE_COUNT: "${QR_SAMPLE_COUNT:-10000}"
       QR_TEMPERATURE_STRATEGY: "${QR_TEMPERATURE_STRATEGY:-fixed}"
       QR_FIXED_TEMPERATURE: "${QR_FIXED_TEMPERATURE:-0.7}"

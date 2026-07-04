@@ -8,7 +8,7 @@ description: |
   CPU timing jitter, memory timing, GPU scheduling, microarchitectural state,
   and more. No network, no API keys, no gRPC server needed.
 
-  This is a strong choice for consciousness-research experiments when a
+  This is a strong choice for weak-signal integration experiments when a
   dedicated QRNG device is not available. The entropy is derived from physical
   hardware processes on the local machine.
 

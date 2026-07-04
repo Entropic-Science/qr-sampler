@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
+import math
 import time
 from typing import TYPE_CHECKING
 
@@ -27,17 +28,25 @@ from qr_sampler.config import QRSamplerConfig
 from qr_sampler.core.types import PrefetchContext, SamplingResult
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.entropy.registry import EntropySourceRegistry
+from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.logging.logger import SamplingLogger
 from qr_sampler.logging.types import TokenSamplingRecord
 from qr_sampler.selection.selector import TokenSelector
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 if TYPE_CHECKING:
-    from qr_sampler.amplification.base import SignalAmplifier
-    from qr_sampler.entropy.base import EntropySource
+    from qr_sampler.amplification.base import AmplificationResult, SignalAmplifier
+    from qr_sampler.entropy.base import DrawMeta, EntropySource
     from qr_sampler.temperature.base import TemperatureStrategy
 
 logger = logging.getLogger("qr_sampler")
+
+# Heartbeat interval for re-publishing an UNCHANGED gate state to the
+# cross-process status file. Readers (qthought's entropy projector) bound
+# staleness on the snapshot's ``updated_at`` stamp; without a heartbeat a
+# steady open gate would look stale and read as closed. Kept slow so the
+# per-token hot path stays write-free in steady state.
+_GATE_STATUS_HEARTBEAT_S = 5.0
 
 
 def derive_commit_nonce(salt: bytes, step: int, prev_token_id: int) -> int:
@@ -230,6 +239,18 @@ class SamplingPipeline:
         self._sampling_logger = sampling_logger
         self._config = config
         self._default_config_hash = config_hash(config)
+        # Lazily-built local zscore_mean amplifier for the degraded
+        # server-draw path (see ``_draw_fallback_amplifier``), keyed by the
+        # config fields it freezes so a per-request override cannot poison
+        # the cache for later requests.
+        self._draw_fallback_amp: SignalAmplifier | None = None
+        self._draw_fallback_amp_key: tuple[float, float, float] | None = None
+        # Last (gate_open, gate_boost, coherence_valid) published to the
+        # cross-process status file — writes happen only on change (plus a
+        # slow heartbeat so readers can apply a staleness bound) so the
+        # hot path never pays a file write per token in steady state.
+        self._last_gate_status: tuple[bool, float, bool] | None = None
+        self._last_gate_write_monotonic: float = 0.0
 
     def sample_token(
         self,
@@ -286,31 +307,76 @@ class SamplingPipeline:
         min_p = float(temp_result.diagnostics.get("min_p", active_config.min_p_base))
 
         # --- 2. Collect entropy (pipelined redeem or serial just-in-time) ---
+        # Two shapes: the local byte path (fetch bytes, amplify locally)
+        # and the server-draw path (one PurityService round trip returns
+        # the uniform u directly, so stages 2-3 collapse into the fetch).
         t_fetch_start = time.perf_counter_ns()
         entropy_is_fallback = False
         entropy_source_name = self._entropy_source.name
         ticket = prefetch_ctx.ticket if prefetch_ctx is not None else None
 
-        if ticket is not None:
+        draw_mode = bool(getattr(active_amplifier, "requires_server_draw", False))
+        draw_meta: DrawMeta | None = None
+        raw_bytes: bytes | None = None
+        u_value: float = 0.0  # always overwritten below
+
+        if draw_mode:
+            try:
+                u_value, draw_meta = self._entropy_source.get_draw(
+                    active_config.draw_block_bytes,
+                    active_config.draw_source_id,
+                    ticket,
+                )
+            except EntropyUnavailableError:
+                if active_config.fallback_mode == "error":
+                    raise
+                # Degrade fail-safe: fallback BYTES + a local zscore_mean
+                # amplifier (built lazily below). draw_meta stays None and
+                # the observe_draw_meta hook below fires with None, so a
+                # coherence-gate strategy clears its stored evidence and
+                # holds exactly T_base — a dead PurityService yields a
+                # boring base-temperature model, never a fabricated signal.
+                raw_bytes = self._entropy_source.get_random_bytes(active_config.sample_count)
+        elif ticket is not None:
             raw_bytes = self._entropy_source.get_random_bytes_with_ticket(
                 active_config.sample_count, ticket
             )
         else:
             raw_bytes = self._entropy_source.get_random_bytes(active_config.sample_count)
 
-        # Detect if fallback was used.
-        if isinstance(self._entropy_source, FallbackEntropySource):
+        # Detect if fallback was used (byte fetches only — the wrapper's
+        # bookkeeping means "who provided BYTES"; draws are primary-only).
+        if raw_bytes is not None and isinstance(self._entropy_source, FallbackEntropySource):
             entropy_source_name = self._entropy_source.last_source_used
             entropy_is_fallback = (
                 self._entropy_source.last_source_used != self._entropy_source.primary_name
             )
+        if draw_mode and raw_bytes is not None:
+            # The draw itself failed: this token is degraded regardless of
+            # which source ultimately provided the substitute bytes.
+            entropy_is_fallback = True
 
         t_fetch_end = time.perf_counter_ns()
         entropy_fetch_ms = (t_fetch_end - t_fetch_start) / 1_000_000.0
 
-        # --- 3. Amplify to uniform float ---
+        # Duck-typed strategy hook (precedent: ``begin_thought``). Fired
+        # after EVERY draw-mode fetch — with the DrawMeta on success, with
+        # None on a degraded draw (clearing stale evidence so an outage
+        # hard-resets the gate). Since temperature is stage 1, meta
+        # observed at token t first affects token t+1 — the one-draw lag
+        # is structural, not simulated.
+        if draw_mode and hasattr(active_strategy, "observe_draw_meta"):
+            active_strategy.observe_draw_meta(draw_meta)
+
+        # --- 3. Amplify to uniform float (byte path only) ---
         t_stage = time.perf_counter_ns()
-        amp_result = active_amplifier.amplify(raw_bytes)
+        amp_result: AmplificationResult | None = None
+        if raw_bytes is not None:
+            local_amplifier = (
+                self._draw_fallback_amplifier(active_config) if draw_mode else active_amplifier
+            )
+            amp_result = local_amplifier.amplify(raw_bytes)
+            u_value = amp_result.u
         amplify_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 
         # --- 4. Select token via CDF ---
@@ -320,7 +386,7 @@ class SamplingPipeline:
             temp_result.temperature,
             active_config.top_k,
             active_config.top_p,
-            amp_result.u,
+            u_value,
             min_p=min_p,
         )
         select_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
@@ -336,7 +402,18 @@ class SamplingPipeline:
             next_nonce = derive_commit_nonce(
                 prefetch_ctx.salt, prefetch_ctx.step + 1, selection.token_id
             )
-            next_ticket = self._entropy_source.prefetch(active_config.sample_count, next_nonce)
+            if draw_mode:
+                # Same commitment chain, draw-shaped request. Fired even on
+                # a degraded token: prefetch_draw never raises, and the next
+                # token then retries the draw path (serially if this yields
+                # None), so recovery is automatic.
+                next_ticket = self._entropy_source.prefetch_draw(
+                    active_config.draw_block_bytes,
+                    active_config.draw_source_id,
+                    next_nonce,
+                )
+            else:
+                next_ticket = self._entropy_source.prefetch(active_config.sample_count, next_nonce)
 
         # --- 6. Build one-hot numpy array (optional) ---
         one_hot: np.ndarray | None = None
@@ -356,6 +433,18 @@ class SamplingPipeline:
         echo_verified = getattr(ticket, "echo_verified", None) if ticket is not None else None
         server_ts_ns = getattr(ticket, "server_timestamp_ns", None) if ticket is not None else None
 
+        # Amplification statistics: byte path from the amplifier's
+        # diagnostics; draw path from the server's DrawMeta. On the draw
+        # path no byte mean exists, so sample_mean is the documented
+        # ``math.nan`` sentinel and z_score is the server-integrated z.
+        if amp_result is not None:
+            sample_mean = float(amp_result.diagnostics.get("sample_mean", 0.0))
+            z_score = float(amp_result.diagnostics.get("z_score", 0.0))
+        else:
+            assert draw_meta is not None  # draw succeeded: u_value + meta set
+            sample_mean = math.nan
+            z_score = draw_meta.z
+
         # Optional HVH-Drift / preset diagnostics. ``.get`` returns ``None``
         # for non-HVH strategies and pre-Step-2 selectors that omit min_p_used.
         temp_diag = temp_result.diagnostics
@@ -365,9 +454,9 @@ class SamplingPipeline:
             total_sampling_ms=total_sampling_ms,
             entropy_source_used=entropy_source_name,
             entropy_is_fallback=entropy_is_fallback,
-            sample_mean=amp_result.diagnostics.get("sample_mean", 0.0),
-            z_score=amp_result.diagnostics.get("z_score", 0.0),
-            u_value=amp_result.u,
+            sample_mean=sample_mean,
+            z_score=z_score,
+            u_value=u_value,
             temperature_strategy=active_config.temperature_strategy,
             shannon_entropy=temp_result.shannon_entropy,
             temperature_used=temp_result.temperature,
@@ -388,17 +477,83 @@ class SamplingPipeline:
             temperature_ms=temperature_ms,
             amplify_ms=amplify_ms,
             select_ms=select_ms,
+            draw_z=draw_meta.z if draw_meta is not None else None,
+            draw_coherence_z=draw_meta.coherence_z if draw_meta is not None else None,
+            draw_coherence_valid=draw_meta.coherence_valid if draw_meta is not None else None,
+            draw_coherence_r=draw_meta.coherence_r if draw_meta is not None else None,
+            purity_label=draw_meta.purity_label if draw_meta is not None else None,
+            integrated_bytes=draw_meta.integrated_bytes if draw_meta is not None else None,
+            integrator=draw_meta.integrator if draw_meta is not None else None,
+            draw_source_id=draw_meta.source_id if draw_meta is not None else None,
+            gate_open=temp_diag.get("gate_open"),
+            gate_boost=temp_diag.get("gate_boost"),
         )
 
         # --- 8. Log ---
         self._sampling_logger.log_token(record)
+        self._publish_gate_status(record)
 
         return SamplingResult(
             token_id=selection.token_id,
             one_hot=one_hot,
             record=record,
             next_ticket=next_ticket,
+            draw_meta=draw_meta,
         )
+
+    def _publish_gate_status(self, record: TokenSamplingRecord) -> None:
+        """Publish the latest gate fields to the cross-process status file.
+
+        FR-T3 enabler: only active when a coherence gate produced gate
+        diagnostics (``record.gate_open is not None``); writes on state
+        change plus a slow heartbeat (``_GATE_STATUS_HEARTBEAT_S``) so
+        out-of-process readers can treat an old ``updated_at`` stamp as
+        stale (a dead sampler must not leave ``gate_open: true`` behind
+        forever). ``write_gate_status`` itself never raises — telemetry
+        must not add failure modes to the sampling hot path.
+        """
+        if record.gate_open is None:
+            return
+        current = (
+            bool(record.gate_open),
+            float(record.gate_boost or 0.0),
+            bool(record.draw_coherence_valid or False),
+        )
+        now = time.monotonic()
+        heartbeat_due = now - self._last_gate_write_monotonic >= _GATE_STATUS_HEARTBEAT_S
+        if current == self._last_gate_status and not heartbeat_due:
+            return
+        from qr_sampler.telemetry.status_file import write_gate_status
+
+        write_gate_status(
+            gate_open=current[0],
+            gate_boost=current[1],
+            coherence_valid=current[2],
+        )
+        self._last_gate_status = current
+        self._last_gate_write_monotonic = now
+
+    def _draw_fallback_amplifier(self, config: QRSamplerConfig) -> SignalAmplifier:
+        """The lazily-built local amplifier for the degraded draw path.
+
+        A plain config-derived ``zscore_mean``, cached on the pipeline —
+        the degradation path must not pay a construction per token during
+        a sustained PurityService outage. The cache is keyed by the config
+        fields ``ZScoreMeanAmplifier`` freezes at construction, so a
+        per-request override that happens to degrade first cannot poison
+        the amplifier used by later (differently-configured) requests.
+        """
+        key = (
+            float(config.population_mean),
+            float(config.population_std),
+            float(config.uniform_clamp_epsilon),
+        )
+        if self._draw_fallback_amp is None or self._draw_fallback_amp_key != key:
+            from qr_sampler.amplification.zscore import ZScoreMeanAmplifier
+
+            self._draw_fallback_amp = ZScoreMeanAmplifier(config)
+            self._draw_fallback_amp_key = key
+        return self._draw_fallback_amp
 
     @property
     def entropy_source(self) -> EntropySource:

@@ -437,6 +437,12 @@ class TestFieldSets:
                 "hvh_kappa_h",
                 "hvh_nu_dh",
                 "min_p_base",
+                "draw_source_id",
+                "draw_block_bytes",
+                "coherence_threshold",
+                "coherence_t_boost_max",
+                "coherence_ema_alpha",
+                "coherence_inner_strategy",
             }
         )
         assert intended == PER_REQUEST_FIELDS

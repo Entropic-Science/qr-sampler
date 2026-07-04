@@ -20,7 +20,7 @@ Rules for anyone editing this file:
   removed name, a changed signature, a changed field set) — qthought's
   ``qr_qthought.__init__`` asserts this value at import and fails loudly on
   a mismatch, so a stale sibling checkout cannot silently drift.
-* ``tests/test_contract.py`` pins ``__all__``, the three qthought preset
+* ``tests/test_contract.py`` pins ``__all__``, the qthought preset
   dicts, and the ``QthoughtRoller`` / ``ChoiceProvenance`` shapes this module
   re-exports — it is the drift guard for everything below.
 """
@@ -30,6 +30,7 @@ from __future__ import annotations
 from qr_sampler.config import (
     BUILTIN_PRESETS,
     PRESET_QTHOUGHT,
+    PRESET_QTHOUGHT_PURITY,
     PRESET_QTHOUGHT_THINK,
     PRESET_QTHOUGHT_VOICE,
     QRSamplerConfig,
@@ -62,6 +63,7 @@ __all__ = [  # noqa: RUF022 -- grouped by concern (roller/config/entropy/excepti
     "PRESET_QTHOUGHT",
     "PRESET_QTHOUGHT_THINK",
     "PRESET_QTHOUGHT_VOICE",
+    "PRESET_QTHOUGHT_PURITY",
     # entropy primitives
     "EntropySource",
     "MockUniformSource",

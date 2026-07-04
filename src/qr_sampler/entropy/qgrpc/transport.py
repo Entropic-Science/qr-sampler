@@ -6,6 +6,11 @@ package's single wire format) plus the three transport modes:
 - **Unary**: simple request-response. One HTTP/2 stream per call.
 - **Server streaming**: one config request, one streamed response per call.
 - **Bidirectional streaming**: persistent stream with response correlation.
+
+Two RPC shapes ride this transport: the byte fetch (``EntropyService``)
+and the server-integrated draw fetch (``PurityService`` — unary and bidi
+only; draws define no server-streaming shape). Both share the channel,
+circuit breaker, and pre-probe owned by the source.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.proto.entropy_service_pb2 import EntropyRequest, EntropyResponse
+from qr_sampler.proto.purity_service_pb2 import DrawRequest, DrawResponse
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -82,6 +88,44 @@ def decode_reply(raw: bytes) -> tuple[bytes, int, int]:
     return msg.data, msg.sequence_id, msg.generation_timestamp_ns
 
 
+def encode_draw_request(source_id: str, block_bytes: int, nonce: int = 0) -> bytes:
+    """Encode one server-integrated draw request (``qr_purity.DrawRequest``).
+
+    The commitment *nonce* rides in ``sequence_id`` (field 1) exactly like
+    the byte path's :func:`encode_request`; per proto3 semantics zero values
+    are omitted from the wire. ``source_id = ""`` and ``block_bytes = 0``
+    defer to the server (API-key binding / ``integration.block_bytes``).
+    """
+    return DrawRequest(
+        sequence_id=nonce, source_id=source_id, block_bytes=block_bytes
+    ).SerializeToString()
+
+
+def decode_draw_reply(raw: bytes) -> DrawResponse:
+    """Decode one draw response into a ``qr_purity.DrawResponse``.
+
+    A success response never carries ``u`` outside (0, 1) — the server
+    clamps to ``(1e-10, 1 - 1e-10)`` — so an absent field 1 (which decodes
+    as exactly ``0.0`` under proto3 default omission) unambiguously means
+    "no draw served".
+
+    Args:
+        raw: Raw protobuf wire-format bytes.
+
+    Returns:
+        The decoded ``DrawResponse``.
+
+    Raises:
+        EntropyUnavailableError: If ``u`` (field 1) is absent or 0.
+    """
+    msg = DrawResponse.FromString(raw)
+    if msg.u == 0.0:
+        raise EntropyUnavailableError(
+            "Failed to decode gRPC draw response: field 1 (u) absent or 0"
+        )
+    return msg
+
+
 class _FetchReply:
     """Decoded result of one entropy fetch, with true call latency.
 
@@ -106,6 +150,33 @@ class _FetchReply:
         self.elapsed_ms = elapsed_ms
 
 
+class _DrawFetchReply:
+    """Decoded result of one server-integrated draw fetch.
+
+    ``elapsed_ms`` is measured inside the background-loop coroutine —
+    request write to response decode — exactly like :class:`_FetchReply`,
+    so the circuit breaker times draw fetches like byte fetches.
+    """
+
+    __slots__ = ("elapsed_ms", "response")
+
+    def __init__(self, response: DrawResponse, elapsed_ms: float) -> None:
+        self.response = response
+        self.elapsed_ms = elapsed_ms
+
+
+def _decode_entropy_frame(raw: bytes) -> tuple[tuple[bytes, int, int], int]:
+    """Bidi frame decoder for the byte path: (result, correlation seq)."""
+    payload, seq, gen_ts = decode_reply(raw)
+    return (payload, seq, gen_ts), seq
+
+
+def _decode_draw_frame(raw: bytes) -> tuple[DrawResponse, int]:
+    """Bidi frame decoder for the draw path: (result, correlation seq)."""
+    msg = decode_draw_reply(raw)
+    return msg, msg.sequence_id
+
+
 class _BidiSession:
     """One persistent bidirectional stream with response correlation.
 
@@ -119,20 +190,31 @@ class _BidiSession:
     per-stream ordering. This replaces the previous write-then-read
     pattern, which interleaved incorrectly when more than one fetch was
     in flight (a state the pipelined prefetch path makes routine).
+
+    The correlation machinery is frame-agnostic: *decode* turns one raw
+    response frame into ``(result, sequence_id)``, so the same session
+    class serves both the byte stream (:func:`_decode_entropy_frame`)
+    and the draw stream (:func:`_decode_draw_frame`).
     """
 
-    def __init__(self, call: Any, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        call: Any,
+        loop: asyncio.AbstractEventLoop,
+        decode: Callable[[bytes], tuple[Any, int]] = _decode_entropy_frame,
+    ) -> None:
         self._call = call
         self._loop = loop
+        self._decode = decode
         self._write_lock = asyncio.Lock()
         # Insertion-ordered: doubles as the FIFO queue for no-echo servers.
-        self._pending: dict[int, asyncio.Future[tuple[bytes, int, int]]] = {}
+        self._pending: dict[int, asyncio.Future[Any]] = {}
         self._fifo_counter = 0  # synthetic keys for nonce-less requests
         self.dead = False
         self._reader_task = loop.create_task(self._read_loop())
 
-    async def request(self, n: int, nonce: int) -> tuple[bytes, int, int]:
-        """Send one entropy request and await its correlated response."""
+    async def request(self, request_bytes: bytes, nonce: int) -> Any:
+        """Send one pre-encoded request and await its correlated response."""
         if self.dead:
             raise EntropyUnavailableError("Bidi stream is closed")
         key = nonce
@@ -141,11 +223,11 @@ class _BidiSession:
             # (which are positive 63-bit values).
             self._fifo_counter -= 1
             key = self._fifo_counter
-        fut: asyncio.Future[tuple[bytes, int, int]] = self._loop.create_future()
+        fut: asyncio.Future[Any] = self._loop.create_future()
         self._pending[key] = fut
         try:
             async with self._write_lock:
-                await self._call.write(encode_request(n, nonce))
+                await self._call.write(request_bytes)
         except Exception:
             self._pending.pop(key, None)
             raise
@@ -159,14 +241,14 @@ class _BidiSession:
                 if raw is None:
                     error = EntropyUnavailableError("Bidi stream ended unexpectedly")
                     break
-                payload, seq, gen_ts = decode_reply(raw)
+                result, seq = self._decode(raw)
                 fut = self._pending.pop(seq, None) if seq else None
                 if fut is None and self._pending:
                     # No echo (or unknown echo): FIFO-match oldest pending.
                     oldest_key = next(iter(self._pending))
                     fut = self._pending.pop(oldest_key)
                 if fut is not None and not fut.done():
-                    fut.set_result((payload, seq, gen_ts))
+                    fut.set_result(result)
                 # else: response for a cancelled/unknown request — drop.
         except Exception as exc:  # reader died — fail everything pending
             error = exc
@@ -210,6 +292,7 @@ class GrpcTransport:
         self._timeout_ms = timeout_ms_provider
         # Streaming state (lazily initialized on the loop thread).
         self._bidi_session: _BidiSession | None = None
+        self._draw_bidi_session: _BidiSession | None = None
 
     async def fetch(self, n: int, nonce: int = 0) -> _FetchReply:
         """Route to the appropriate transport mode; measure true call time.
@@ -283,7 +366,8 @@ class GrpcTransport:
                 assert loop is not None  # running on the loop already
                 session = _BidiSession(call, loop)
                 self._bidi_session = session
-            return await session.request(n, nonce)
+            result: tuple[bytes, int, int] = await session.request(encode_request(n, nonce), nonce)
+            return result
         except EntropyUnavailableError:
             self._bidi_session = None
             raise
@@ -292,12 +376,87 @@ class GrpcTransport:
             self._bidi_session = None
             raise
 
+    # --- Server-integrated draws (PurityService) ---
+
+    async def fetch_draw(self, source_id: str, block_bytes: int, nonce: int = 0) -> _DrawFetchReply:
+        """Fetch one server-integrated draw; measure true call time.
+
+        Dispatches on the same ``mode`` string as :meth:`fetch`. Draws
+        define no server-streaming shape, so ``server_streaming`` mode
+        raises rather than silently degrading.
+        """
+        t0 = time.perf_counter()
+        if self._mode == "unary":
+            response = await self._fetch_draw_unary(source_id, block_bytes, nonce)
+        elif self._mode == "bidi_streaming":
+            response = await self._fetch_draw_bidi(source_id, block_bytes, nonce)
+        else:
+            raise EntropyUnavailableError(
+                f"gRPC mode {self._mode!r} does not support draws "
+                "(draws define no server-streaming shape)"
+            )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return _DrawFetchReply(response, elapsed_ms)
+
+    async def _fetch_draw_unary(self, source_id: str, block_bytes: int, nonce: int) -> DrawResponse:
+        """Single draw request-response per call."""
+        draw_method = self._channel.draw_unary_method
+        if draw_method is None:
+            raise EntropyUnavailableError(
+                "Draw method not initialized (grpc_draw_method_path is empty)"
+            )
+        request_bytes = encode_draw_request(source_id, block_bytes, nonce)
+        timeout_s = self._timeout_ms() / 1000.0
+        raw_response: bytes = await draw_method(
+            request_bytes,
+            timeout=timeout_s,
+            metadata=self._metadata or None,
+        )
+        return decode_draw_reply(raw_response)
+
+    async def _fetch_draw_bidi(self, source_id: str, block_bytes: int, nonce: int) -> DrawResponse:
+        """Fetch one draw over a persistent, correlation-safe bidi stream.
+
+        A second :class:`_BidiSession` (draw frame codec) rides the draw
+        stream handle; correlation semantics are identical to the byte
+        path's session. If the stream breaks, the session is discarded
+        and re-established on the next call.
+        """
+        try:
+            session = self._draw_bidi_session
+            if session is None or session.dead:
+                draw_stream_method = self._channel.draw_stream_method
+                if draw_stream_method is None:
+                    raise EntropyUnavailableError(
+                        "Draw stream method not initialized (grpc_draw_stream_method_path is empty)"
+                    )
+                call = draw_stream_method(metadata=self._metadata or None)
+                loop = self._channel.loop
+                assert loop is not None  # running on the loop already
+                session = _BidiSession(call, loop, decode=_decode_draw_frame)
+                self._draw_bidi_session = session
+            response: DrawResponse = await session.request(
+                encode_draw_request(source_id, block_bytes, nonce), nonce
+            )
+            return response
+        except EntropyUnavailableError:
+            self._draw_bidi_session = None
+            raise
+        except Exception:
+            # Stream broken — reset for next call.
+            self._draw_bidi_session = None
+            raise
+
     def clear_bidi(self) -> None:
-        """Forget the bidi session (after a channel reset tore down its loop)."""
+        """Forget the bidi sessions (after a channel reset tore down their loop)."""
         self._bidi_session = None
+        self._draw_bidi_session = None
 
     def close_bidi(self) -> None:
-        """Shut down the bidi session, if any. Loop-thread only."""
+        """Shut down the bidi sessions, if any. Loop-thread only."""
         if self._bidi_session is not None:
             self._bidi_session.close()
             self._bidi_session = None
+        if self._draw_bidi_session is not None:
+            self._draw_bidi_session.close()
+            self._draw_bidi_session = None

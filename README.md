@@ -22,11 +22,11 @@ Standard LLM inference uses pseudorandom number generators (PRNGs) for token sam
 - **Your own source** — implement the `EntropySource` ABC or connect any hardware via the gRPC protocol
 - **OS entropy** — `os.urandom()` as a fallback or baseline
 
-### Consciousness-research context
+### Research context: entropy purity and integrity verification
 
-qr-sampler provides infrastructure for studying whether conscious intent can influence quantum-random processes in LLM token selection. The signal amplification system converts thousands of random bytes into a single token choice, designed so that even a tiny statistical bias (e.g. a small shift in byte means) produces a measurable effect on which token gets selected. All entropy is generated **just-in-time** — the quantum measurement happens *after* logits are computed, never before.
+qr-sampler provides infrastructure for weak-signal integration experiments: studying whether tiny statistical biases in physical entropy sources produce measurable effects on LLM token selection. The signal amplification system converts thousands of random bytes into a single token choice, designed so that even a small shift in byte means produces a detectable shift in which token gets selected. All entropy is generated **just-in-time** — the physical measurement happens *after* logits are computed, never before. In server-draw mode (see below), integration happens server-side and each draw arrives with purity and integrity labels attached.
 
-This is a research tool. It makes no claims about consciousness or quantum mechanics — it provides the infrastructure to run rigorous experiments.
+This is a research tool. It makes no claims beyond statistics — it provides the infrastructure to run rigorous experiments. The research narrative behind the QPI (quantum purity and integrity) layer lives in the [Qbert0G](https://github.com/Entropic-Science/Qbert0G) README.
 
 ---
 
@@ -136,7 +136,7 @@ curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-1.5B-Instruct",
-    "prompt": "The nature of consciousness is",
+    "prompt": "The nature of randomness is",
     "max_tokens": 100
   }'
 ```
@@ -344,6 +344,20 @@ Empirical CDF amplifier with online calibration (`QR_ECDF_CALIBRATION_SAMPLES`, 
 
 Used by the qthought decode lane: per-decision draws stay plain `zscore_mean`, while a per-thought aggregate bias statistic rides alongside. See `qr-sampler info amplifier zscore_thought`.
 
+### Server-side integrated draw (`server`) — server-draw mode
+
+With `qr_signal_amplifier_type: "server"`, the client does not fetch raw bytes at all. Instead it calls the `qr_purity.PurityService` gRPC protocol (served by [Qbert0G](https://github.com/Entropic-Science/Qbert0G) ≥ the QPI release, on the same socket as `EntropyService`): the *server* reads a block of device entropy (2 MiB by default), integrates it against a frozen device fingerprint, and returns one externally supplied uniform draw `u` plus metadata — the integration z-score, a purity label (`origin/integrity/processing[/...]` taxonomy), the block-coherence statistic `(coherence_r, coherence_z, coherence_valid)`, the integrator name, and the number of integrated bytes. The pipeline records all of it as a `DrawMeta` on the `SamplingResult` and the token record.
+
+Properties:
+
+- **Same causal contract** — the draw request carries the commit-then-fetch nonce in `sequence_id`, echo-verified exactly like the byte path; prefetch works identically.
+- **Fail-safe degradation** — if the server does not implement `PurityService` (or the draw fails), the pipeline falls back to fetching `qr_sample_count` bytes and amplifying locally with `zscore_mean`; the record shows `entropy_is_fallback: true` and no `DrawMeta`. An EntropyService-only server keeps working unmodified.
+- **Configuration** — `qr_draw_source_id` (empty = the API key's bound source) and `qr_draw_block_bytes` (`0` = server default) select what the server integrates.
+
+### Coherence gate (`coherence_gate` temperature strategy)
+
+Not an amplifier, but the consumer of the draw metadata: see Temperature strategies below.
+
 ---
 
 ## Temperature strategies
@@ -368,11 +382,28 @@ High-entropy (uncertain) distributions get higher temperatures; low-entropy (con
 
 Stateful per-request strategy tracking EMAs of Shannon entropy (H) and varentropy (VH); the drift between current and EMA values drives temperature and dynamic min-p adjustments token-by-token. Shipped via the `creative_sampling` preset.
 
+### Coherence gate (`coherence_gate`)
+
+A wrapper strategy for server-draw mode: it composes an inner strategy (`qr_coherence_inner_strategy`, default `fixed`) and adds a temperature boost when the *previous* token's draw reported significant device coherence:
+
+```
+b   = coherence_t_boost_max * max(0, coherence_r)   if coherence_valid and coherence_z >= coherence_threshold, else 0
+b̄   ← ema_alpha * b + (1 - ema_alpha) * b̄            # EMA smoothing
+T   = inner_strategy(T_base + b̄)                     # boost applied to the inner strategy's base temperature
+```
+
+Key properties:
+
+- **Lag-by-one**: token *N*'s temperature reacts to token *N-1*'s draw metadata (the draw for token *N* happens after logits — and after the temperature — are computed).
+- **Fail-safe**: no draw metadata, first token, malformed metadata, `coherence_valid=false`, or any inner-strategy hiccup under boost ⇒ exactly the unboosted base temperature. The gate can only ever *add* temperature, never corrupt sampling.
+- **Labelling**: diagnostics gain `gate_open`, `gate_boost`, `coherence_z`, `coherence_valid`, which flow into the token record (and the cross-process status file) — so every sampled token is labelled with whether the gate was open.
+- Knobs: `qr_coherence_threshold` (default 3.5), `qr_coherence_t_boost_max` (0.5), `qr_coherence_ema_alpha` (0.3), `qr_coherence_inner_strategy` (`fixed`).
+
 ---
 
 ## Presets
 
-A preset is a named bundle of `qr_*` overrides that callers opt into via `qr_preset` (per-request) or `QR_PRESET` (env var, process-wide default). Five ship built in:
+A preset is a named bundle of `qr_*` overrides that callers opt into via `qr_preset` (per-request) or `QR_PRESET` (env var, process-wide default). Six ship built in:
 
 | Preset | What it does | Status |
 |---|---|---|
@@ -381,8 +412,9 @@ A preset is a named bundle of `qr_*` overrides that callers opt into via `qr_pre
 | `qthought` | Entropy profile for the `QthoughtRoller` decode lane (quantum source + `zscore_thought`) | Frozen research lineage |
 | `qthought_think` | REFLECT sampling lane for qr-llm-qthought (hotter HVH-drift, 6,000-byte fetch) | Frozen research lineage |
 | `qthought_voice` | SPEAK sampling lane for qr-llm-qthought (EDT + nucleus/top-k, 10,000-byte fetch) | Frozen research lineage |
+| `qthought_purity` | Server-draw mode: `server` amplifier + `coherence_gate` over `fixed` at T=1 (PurityService required; degrades fail-safe) | QPI default composition |
 
-The three `qthought*` presets are scientific lineage consumed by the sibling [qr-llm-qthought](https://github.com/Entropic-Science/LiveLM-backend) service — their values are pinned by contract tests on both sides. Do not tune them casually.
+The three historical `qthought*` presets are scientific lineage consumed by the sibling [qr-llm-qthought](https://github.com/Entropic-Science/LiveLM-backend) service — their values are pinned by contract tests on both sides. Do not tune them casually.
 
 ```bash
 # Process-wide
@@ -391,7 +423,7 @@ QR_PRESET=creative_sampling vllm serve Qwen/Qwen2.5-1.5B-Instruct
 # Per-request
 curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
   "model": "Qwen/Qwen2.5-1.5B-Instruct",
-  "prompt": "The nature of consciousness is",
+  "prompt": "The nature of randomness is",
   "max_tokens": 100,
   "extra_args": {"qr_preset": "creative_sampling"}
 }'
@@ -416,7 +448,7 @@ curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-1.5B-Instruct",
-    "prompt": "The nature of consciousness is",
+    "prompt": "The nature of randomness is",
     "max_tokens": 100,
     "extra_args": {
       "qr_temperature_strategy": "edt",
@@ -446,6 +478,8 @@ All configuration is done via environment variables with the `QR_` prefix (a `.e
 | `QR_GRPC_MODE` | `unary` | Transport mode: `unary`, `server_streaming`, `bidi_streaming` |
 | `QR_GRPC_METHOD_PATH` | `/qr_entropy.EntropyService/GetEntropy` | gRPC method path for unary RPC |
 | `QR_GRPC_STREAM_METHOD_PATH` | `/qr_entropy.EntropyService/StreamEntropy` | Streaming method path (empty disables streaming) |
+| `QR_GRPC_DRAW_METHOD_PATH` | `/qr_purity.PurityService/GetDraw` | Unary server-integrated draw method path (empty disables the draw handle) |
+| `QR_GRPC_DRAW_STREAM_METHOD_PATH` | `/qr_purity.PurityService/StreamDraws` | Bidi-streaming draw method path (empty disables the draw stream handle) |
 | `QR_GRPC_API_KEY` | *(empty)* | API key sent via gRPC metadata (empty = no auth; never logged) |
 | `QR_GRPC_API_KEY_HEADER` | `api-key` | gRPC metadata header name for the API key |
 | `QR_FALLBACK_MODE` | `system` | Fallback when primary fails: `error`, `system`, `mock_uniform` |
@@ -478,12 +512,18 @@ Environment-only settings (read outside the config model):
 |---|---|---|---|
 | `QR_ENTROPY_SOURCE_TYPE` | `qr_entropy_source_type` | `system` | Entropy source for this request (must be pre-initialised) |
 | `QR_ENTROPY_PREFETCH` | `qr_entropy_prefetch` | `true` | Pipelined commit-then-fetch prefetch |
-| `QR_SIGNAL_AMPLIFIER_TYPE` | `qr_signal_amplifier_type` | `zscore_mean` | Signal amplification algorithm |
+| `QR_SIGNAL_AMPLIFIER_TYPE` | `qr_signal_amplifier_type` | `zscore_mean` | Signal amplification algorithm (`server` = server-draw mode) |
+| `QR_DRAW_SOURCE_ID` | `qr_draw_source_id` | *(empty)* | Source id for server-integrated draws (empty = server's API-key binding) |
+| `QR_DRAW_BLOCK_BYTES` | `qr_draw_block_bytes` | `0` | Raw block size for server-integrated draws (`0` = server default) |
 | `QR_SAMPLE_COUNT` | `qr_sample_count` | `10000` | Entropy bytes fetched per token |
 | `QR_POPULATION_MEAN` | `qr_population_mean` | `127.5` | Null-hypothesis mean for byte values |
 | `QR_POPULATION_STD` | `qr_population_std` | `73.612...` | Population std for uniform [0, 255] |
 | `QR_UNIFORM_CLAMP_EPSILON` | `qr_uniform_clamp_epsilon` | `1e-10` | Clamp u to avoid degenerate CDF |
-| `QR_TEMPERATURE_STRATEGY` | `qr_temperature_strategy` | `fixed` | Strategy: `fixed`, `edt`, `hvh_drift` |
+| `QR_TEMPERATURE_STRATEGY` | `qr_temperature_strategy` | `fixed` | Strategy: `fixed`, `edt`, `hvh_drift`, `coherence_gate` |
+| `QR_COHERENCE_THRESHOLD` | `qr_coherence_threshold` | `3.5` | Minimum `coherence_z` for the gate to open |
+| `QR_COHERENCE_T_BOOST_MAX` | `qr_coherence_t_boost_max` | `0.5` | Max temperature boost at `coherence_r = 1` |
+| `QR_COHERENCE_EMA_ALPHA` | `qr_coherence_ema_alpha` | `0.3` | EMA smoothing for the gate boost |
+| `QR_COHERENCE_INNER_STRATEGY` | `qr_coherence_inner_strategy` | `fixed` | Inner strategy the coherence gate composes over |
 | `QR_FIXED_TEMPERATURE` | `qr_fixed_temperature` | `1.0` | Constant temperature (fixed strategy) |
 | `QR_EDT_BASE_TEMP` | `qr_edt_base_temp` | `0.8` | Base coefficient for EDT |
 | `QR_EDT_EXPONENT` | `qr_edt_exponent` | `0.5` | Power-law exponent for EDT |
@@ -712,7 +752,7 @@ deployments/                       # Per-host compose profiles
 qr-sampler includes statistical tests (in `tests/test_statistical_properties.py`, requires `scipy`) that validate the mathematical properties of the sampling pipeline:
 
 - **KS-test for u-value uniformity**: under the null hypothesis (no bias), amplified `u` values are uniform on (0, 1).
-- **Bias detection**: a small per-byte mean shift produces a statistically detectable shift in the `u` distribution — the amplification system is sensitive enough for consciousness-research experiments.
+- **Bias detection**: a small per-byte mean shift produces a statistically detectable shift in the `u` distribution — the amplification system is sensitive enough for weak-signal integration experiments.
 - **EDT monotonicity**: higher-entropy logit distributions get higher temperatures.
 
 ```bash

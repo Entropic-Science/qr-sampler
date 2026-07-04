@@ -79,6 +79,20 @@ class QRSamplerConfig(BaseSettings):
         default="/qr_entropy.EntropyService/StreamEntropy",
         description="gRPC method path for streaming RPC (empty string disables streaming modes)",
     )
+    grpc_draw_method_path: str = Field(
+        default="/qr_purity.PurityService/GetDraw",
+        description=(
+            "gRPC method path for the unary server-integrated draw RPC "
+            "(empty string disables the draw handle)"
+        ),
+    )
+    grpc_draw_stream_method_path: str = Field(
+        default="/qr_purity.PurityService/StreamDraws",
+        description=(
+            "gRPC method path for the bidi-streaming server-integrated draw "
+            "RPC (empty string disables the draw stream handle)"
+        ),
+    )
     grpc_api_key: str = Field(
         default="",
         description="API key sent via gRPC metadata (empty = no auth)",
@@ -253,6 +267,28 @@ class QRSamplerConfig(BaseSettings):
         description="Samples for ECDF calibration",
     )
 
+    # --- Server-integrated draws (per-request overridable) ---
+    # Active only with signal_amplifier_type="server": the entropy server
+    # integrates a raw block itself (qr_purity.PurityService) and returns
+    # the uniform u directly, so both fields default to "defer to server".
+
+    draw_source_id: str = Field(
+        default="",
+        description=(
+            "Source id for server-integrated draws; '' defers to the server's API-key binding"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    draw_block_bytes: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Raw block size for server-integrated draws; 0 defers to the "
+            "server default (integration.block_bytes)"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
     # --- Temperature Strategy (per-request overridable) ---
 
     temperature_strategy: str = Field(
@@ -344,6 +380,48 @@ class QRSamplerConfig(BaseSettings):
     hvh_nu_dh: float = Field(
         default=0.02,
         description="HVH-Drift min-p entropy-drift coefficient (V6_HVD_R01_01 winner)",
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- Coherence-Gate Temperature Strategy (per-request overridable) ---
+    # Dormant unless temperature_strategy = "coherence_gate" is explicitly
+    # set. The gate reads the coherence triple from the PREVIOUS
+    # server-integrated draw's DrawMeta (one-draw lag, structural) and
+    # boosts the inner strategy's base temperature.
+
+    coherence_threshold: float = Field(
+        default=3.5,
+        description=(
+            "Minimum coherence_z (Fisher-transformed cross-device block "
+            "correlation) for the gate to open; below it the boost is 0.0"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    coherence_t_boost_max: float = Field(
+        default=0.5,
+        ge=0.0,
+        description=(
+            "Maximum temperature boost at r = 1; instantaneous boost is "
+            "coherence_t_boost_max * max(0, coherence_r) when the gate is open"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    coherence_ema_alpha: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "EMA smoothing for the gate boost: b_ema <- alpha*b + (1-alpha)*b_ema; "
+            "1.0 means the instantaneous boost is applied unsmoothed"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    coherence_inner_strategy: str = Field(
+        default="fixed",
+        description=(
+            "Temperature strategy the coherence gate composes over; the boost "
+            "shifts its base-temperature field on a per-token config copy"
+        ),
         json_schema_extra=_PER_REQUEST,
     )
 

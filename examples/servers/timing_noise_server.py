@@ -4,7 +4,7 @@
 An educational example showing how to build a non-QRNG entropy source
 as a gRPC server. Derives randomness from variations in CPU instruction
 timing — useful for demos and testing, but NOT suitable for
-consciousness-research experiments (timing noise is deterministic
+weak-signal integration experiments (timing noise is deterministic
 under classical physics).
 
 The algorithm:

@@ -32,6 +32,9 @@ services:
       QR_FALLBACK_MODE: "${QR_FALLBACK_MODE:-system}"
 
       # --- qr-sampler: sampling parameters ---
+      # Server-draw preset by default; degrades fail-safe to local
+      # byte amplification when the server has no PurityService.
+      QR_PRESET: "${QR_PRESET:-qthought_purity}"
       # NOTE: sample_count=13312 to stay within firefly-1's 13 KB per-request limit.
       QR_SAMPLE_COUNT: "${QR_SAMPLE_COUNT:-13312}"
       QR_TEMPERATURE_STRATEGY: "${QR_TEMPERATURE_STRATEGY:-fixed}"

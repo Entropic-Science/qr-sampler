@@ -8,7 +8,7 @@ change would silently break on:
    or rename here is exactly the "partial rename" failure mode a cross-repo
    seam exists to catch at the qr-sampler side, before it ever reaches
    qthought's CI.
-2. The exact field dicts of the three qthought lane presets — these encode a
+2. The exact field dicts of the four qthought lane presets — these encode a
    scientific lineage (see ``presets.py``) that must not drift silently.
 3. The public signature shape of :class:`~qr_sampler.qthought.QthoughtRoller`
    and :class:`~qr_sampler.qthought.ChoiceProvenance` — a signature change
@@ -39,6 +39,7 @@ _EXPECTED_ALL = [
     "PRESET_QTHOUGHT",
     "PRESET_QTHOUGHT_THINK",
     "PRESET_QTHOUGHT_VOICE",
+    "PRESET_QTHOUGHT_PURITY",
     "EntropySource",
     "MockUniformSource",
     "FallbackEntropySource",
@@ -98,11 +99,28 @@ def test_preset_qthought_voice_dict_pinned() -> None:
     }
 
 
+def test_preset_qthought_purity_dict_pinned() -> None:
+    assert BUILTIN_PRESETS[contract.PRESET_QTHOUGHT_PURITY] == {
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "server",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "fixed",
+        "fixed_temperature": 1.0,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
+        "draw_block_bytes": 0,
+        "top_k": 0,
+        "top_p": 1.0,
+    }
+
+
 def test_preset_name_constants_match_dict_keys() -> None:
-    """The three constants are exactly the keys they name (no drift between them)."""
+    """The four constants are exactly the keys they name (no drift between them)."""
     assert contract.PRESET_QTHOUGHT == "qthought"
     assert contract.PRESET_QTHOUGHT_THINK == "qthought_think"
     assert contract.PRESET_QTHOUGHT_VOICE == "qthought_voice"
+    assert contract.PRESET_QTHOUGHT_PURITY == "qthought_purity"
 
 
 # ── 3. QthoughtRoller / ChoiceProvenance signature snapshots ─────────────

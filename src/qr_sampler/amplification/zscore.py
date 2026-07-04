@@ -3,7 +3,7 @@
 Converts raw entropy bytes into a uniform float via z-score statistics.
 Under the null hypothesis (unbiased entropy), the output is uniformly
 distributed on (0, 1). Any systematic bias in the entropy source shifts
-the output away from 0.5, enabling consciousness-influence detection.
+the output away from 0.5, enabling weak-signal detection.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ class ZScoreMeanAmplifier(SignalAmplifier):
         5. Map to uniform via normal CDF: u = 0.5 * (1 + erf(z / sqrt(2))).
         6. Clamp to (eps, 1-eps).
 
-    Under the null hypothesis (no consciousness influence), z ~ N(0, 1)
+    Under the null hypothesis (no systematic bias), z ~ N(0, 1)
     and u ~ Uniform(0, 1). A small per-byte bias (e.g., +0.003) accumulates
     over thousands of samples, producing a detectable shift in u.
 

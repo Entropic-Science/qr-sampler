@@ -10,9 +10,11 @@ sampling with external-entropy-driven selection. It fetches random bytes from
 any entropy source (QRNGs via gRPC, OS randomness, CPU timing jitter,
 OpenEntropy), amplifies the signal into a uniform float via z-score or ECDF
 statistics, and uses that float to select a token from a probability-ordered
-CDF. The primary use case is consciousness research: studying whether
-conscious intent can influence quantum-random processes in LLM token
-selection.
+CDF. The primary use case is weak-signal integration research: studying
+whether small statistical biases in physical entropy sources are detectable
+in LLM token selection. In server-draw mode the integration happens
+server-side (Qbert0G's `qr_purity.PurityService`) and each draw arrives with
+purity/coherence metadata; the research narrative lives in Qbert0G's README.
 
 Two independent consumers sit on top of the library:
 
@@ -106,7 +108,7 @@ src/qr_sampler/
 |   +-- pipeline.py            # SamplingPipeline + factories (build_pipeline, build_entropy_source, config_hash, derive_commit_nonce)
 |   +-- types.py               # SamplingResult (frozen)
 +-- entropy/
-|   +-- base.py                # EntropySource ABC (get_random_bytes, prefetch/ticket hooks, health_check)
+|   +-- base.py                # EntropySource ABC (get_random_bytes, prefetch/ticket hooks, health_check; DrawMeta + get_draw/prefetch_draw server-draw surface)
 |   +-- registry.py            # EntropySourceRegistry: lazy _BUILTINS table + entry-point discovery
 |   +-- system.py / timing.py / mock.py / openentropy.py
 |   +-- fallback.py            # FallbackEntropySource composition wrapper (+ status-file publishing hook)
@@ -116,17 +118,20 @@ src/qr_sampler/
 |       +-- channel.py         #   background asyncio loop + channel lifecycle
 |       +-- breaker.py         #   adaptive-P99 circuit breaker (pure class)
 |       +-- preprobe.py        #   TCP pre-probe state machine
-+-- amplification/             # SignalAmplifier ABC + registry; zscore.py, zscore_thought.py, ecdf.py
-+-- temperature/               # TemperatureStrategy ABC + registry; fixed.py, edt.py, hvh_drift.py
++-- amplification/             # SignalAmplifier ABC + registry; zscore.py, zscore_thought.py, ecdf.py, server_side.py ("server": server-integrated draws)
++-- temperature/               # TemperatureStrategy ABC + registry; fixed.py, edt.py, hvh_drift.py, coherence_gate.py
 +-- selection/                 # TokenSelector: top-k -> softmax -> min-p -> top-p -> CDF
 +-- logging/                   # TokenSamplingRecord + SamplingLogger (none/summary/full)
 +-- telemetry/
 |   +-- status_file.py         # Cross-process entropy-status file IPC (QR_ENTROPY_STATUS_FILE)
 +-- proto/
-|   +-- wire.py                # THE varint/tag codec (encode_varint, decode_varint, encode_tag)
+|   +-- wire.py                # THE varint/tag/fixed64 codec (encode_varint, decode_varint, encode_tag, encode_fixed64, decode_fixed64)
 |   +-- entropy_service.proto  # Canonical protocol definition
 |   +-- entropy_service_pb2.py # Hand-written message stubs (import wire.py; the single wire format)
 |   +-- entropy_service_pb2_grpc.py
+|   +-- purity_service.proto   # PurityService (byte-identical to Qbert0G's copy; sha256-pinned in tests)
+|   +-- purity_service_pb2.py  # Hand-written DrawRequest/DrawResponse stubs (import wire.py)
+|   +-- purity_service_pb2_grpc.py
 +-- engines/
 |   +-- base.py                # EngineAdapter ABC
 |   +-- registry.py            # EngineAdapterRegistry (lazy _BUILTINS + entry points)
@@ -194,13 +199,34 @@ deployments/                   # Per-host compose profiles (generic, non-Modal)
 16. **Presets are a thin resolution layer over `extra_args`.**
     `BUILTIN_PRESETS` in `config/presets.py` is the runtime source of truth;
     YAML files under `profiles/presets/` are documentation kept in sync by
-    `tests/test_presets/test_yaml_sync.py`. The three `qthought*` presets are
-    scientific lineage — value changes require a `CONTRACT_VERSION` bump.
-17. **One wire format.** All varint/tag encoding lives in `proto/wire.py`;
-    the pb2 stubs and the qgrpc transport share it. Decode follows pb2
-    semantics (last field-1 occurrence wins; empty payload raises
+    `tests/test_presets/test_yaml_sync.py`. The three historical `qthought*`
+    presets are scientific lineage — value changes require a
+    `CONTRACT_VERSION` bump. The serve-path preset lineage extends to
+    `qthought_purity` (published 2026-07): its dict is pinned by
+    `tests/test_contract.py` too.
+17. **One wire format.** All varint/tag/fixed64 encoding lives in
+    `proto/wire.py`; the pb2 stubs and the qgrpc transport share it. Decode
+    follows pb2 semantics (last field-1 occurrence wins; empty payload raises
     `EntropyUnavailableError` in the transport). No hand-rolled codecs
-    elsewhere. Pinned by `tests/test_wire_format.py`.
+    elsewhere. Pinned by `tests/test_wire_format.py`. `purity_service.proto`
+    is byte-identical to Qbert0G's copy — both repos pin the same sha256.
+18. **The draw path preserves commit-then-fetch.** Server-integrated draws
+    (`get_draw`/`prefetch_draw`) carry the same commitment nonce in
+    `DrawRequest.sequence_id` and apply the identical echo-verification rule
+    as the byte path. Prefetch semantics are shared via `PrefetchTicket`.
+19. **The coherence gate is fail-safe by construction.** Every failure branch
+    in `temperature/coherence_gate.py` (no draw meta, first token, malformed
+    meta, invalid coherence, boosted-inner failure, unknown inner) yields
+    exactly the unboosted base temperature and never raises; the boost can
+    only add temperature. An unboosted inner failure propagates — that is an
+    inner-strategy bug, not gate machinery. Same spirit at the pipeline
+    level: a failed draw degrades to local bytes + `zscore_mean` with
+    `entropy_is_fallback=True`, so an EntropyService-only server keeps
+    working.
+20. **Neutral language in this repo.** The research narrative (and its
+    vocabulary) lives in Qbert0G; qr-sampler describes itself in terms of
+    weak-signal integration and entropy purity verification. Enforced for
+    `src/` by `tests/test_language_scrub.py`.
 
 ### Config shape: flat, deliberately
 
