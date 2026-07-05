@@ -38,7 +38,8 @@ from qr_sampler.config import (
     resolve_config,
     resolve_preset,
 )
-from qr_sampler.entropy.base import EntropySource
+from qr_sampler.core.pipeline import build_entropy_source
+from qr_sampler.entropy.base import DrawMeta, EntropySource
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.entropy.mock import MockUniformSource
 from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
@@ -70,6 +71,8 @@ __all__ = [  # noqa: RUF022 -- grouped by concern (roller/config/entropy/excepti
     "EntropySource",
     "MockUniformSource",
     "FallbackEntropySource",
+    "build_entropy_source",
+    "DrawMeta",
     # exceptions
     "EntropyUnavailableError",
     "ConfigValidationError",

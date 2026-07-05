@@ -44,6 +44,8 @@ _EXPECTED_ALL = [
     "EntropySource",
     "MockUniformSource",
     "FallbackEntropySource",
+    "build_entropy_source",
+    "DrawMeta",
     "EntropyUnavailableError",
     "ConfigValidationError",
 ]
@@ -67,6 +69,17 @@ def test_per_request_fields_is_the_derived_frozenset() -> None:
     assert {"sample_count", "signal_amplifier_type", "entropy_source_type"} <= (
         contract.PER_REQUEST_FIELDS
     )
+
+
+def test_server_draw_surface_is_exported() -> None:
+    """``build_entropy_source`` / ``DrawMeta`` (additive export for qthought's
+    server-integrated dispose draw, F7.2) cross the seam: the factory is
+    callable and the meta type is the frozen dataclass ``get_draw`` returns."""
+    import dataclasses as _dc
+
+    assert callable(contract.build_entropy_source)
+    assert _dc.is_dataclass(contract.DrawMeta)
+    assert "z" in {f.name for f in _dc.fields(contract.DrawMeta)}
 
 
 def test_every_exported_name_is_importable_from_contract() -> None:
