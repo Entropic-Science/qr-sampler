@@ -36,6 +36,7 @@ _EXPECTED_ALL = [
     "resolve_config",
     "resolve_preset",
     "BUILTIN_PRESETS",
+    "PER_REQUEST_FIELDS",
     "PRESET_QTHOUGHT",
     "PRESET_QTHOUGHT_THINK",
     "PRESET_QTHOUGHT_VOICE",
@@ -56,6 +57,16 @@ def test_contract_all_is_frozen() -> None:
 def test_contract_version_is_one() -> None:
     """The seam's version starts at 1; bump both this pin and qthought's on a break."""
     assert contract.CONTRACT_VERSION == 1
+
+
+def test_per_request_fields_is_the_derived_frozenset() -> None:
+    """``PER_REQUEST_FIELDS`` (additive export for qthought's sampler registry)
+    is the metadata-derived frozenset and covers the per-lane override keys
+    qthought curates against it."""
+    assert isinstance(contract.PER_REQUEST_FIELDS, frozenset)
+    assert {"sample_count", "signal_amplifier_type", "entropy_source_type"} <= (
+        contract.PER_REQUEST_FIELDS
+    )
 
 
 def test_every_exported_name_is_importable_from_contract() -> None:

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from qr_sampler.config import (
     BUILTIN_PRESETS,
+    PER_REQUEST_FIELDS,
     PRESET_QTHOUGHT,
     PRESET_QTHOUGHT_PURITY,
     PRESET_QTHOUGHT_THINK,
@@ -60,6 +61,7 @@ __all__ = [  # noqa: RUF022 -- grouped by concern (roller/config/entropy/excepti
     "resolve_config",
     "resolve_preset",
     "BUILTIN_PRESETS",
+    "PER_REQUEST_FIELDS",
     "PRESET_QTHOUGHT",
     "PRESET_QTHOUGHT_THINK",
     "PRESET_QTHOUGHT_VOICE",
