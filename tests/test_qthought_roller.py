@@ -147,6 +147,50 @@ def test_choose_index_in_range(mock_config: QRSamplerConfig) -> None:
         roller.close()
 
 
+def test_biased_device_choose_spreads_after_calibration() -> None:
+    """The 'acorn' regression: a statically biased device must not pin every choose to 0.
+
+    Without baseline calibration a real device's byte-mean offset saturates
+    every amplified u into the CDF clamp, so choose(k) returns index 0 on
+    every draw — decoding the same lexicon entry ('acorn', 'give', 'want')
+    into every proto-thought in every channel mode. With the qthought preset's
+    zscore_calibration_samples, the roller calibrates at build time and the
+    indices spread over the pool again.
+    """
+    from qr_sampler.entropy.mock import MockUniformSource
+
+    config = QRSamplerConfig(
+        entropy_source_type="mock_uniform",
+        sample_count=10000,
+        zscore_calibration_samples=100,
+    )
+    biased = MockUniformSource(mean=122.0, seed=13)  # -5.5 static byte offset
+    roller = QthoughtRoller(config, entropy_source=biased)
+    try:
+        values = [roller.choose(56) for _ in range(60)]
+        assert len(set(values)) >= 10  # spread over the THING pool, not pinned
+        assert not all(v == 0 for v in values)
+    finally:
+        roller.close()
+
+
+def test_biased_device_choose_pins_without_calibration() -> None:
+    """Control for the regression above: uncalibrated, the same device pins to 0."""
+    from qr_sampler.entropy.mock import MockUniformSource
+
+    config = QRSamplerConfig(
+        entropy_source_type="mock_uniform",
+        sample_count=10000,
+    )
+    biased = MockUniformSource(mean=122.0, seed=13)
+    roller = QthoughtRoller(config, entropy_source=biased)
+    try:
+        values = [roller.choose(56) for _ in range(20)]
+        assert all(v == 0 for v in values)
+    finally:
+        roller.close()
+
+
 def test_coin_returns_bool(mock_config: QRSamplerConfig) -> None:
     """coin returns a bool and records it as the provenance value."""
     roller = QthoughtRoller(mock_config)
@@ -535,6 +579,7 @@ def test_qthought_presets_registered() -> None:
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_thought",
         "sample_count": 10000,
+        "zscore_calibration_samples": 200,
     }
     assert BUILTIN_PRESETS["qthought_think"] == {
         "temperature_strategy": "hvh_drift",
@@ -544,6 +589,7 @@ def test_qthought_presets_registered() -> None:
         "sample_count": 6000,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 200,
     }
     assert BUILTIN_PRESETS["qthought_voice"] == {
         "temperature_strategy": "edt",
@@ -553,6 +599,7 @@ def test_qthought_presets_registered() -> None:
         "sample_count": 10000,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 200,
     }
 
 

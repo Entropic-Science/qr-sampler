@@ -21,3 +21,6 @@ overrides:
   sample_count: 6000
   entropy_source_type: quantum_grpc
   signal_amplifier_type: zscore_mean
+  # Device-baseline calibration (see qthought.yaml) — an uncalibrated real
+  # device pins every u to a CDF extreme, collapsing sampling to greedy.
+  zscore_calibration_samples: 200

@@ -96,6 +96,7 @@ def test_preset_qthought_dict_pinned() -> None:
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_thought",
         "sample_count": 10000,
+        "zscore_calibration_samples": 200,
     }
 
 
@@ -108,6 +109,7 @@ def test_preset_qthought_think_dict_pinned() -> None:
         "sample_count": 6000,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 200,
     }
 
 
@@ -120,6 +122,7 @@ def test_preset_qthought_voice_dict_pinned() -> None:
         "sample_count": 10000,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 200,
     }
 
 

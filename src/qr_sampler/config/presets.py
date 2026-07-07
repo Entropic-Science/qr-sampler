@@ -75,10 +75,16 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # entropy half. Pins the quantum source and the optional thought-level
     # amplifier (zscore_thought) so a per-thought aggregate bias rides alongside
     # the unchanged per-decision draws; the lineage is explicit in config_hash.
+    # zscore_calibration_samples: the z-score baseline is calibrated against
+    # the device at build time (200 blocks, cached per source instance) so a
+    # real QRNG's static byte-mean offset does not saturate every u into the
+    # CDF clamp and pin every grammar decision to index 0 — the "acorn" bug.
+    # Only *departures from the device's own baseline* register as signal.
     PRESET_QTHOUGHT: {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_thought",
         "sample_count": 10000,
+        "zscore_calibration_samples": 200,
     },
     # Qthought REFLECT lane — the private inner-voice / propose-speech completion.
     # Derived from creative_sampling's HVH-Drift family (the unspecified hvh_*
@@ -93,6 +99,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "sample_count": 6000,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 200,
     },
     # Qthought SPEAK lane — the user-visible voice. EDT temperature with nucleus
     # + top-k truncation for fluent, focused speech (cooler and tighter than the
@@ -105,6 +112,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "sample_count": 10000,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 200,
     },
     # Qthought purity lane — server-integrated draws (qr_purity.PurityService)
     # with the coherence-gated temperature strategy. The server integrates the

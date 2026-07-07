@@ -266,6 +266,23 @@ class QRSamplerConfig(BaseSettings):
         ge=100,
         description="Samples for ECDF calibration",
     )
+    zscore_calibration_samples: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Calibration blocks for the z-score amplifiers. 0 (default) keeps "
+            "the ideal-population baseline (mean 127.5, uniform-byte std) — "
+            "byte-identical to the historical behaviour. N > 0 draws N blocks "
+            "of sample_count bytes from the entropy source at build time and "
+            "replaces the baseline with the device's empirical block-mean and "
+            "block-SEM, so a real device's static manufacturing bias reads as "
+            "z ~ 0 instead of saturating the CDF into its clamp (the 'acorn' "
+            "failure: every u pinned to an extreme selects the same lexicon "
+            "index on every draw). Baseline correction, not censoring — the "
+            "same rationale as the server-integrated draw path."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
 
     # --- Server-integrated draws (per-request overridable) ---
     # Active only with signal_amplifier_type="server": the entropy server

@@ -14,6 +14,12 @@ description: |
   (``zscore_thought``) so a per-thought aggregate bias rides alongside the
   unchanged per-decision draws. The lineage is explicit in ``config_hash``.
 
+  The z-score baseline is calibrated against the device at build time
+  (200 blocks, cached per source instance): a real QRNG's static byte-mean
+  offset would otherwise saturate every u into the CDF clamp and pin every
+  grammar decision to the same lexicon index (the "acorn" bug). Only
+  departures from the device's own baseline register as signal.
+
 experimental: false
 origin: null
 overrides:
@@ -22,3 +28,4 @@ overrides:
   # Pin 10000 so each qthought decision is fixed regardless of the prod
   # QR_SAMPLE_COUNT that the serving container's Secret happens to mount.
   sample_count: 10000
+  zscore_calibration_samples: 200

@@ -415,6 +415,7 @@ class TestFieldSets:
                 "population_mean",
                 "population_std",
                 "uniform_clamp_epsilon",
+                "zscore_calibration_samples",
                 "temperature_strategy",
                 "fixed_temperature",
                 "edt_base_temp",
