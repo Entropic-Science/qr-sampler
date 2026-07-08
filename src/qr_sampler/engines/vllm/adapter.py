@@ -181,7 +181,17 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         self._is_pin_memory = is_pin_memory
 
         # --- Load default configuration ---
-        self._default_config = QRSamplerConfig()
+        # Expand ``QR_PRESET`` (and any ``QR_*`` env) into the PROCESS-default
+        # config, so a deployment selects its entire sampling profile with one
+        # env var and no per-request ``extra_args``. This is how the "amplify
+        # in Qbert" migrate is switched on for serving: ``QR_PRESET=qthought_purity``
+        # makes every token one server-integrated draw (``signal_amplifier_type
+        # =server`` + ``draw_block_bytes``), the amplification having moved
+        # server-side — the client just draws. The ``preset`` field is then
+        # cleared so the per-request ``resolve_config`` does not re-expand it.
+        self._default_config = resolve_config(QRSamplerConfig(), None)
+        if self._default_config.preset:
+            self._default_config = self._default_config.model_copy(update={"preset": ""})
 
         # --- Pre-initialise one pipeline per allowed entropy source ---
         # The default source from QR_ENTROPY_SOURCE_TYPE is always included
@@ -246,14 +256,17 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # --- iter-55: rolling per-stage perf telemetry ---
         self._perf = _PerfAggregator()
 
+        _draw_mode = self._default_config.signal_amplifier_type == "server"
         logger.info(
             "VLLMAdapter initialized: vocab_size=%d, "
             "default_entropy_source=%s, preinit_sources=%s, "
-            "amplifier=%s, temperature=%s",
+            "amplifier=%s, draw_mode=%s, draw_block_bytes=%d, temperature=%s",
             self._vocab_size,
             self._pipeline.entropy_source.name,
             sorted(self._pipelines.keys()),
             self._default_config.signal_amplifier_type,
+            _draw_mode,
+            self._default_config.draw_block_bytes,
             self._default_config.temperature_strategy,
         )
 

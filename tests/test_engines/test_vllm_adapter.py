@@ -242,6 +242,41 @@ class TestPipelineDelegation:
         assert isinstance(adapter.default_config, QRSamplerConfig)
         adapter.close()
 
+    def test_qr_preset_expands_into_the_process_default(self) -> None:
+        """QR_PRESET selects the whole sampling profile at process init — no
+        per-request extra_args. ``qthought_purity`` makes the default config a
+        server-integrated draw (the amplify-in-Qbert migrate), and the default
+        pipeline's amplifier reports ``requires_server_draw``."""
+        import os
+
+        for key, val in {
+            "QR_PRESET": "qthought_purity",
+            "QR_ENTROPY_SOURCE_TYPE": "mock_uniform",
+            "QR_FALLBACK_MODE": "error",
+            "QR_LOG_LEVEL": "none",
+            "QR_PREINIT_ENTROPY_SOURCES": "mock_uniform",
+        }.items():
+            os.environ[key] = val
+        try:
+            adapter = VLLMAdapter(vllm_config=None)
+            cfg = adapter.default_config
+            assert cfg.signal_amplifier_type == "server"
+            assert cfg.draw_block_bytes == 1048576
+            assert cfg.temperature_strategy == "coherence_gate"
+            # The preset field is cleared so per-request resolve does not re-expand.
+            assert cfg.preset == ""
+            assert getattr(adapter._pipeline.amplifier, "requires_server_draw", False) is True
+            adapter.close()
+        finally:
+            for key in (
+                "QR_PRESET",
+                "QR_ENTROPY_SOURCE_TYPE",
+                "QR_FALLBACK_MODE",
+                "QR_LOG_LEVEL",
+                "QR_PREINIT_ENTROPY_SOURCES",
+            ):
+                os.environ.pop(key, None)
+
     def test_close_delegates_to_pipeline(self) -> None:
         """close() delegates to pipeline.close()."""
         adapter = _make_adapter()
