@@ -14,13 +14,19 @@ description: |
 experimental: false
 origin: "Derived from creative_sampling (V6_HVD_R01_01) with a hotter base temperature"
 overrides:
-  temperature_strategy: hvh_drift
+  # Server-integrated 1 MiB draws per token under the coherence gate, with the
+  # divergent hvh_drift family as the gate's inner strategy. sample_count /
+  # zscore_calibration_samples are degrade-fallback only.
+  temperature_strategy: coherence_gate
+  coherence_inner_strategy: hvh_drift
   hvh_t_base: 1.45
   top_k: 0
   top_p: 1.0
-  sample_count: 6000
+  coherence_threshold: 3.5
+  coherence_t_boost_max: 0.5
+  coherence_ema_alpha: 0.3
   entropy_source_type: quantum_grpc
-  signal_amplifier_type: zscore_mean
-  # Device-baseline calibration (see qthought.yaml) — an uncalibrated real
-  # device pins every u to a CDF extreme, collapsing sampling to greedy.
+  signal_amplifier_type: server
+  draw_block_bytes: 1048576
+  sample_count: 6000
   zscore_calibration_samples: 200

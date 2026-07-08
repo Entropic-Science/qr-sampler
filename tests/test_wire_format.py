@@ -172,14 +172,14 @@ class TestEntropyResponseWireFormat:
             data=b"\x00\x01\x02\x03\x04" * 100,
             sequence_id=12345,
             generation_timestamp_ns=1_700_000_000_000_000_000,
-            device_id="firefly-1",
+            device_id="dragonfly-0",
         )
         wire = resp.SerializeToString()
         decoded = EntropyResponse.FromString(wire)
         assert decoded.data == resp.data
         assert decoded.sequence_id == 12345
         assert decoded.generation_timestamp_ns == 1_700_000_000_000_000_000
-        assert decoded.device_id == "firefly-1"
+        assert decoded.device_id == "dragonfly-0"
 
     def test_roundtrip_defaults(self) -> None:
         resp = EntropyResponse()

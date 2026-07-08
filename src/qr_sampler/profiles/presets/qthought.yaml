@@ -23,9 +23,12 @@ description: |
 experimental: false
 origin: null
 overrides:
+  # Every grammar decision is now one server-integrated 1 MiB draw
+  # (qr_purity GetDraw), baseline-referenced server-side against the device
+  # fingerprint. sample_count / zscore_calibration_samples remain ONLY for the
+  # labelled degrade fallback (a dead draw path -> calibrated local zscore).
   entropy_source_type: quantum_grpc
-  signal_amplifier_type: zscore_thought
-  # Pin 10000 so each qthought decision is fixed regardless of the prod
-  # QR_SAMPLE_COUNT that the serving container's Secret happens to mount.
+  signal_amplifier_type: server
+  draw_block_bytes: 1048576
   sample_count: 10000
   zscore_calibration_samples: 200

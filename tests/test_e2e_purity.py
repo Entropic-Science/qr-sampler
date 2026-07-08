@@ -161,9 +161,10 @@ class TestQthoughtPurityEndToEnd:
         assert record.integrator == "bit_z"
         assert record.draw_source_id == "qrng-a"
         assert record.entropy_is_fallback is False
-        # The preset's draw shape reached the server: 0 = server defaults.
+        # The preset's draw shape reached the server: source_id defers to the
+        # key binding (""), block_bytes is the 1 MiB the qthought lanes pin.
         assert servicer.requests[0].source_id == ""
-        assert servicer.requests[0].block_bytes == 0
+        assert servicer.requests[0].block_bytes == 1048576
 
     def test_gate_boosts_exactly_t_base_plus_half(
         self, gated_service: tuple[str, ScriptedPurityServicer]

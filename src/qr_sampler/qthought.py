@@ -39,6 +39,7 @@ from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import PRESET_QTHOUGHT, QRSamplerConfig, resolve_config
 from qr_sampler.core.pipeline import build_entropy_source, config_hash
 from qr_sampler.entropy.fallback import FallbackEntropySource
+from qr_sampler.exceptions import EntropyUnavailableError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -224,6 +225,14 @@ class QthoughtRoller:
         self._amplifier: SignalAmplifier = AmplifierRegistry.build(config)
         if hasattr(self._amplifier, "calibrate"):
             self._amplifier.calibrate(self._source, config)
+        # Server-draw mode: when the amplifier is the ``server`` marker, every
+        # decision's uniform comes from one ``get_draw`` (a server-integrated,
+        # baseline-referenced block) instead of a local ``get_random_bytes`` +
+        # ``amplify``. The byte path survives only as the labelled degrade
+        # fallback (built lazily, calibrated so a draw-only outage that still
+        # serves biased bytes cannot pin every decision — the "acorn" failure).
+        self._draw_mode: bool = bool(getattr(self._amplifier, "requires_server_draw", False))
+        self._fallback_amplifier: SignalAmplifier | None = None
         self._buffer: list[ChoiceProvenance] = []
         self._thought_active = False
         logger.info(
@@ -450,23 +459,69 @@ class QthoughtRoller:
         self._source.close()
 
     def _draw(self) -> _Draw:
-        """Perform one fresh fetch + amplify and capture its provenance fields.
+        """Perform one fresh entropy draw and capture its provenance fields.
 
-        Exactly the entropy half of a token-sampling step:
-        ``get_random_bytes(sample_count)`` → ``amplify()`` → ``u``. The fallback
-        source name + flag are read immediately after the fetch (the wrapper
-        records the leg it just used), mirroring ``SamplingPipeline.sample_token``.
+        In **server-draw mode** (``signal_amplifier_type="server"``) this is one
+        ``get_draw`` round trip — a server-integrated, baseline-referenced
+        uniform, byte-identical to the qthought dispose gate's draw. Otherwise
+        it is the local byte path (``get_random_bytes(sample_count)`` →
+        ``amplify()`` → ``u``), the entropy half of a token-sampling step.
+        """
+        if self._draw_mode:
+            return self._draw_server()
+        return self._draw_bytes()
+
+    def _draw_server(self) -> _Draw:
+        """One server-integrated draw (``get_draw``), or a labelled local degrade.
+
+        The uniform arrives already integrated against the device's fingerprint
+        (``bias`` is 0 by construction — the baseline correction happened at the
+        source), so provenance carries ``meta.z`` and ``is_fallback=False``. A
+        failed draw degrades — labelled, never silent — to the local byte path
+        (unless ``fallback_mode="error"``), so a dead PurityService can never
+        mute a decision.
+        """
+        t_start = time.perf_counter_ns()
+        try:
+            u, meta = self._source.get_draw(
+                self._config.draw_block_bytes, self._config.draw_source_id, None
+            )
+        except EntropyUnavailableError:
+            if self._config.fallback_mode == "error":
+                raise
+            return self._draw_bytes(forced_fallback=True)
+        latency_ms = (time.perf_counter_ns() - t_start) / 1_000_000.0
+        return _Draw(
+            u=float(u),
+            z_score=float(meta.z),
+            bias=0.0,
+            source=self._source.name,
+            is_fallback=False,
+            generation_timestamp=time.time(),
+            latency_ms=latency_ms,
+        )
+
+    def _draw_bytes(self, *, forced_fallback: bool = False) -> _Draw:
+        """One local byte fetch + amplify. The fallback source name + flag are
+        read immediately after the fetch (the wrapper records the leg it just
+        used), mirroring ``SamplingPipeline.sample_token``.
+
+        ``forced_fallback`` marks a draw that landed here because a server draw
+        failed: the decision is degraded regardless of which leg served the
+        bytes, and it is amplified with the calibrated local fallback amplifier
+        (the ``server`` marker amplifier has no local ``amplify`` path).
         """
         t_start = time.perf_counter_ns()
         raw = self._source.get_random_bytes(self._config.sample_count)
 
         source_name = self._source.name
-        is_fallback = False
+        is_fallback = forced_fallback
         if isinstance(self._source, FallbackEntropySource):
             source_name = self._source.last_source_used
-            is_fallback = source_name != self._source.primary_name
+            is_fallback = is_fallback or (source_name != self._source.primary_name)
 
-        result = self._amplifier.amplify(raw)
+        amplifier = self._degrade_amplifier() if forced_fallback else self._amplifier
+        result = amplifier.amplify(raw)
         sample_mean = float(result.diagnostics.get("sample_mean", self._config.population_mean))
         z_score = float(result.diagnostics.get("z_score", 0.0))
         latency_ms = (time.perf_counter_ns() - t_start) / 1_000_000.0
@@ -480,6 +535,24 @@ class QthoughtRoller:
             generation_timestamp=time.time(),
             latency_ms=latency_ms,
         )
+
+    def _degrade_amplifier(self) -> SignalAmplifier:
+        """The lazily-built, calibrated local amplifier for the degraded draw path.
+
+        A ``zscore_mean`` baselined against the source (``zscore_calibration_samples``),
+        cached so a sustained PurityService outage does not re-calibrate per
+        decision. Calibration matters here: if only the *draw* path is down but
+        the device still serves biased bytes, an ideal-baseline amplifier would
+        pin every degraded decision to one lexicon index (the "acorn" failure).
+        """
+        if self._fallback_amplifier is None:
+            from qr_sampler.amplification.zscore import ZScoreMeanAmplifier
+
+            amp: SignalAmplifier = ZScoreMeanAmplifier(self._config)
+            if hasattr(amp, "calibrate"):
+                amp.calibrate(self._source, self._config)
+            self._fallback_amplifier = amp
+        return self._fallback_amplifier
 
     def _to_provenance(
         self, kind: DecisionKind, value: int | bool, draw: _Draw

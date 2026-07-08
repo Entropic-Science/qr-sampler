@@ -14,7 +14,7 @@ import pytest
 
 from qr_sampler.amplification.zscore import ZScoreMeanAmplifier
 from qr_sampler.config import BUILTIN_PRESETS, QRSamplerConfig
-from qr_sampler.entropy.base import EntropySource
+from qr_sampler.entropy.base import DrawMeta, EntropySource
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.qthought import (
@@ -486,8 +486,18 @@ def test_status_without_fallback_wrapper(mock_config: QRSamplerConfig) -> None:
 
 
 def test_thought_aggregate_folded_when_amplifier_supports_it() -> None:
-    """The qthought preset (zscore_thought) folds a thought aggregate on drain."""
-    roller = QthoughtRoller()  # qthought preset → zscore_thought amplifier
+    """The zscore_thought amplifier folds a thought aggregate on drain.
+
+    The default qthought preset now uses server draws (no byte accumulator),
+    so this pins the aggregate protocol on an explicit zscore_thought config —
+    the amplifier that still carries it for any byte-lane caller.
+    """
+    config = QRSamplerConfig(
+        entropy_source_type="mock_uniform",
+        signal_amplifier_type="zscore_thought",
+        sample_count=1024,
+    )
+    roller = QthoughtRoller(config)
     roller._source = _ConstSource(160)
     try:
         assert hasattr(roller._amplifier, "begin_thought")
@@ -574,41 +584,53 @@ def test_bind_int_rejects_bad_spec(mock_config: QRSamplerConfig) -> None:
 
 
 def test_qthought_presets_registered() -> None:
-    """The three qthought presets pin their entropy/amplifier/sampling lanes."""
+    """The three qthought lanes pin server-integrated draws (1 MiB blocks); the
+    byte-fetch fields (sample_count / calibration) survive as degrade-fallback."""
     assert BUILTIN_PRESETS["qthought"] == {
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_thought",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
     assert BUILTIN_PRESETS["qthought_think"] == {
-        "temperature_strategy": "hvh_drift",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "hvh_drift",
         "hvh_t_base": 1.45,
         "top_k": 0,
         "top_p": 1.0,
-        "sample_count": 6000,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_mean",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
+        "sample_count": 6000,
         "zscore_calibration_samples": 200,
     }
     assert BUILTIN_PRESETS["qthought_voice"] == {
-        "temperature_strategy": "edt",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "edt",
         "edt_base_temp": 0.8,
         "top_k": 50,
         "top_p": 0.9,
-        "sample_count": 10000,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_mean",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
+        "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
 
 
 def test_default_construction_resolves_qthought_preset() -> None:
-    """No-arg construction resolves the qthought preset (quantum + zscore_thought)."""
+    """No-arg construction resolves the qthought preset (quantum + server draws)."""
     roller = QthoughtRoller()
     try:
-        assert roller.config.signal_amplifier_type == "zscore_thought"
-        assert roller.config.sample_count == 10000
+        assert roller.config.signal_amplifier_type == "server"
+        assert roller.config.draw_block_bytes == 1048576
         assert roller.config.entropy_source_type == "quantum_grpc"
     finally:
         roller.close()
@@ -624,3 +646,139 @@ def test_quantum_grpc_resolves_via_builtin_table() -> None:
     from qr_sampler.entropy.registry import EntropySourceRegistry
 
     assert EntropySourceRegistry.get("quantum_grpc") is not None
+
+
+# --------------------------------------------------------------------------- #
+# Server-draw decode path (signal_amplifier_type="server")
+# --------------------------------------------------------------------------- #
+
+
+class _FakeDrawSource(EntropySource):
+    """Draw-capable source returning a scripted ``(u, meta)`` and counting calls."""
+
+    supports_server_draw = True
+
+    def __init__(self, u: float = 0.734, z: float = 1.5) -> None:
+        self._u = u
+        self._z = z
+        self.draw_calls: list[tuple[int, str]] = []
+        self.byte_calls = 0
+
+    @property
+    def name(self) -> str:
+        return "fake_draw"
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def get_random_bytes(self, n: int) -> bytes:
+        self.byte_calls += 1
+        return bytes(i % 256 for i in range(n))
+
+    def get_draw(
+        self, block_bytes: int, source_id: str, ticket: object | None = None
+    ) -> tuple[float, DrawMeta]:
+        self.draw_calls.append((block_bytes, source_id))
+        return self._u, DrawMeta(
+            z=self._z,
+            coherence_z=0.0,
+            coherence_valid=False,
+            coherence_r=0.0,
+            purity_label="quantum/intact/raw",
+            integrated_bytes=block_bytes,
+            integrator="bit_z",
+            source_id="dragonfly-0",
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class _DrawlessSource(_FakeDrawSource):
+    """Server-draw capable on paper; every draw fails (PurityService down)."""
+
+    def get_draw(
+        self, block_bytes: int, source_id: str, ticket: object | None = None
+    ) -> tuple[float, DrawMeta]:
+        self.draw_calls.append((block_bytes, source_id))
+        raise EntropyUnavailableError("PurityService down")
+
+
+def _server_config(**over: object) -> QRSamplerConfig:
+    return QRSamplerConfig(
+        entropy_source_type="mock_uniform",
+        signal_amplifier_type="server",
+        draw_block_bytes=1048576,
+        sample_count=256,
+        **over,  # type: ignore[arg-type]
+    )
+
+
+def test_server_draw_mode_uses_get_draw_per_decision() -> None:
+    """With the server amplifier, each decision is one ``get_draw`` (1 MiB block),
+    no byte fetch, provenance from ``DrawMeta`` (z from the server, bias 0)."""
+    src = _FakeDrawSource(u=0.734, z=1.5)
+    roller = QthoughtRoller(_server_config(), entropy_source=src)
+    try:
+        for _ in range(5):
+            roller.choose(10)
+        roller.coin(0.5)
+        roller.bind_int(BindSpec.for_time())
+        prov = roller.drain()
+        assert len(prov) == 7
+        assert len(src.draw_calls) == 7  # exactly one server draw per decision
+        assert src.byte_calls == 0  # the happy path never fetches bytes
+        assert all(block == 1048576 for block, _ in src.draw_calls)  # 1 MiB
+        for p in prov:
+            assert p.is_fallback is False
+            assert p.z_score == 1.5
+            assert p.bias == 0.0  # baseline correction happened server-side
+            assert 0.0 < p.u < 1.0
+    finally:
+        roller.close()
+
+
+def test_server_draw_u_and_draw_index_use_get_draw() -> None:
+    """The raw-draw methods (dispose gate + persona seed) also draw server-side."""
+    src = _FakeDrawSource(u=0.42, z=-0.8)
+    roller = QthoughtRoller(_server_config(), entropy_source=src)
+    try:
+        prov_u = roller.draw_u()
+        assert prov_u.kind == "draw_u"
+        assert prov_u.u == 0.42
+        assert prov_u.is_fallback is False
+        prov_idx = roller.draw_index(8)
+        assert prov_idx.kind == "draw_index"
+        assert 0 <= prov_idx.value <= 7
+        assert len(src.draw_calls) == 2
+        assert src.byte_calls == 0
+    finally:
+        roller.close()
+
+
+def test_server_draw_degrades_to_local_labelled_on_failure() -> None:
+    """A failed draw degrades to local bytes + a calibrated fallback amplifier,
+    labelled ``is_fallback`` — a decision is never muted."""
+    src = _DrawlessSource()
+    roller = QthoughtRoller(_server_config(zscore_calibration_samples=0), entropy_source=src)
+    try:
+        value = roller.choose(6)
+        assert 0 <= value <= 5
+        (p,) = roller.drain()
+        assert p.is_fallback is True
+        assert len(src.draw_calls) == 1  # the draw was attempted
+        assert src.byte_calls >= 1  # then it fell back to a byte fetch
+    finally:
+        roller.close()
+
+
+def test_server_draw_failure_raises_under_fallback_error() -> None:
+    """``fallback_mode="error"`` re-raises a failed draw instead of degrading."""
+    src = _DrawlessSource()
+    roller = QthoughtRoller(_server_config(fallback_mode="error"), entropy_source=src)
+    try:
+        with pytest.raises(EntropyUnavailableError):
+            roller.choose(4)
+    finally:
+        roller.close()

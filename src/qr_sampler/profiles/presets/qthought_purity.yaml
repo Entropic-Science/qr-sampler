@@ -26,7 +26,6 @@ overrides:
   coherence_threshold: 3.5
   coherence_t_boost_max: 0.5
   coherence_ema_alpha: 0.3
-  # 0 = server default block size (2 MiB per Amendment 1.3).
-  draw_block_bytes: 0
+  draw_block_bytes: 1048576  # 1 MiB (was 0 = server default 2 MiB)
   top_k: 0
   top_p: 1.0

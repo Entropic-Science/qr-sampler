@@ -14,8 +14,13 @@ to connect to a specific entropy source. Every profile contains:
 | Profile | Entropy source | What it runs |
 |---------|---------------|--------------|
 | [`urandom/`](urandom/) | `os.urandom()` via gRPC | vLLM + co-located gRPC entropy server |
-| [`firefly-1/`](firefly-1/) | Quantum RNG via gRPC | vLLM only (QRNG server is external) |
+| [`openentropy/`](openentropy/) | OpenEntropy device via gRPC | vLLM + co-located gRPC entropy server |
 | [`_template/`](_template/) | Your custom source | Starting point for new profiles |
+
+> The `firefly-1` external-QRNG profile was retired 2026-07 — the qthought
+> deployment draws all entropy locally (co-located Dragonfly QRNG over a UNIX
+> socket), so there is no external/remote entropy host. See git history for the
+> archived profile.
 
 ## Quick start (any profile)
 

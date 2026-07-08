@@ -48,7 +48,11 @@ from qr_sampler.qthought import BindSpec, ChoiceProvenance, IntRange, QthoughtRo
 #: Bumped on any breaking change to this module's ``__all__`` — a removed
 #: name, a changed ``QthoughtRoller``/``ChoiceProvenance`` shape, or a changed
 #: qthought preset dict. qthought asserts this at import time.
-CONTRACT_VERSION = 1
+#: v2 (2026-07): the qthought lanes moved to server-integrated draws
+#: (``signal_amplifier_type="server"`` + 1 MiB ``draw_block_bytes``) — the
+#: preset dicts changed and ``QthoughtRoller`` gained a ``get_draw`` decode
+#: path. The byte-fetch amplifiers survive only as the labelled degrade path.
+CONTRACT_VERSION = 2
 
 __all__ = [  # noqa: RUF022 -- grouped by concern (roller/config/entropy/exceptions), not alphabetized
     "CONTRACT_VERSION",

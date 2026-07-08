@@ -56,9 +56,10 @@ def test_contract_all_is_frozen() -> None:
     assert contract.__all__ == _EXPECTED_ALL
 
 
-def test_contract_version_is_one() -> None:
-    """The seam's version starts at 1; bump both this pin and qthought's on a break."""
-    assert contract.CONTRACT_VERSION == 1
+def test_contract_version_is_two() -> None:
+    """v2 (2026-07): qthought lanes moved to server-integrated draws. Bump both
+    this pin and qthought's import-time assert together on a break."""
+    assert contract.CONTRACT_VERSION == 2
 
 
 def test_per_request_fields_is_the_derived_frozenset() -> None:
@@ -94,7 +95,8 @@ def test_every_exported_name_is_importable_from_contract() -> None:
 def test_preset_qthought_dict_pinned() -> None:
     assert BUILTIN_PRESETS[contract.PRESET_QTHOUGHT] == {
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_thought",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
@@ -102,26 +104,36 @@ def test_preset_qthought_dict_pinned() -> None:
 
 def test_preset_qthought_think_dict_pinned() -> None:
     assert BUILTIN_PRESETS[contract.PRESET_QTHOUGHT_THINK] == {
-        "temperature_strategy": "hvh_drift",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "hvh_drift",
         "hvh_t_base": 1.45,
         "top_k": 0,
         "top_p": 1.0,
-        "sample_count": 6000,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_mean",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
+        "sample_count": 6000,
         "zscore_calibration_samples": 200,
     }
 
 
 def test_preset_qthought_voice_dict_pinned() -> None:
     assert BUILTIN_PRESETS[contract.PRESET_QTHOUGHT_VOICE] == {
-        "temperature_strategy": "edt",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "edt",
         "edt_base_temp": 0.8,
         "top_k": 50,
         "top_p": 0.9,
-        "sample_count": 10000,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_mean",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
+        "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
 
@@ -136,7 +148,7 @@ def test_preset_qthought_purity_dict_pinned() -> None:
         "coherence_threshold": 3.5,
         "coherence_t_boost_max": 0.5,
         "coherence_ema_alpha": 0.3,
-        "draw_block_bytes": 0,
+        "draw_block_bytes": 1048576,
         "top_k": 0,
         "top_p": 1.0,
     }

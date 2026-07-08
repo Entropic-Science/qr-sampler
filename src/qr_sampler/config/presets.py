@@ -75,51 +75,66 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # entropy half. Pins the quantum source and the optional thought-level
     # amplifier (zscore_thought) so a per-thought aggregate bias rides alongside
     # the unchanged per-decision draws; the lineage is explicit in config_hash.
-    # zscore_calibration_samples: the z-score baseline is calibrated against
-    # the device at build time (200 blocks, cached per source instance) so a
-    # real QRNG's static byte-mean offset does not saturate every u into the
-    # CDF clamp and pin every grammar decision to index 0 — the "acorn" bug.
-    # Only *departures from the device's own baseline* register as signal.
+    # Qthought decode lane (the QthoughtRoller). Every grammar decision is now
+    # ONE server-integrated draw (qr_purity GetDraw) — a 1 MiB baseline-
+    # referenced block the server integrates against the device fingerprint —
+    # not a local byte fetch + amplify. The baseline correction happens at the
+    # source, so the "acorn" static-bias pinning cannot occur.
+    # ``sample_count`` / ``zscore_calibration_samples`` remain ONLY for the
+    # labelled degrade fallback: a dead PurityService draw falls back to a
+    # calibrated local zscore so a decision is never muted (never silent).
     PRESET_QTHOUGHT: {
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_thought",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     },
     # Qthought REFLECT lane — the private inner-voice / propose-speech completion.
-    # Derived from creative_sampling's HVH-Drift family (the unspecified hvh_*
-    # terms inherit the V6_HVD_R01_01 field defaults), with a hotter base for
-    # divergent reflection and a smaller fetch. Plain zscore_mean: the
-    # thought-level aggregate lives on the qthought decode lane, not the model lane.
+    # Every token now rides a server-integrated 1 MiB draw (qr_purity GetDraw)
+    # under the coherence-gated temperature: the divergent hvh_drift family is
+    # the gate's INNER strategy (hotter base 1.45 for divergent reflection), and
+    # the cross-device coherence statistic boosts it when significant.
+    # ``sample_count`` / ``zscore_calibration_samples`` are degrade-fallback only.
     PRESET_QTHOUGHT_THINK: {
-        "temperature_strategy": "hvh_drift",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "hvh_drift",
         "hvh_t_base": 1.45,
         "top_k": 0,
         "top_p": 1.0,
-        "sample_count": 6000,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_mean",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
+        "sample_count": 6000,
         "zscore_calibration_samples": 200,
     },
-    # Qthought SPEAK lane — the user-visible voice. EDT temperature with nucleus
-    # + top-k truncation for fluent, focused speech (cooler and tighter than the
-    # REFLECT lane). Full-size fetch on the quantum source + zscore_mean.
+    # Qthought SPEAK lane — the user-visible voice. Server-integrated 1 MiB draws
+    # under the coherence gate, with the composed EDT strategy (nucleus + top-k,
+    # cooler than REFLECT) as the gate's INNER strategy.
+    # ``sample_count`` / ``zscore_calibration_samples`` are degrade-fallback only.
     PRESET_QTHOUGHT_VOICE: {
-        "temperature_strategy": "edt",
+        "temperature_strategy": "coherence_gate",
+        "coherence_inner_strategy": "edt",
         "edt_base_temp": 0.8,
         "top_k": 50,
         "top_p": 0.9,
-        "sample_count": 10000,
+        "coherence_threshold": 3.5,
+        "coherence_t_boost_max": 0.5,
+        "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
-        "signal_amplifier_type": "zscore_mean",
+        "signal_amplifier_type": "server",
+        "draw_block_bytes": 1048576,
+        "sample_count": 10000,
         "zscore_calibration_samples": 200,
     },
-    # Qthought purity lane — server-integrated draws (qr_purity.PurityService)
-    # with the coherence-gated temperature strategy. The server integrates the
-    # raw block and returns (u, z) plus the cross-device coherence statistic;
-    # the gate boosts the inner fixed temperature when the previous draw's
-    # coherence is significant. Fail-safe by construction: a draw failure
-    # degrades to fallback bytes + a local zscore_mean amplifier.
+    # Qthought purity reference lane — the neutral fixed-inner-temperature
+    # profile under the same coherence gate and server-integrated 1 MiB draws.
+    # The three lanes above are all server-draw now; this remains the plain
+    # fixed-temp reference. A draw failure degrades to fallback bytes + a local
+    # zscore_mean amplifier (labelled, never silent).
     PRESET_QTHOUGHT_PURITY: {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
@@ -129,7 +144,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "coherence_threshold": 3.5,
         "coherence_t_boost_max": 0.5,
         "coherence_ema_alpha": 0.3,
-        "draw_block_bytes": 0,  # 0 = server default (2 MiB per Amendment 1.3)
+        "draw_block_bytes": 1048576,  # 1 MiB (was 0 = server default 2 MiB)
         "top_k": 0,
         "top_p": 1.0,
     },
