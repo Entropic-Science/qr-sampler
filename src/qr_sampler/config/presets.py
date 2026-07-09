@@ -92,17 +92,19 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     },
     # Qthought REFLECT lane — the private inner-voice / propose-speech completion.
     # Every token rides a server-integrated 1 MiB draw (qr_purity GetDraw) under
-    # the coherence-gated hvh_drift temperature. **top_k=50 / top_p=0.9
-    # truncation is LOAD-BEARING HERE**: REFLECT must emit a parseable
-    # ``propose_speech`` tool call, and quantum-uniform selection over the FULL
-    # untruncated distribution picks low-probability tokens often enough to
-    # corrupt it (→ strength 0.0 → the mind never speaks). Truncation is confined
-    # to this lane; SPEAK runs free (see below).
-    # ``sample_count`` / ``zscore_calibration_samples`` are degrade-fallback only.
+    # the coherence-gated EDT temperature. This lane must emit a PARSEABLE
+    # ``propose_speech`` tool call, and that constrains BOTH knobs:
+    #   * top_k=50 / top_p=0.9 truncation removes the low-probability tail, and
+    #   * a COOL/adaptive inner strategy (EDT ~0.8) keeps the structure intact.
+    # A hot inner strategy (hvh_drift base 1.45) corrupts the tool call even WITH
+    # truncation — under quantum-uniform selection the heat re-introduces garbage
+    # tokens → strength parses 0.0 → the mind never speaks. So REFLECT is the
+    # coherent lane; SPEAK is the wild one (see below). ``sample_count`` /
+    # ``zscore_calibration_samples`` are degrade-fallback only.
     PRESET_QTHOUGHT_THINK: {
         "temperature_strategy": "coherence_gate",
-        "coherence_inner_strategy": "hvh_drift",
-        "hvh_t_base": 1.45,
+        "coherence_inner_strategy": "edt",
+        "edt_base_temp": 0.8,
         "top_k": 50,
         "top_p": 0.9,
         "coherence_threshold": 3.5,

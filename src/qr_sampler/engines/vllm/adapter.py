@@ -547,7 +547,14 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             # the first sampling step. ``prefetch()`` never raises and
             # returns None for non-async sources (e.g. the system/PRNG
             # comparison lane), which keeps that path untouched.
-            if req_config.entropy_prefetch:
+            #
+            # Skip it entirely in server-DRAW mode: the draw path fetches a
+            # uniform via ``get_draw`` and never redeems these BYTE tickets, so
+            # a byte prefetch here is dead work — and the async byte-prefetch
+            # redeem path is where a ``_FetchReply`` shape mismatch surfaced and
+            # killed the engine once per-request states began to be built.
+            draw_mode = bool(getattr(amplifier, "requires_server_draw", False))
+            if req_config.entropy_prefetch and not draw_mode:
                 first_nonce = derive_commit_nonce(state.prefetch_salt, 0, -1)
                 state.entropy_ticket = target_pipeline.entropy_source.prefetch(
                     req_config.sample_count, first_nonce

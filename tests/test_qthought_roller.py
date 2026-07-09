@@ -595,8 +595,8 @@ def test_qthought_presets_registered() -> None:
     }
     assert BUILTIN_PRESETS["qthought_think"] == {
         "temperature_strategy": "coherence_gate",
-        "coherence_inner_strategy": "hvh_drift",
-        "hvh_t_base": 1.45,
+        "coherence_inner_strategy": "edt",
+        "edt_base_temp": 0.8,
         "top_k": 50,
         "top_p": 0.9,
         "coherence_threshold": 3.5,

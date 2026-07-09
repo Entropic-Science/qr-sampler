@@ -18,10 +18,11 @@ overrides:
   # divergent hvh_drift family as the gate's inner strategy. sample_count /
   # zscore_calibration_samples are degrade-fallback only.
   temperature_strategy: coherence_gate
-  coherence_inner_strategy: hvh_drift
-  hvh_t_base: 1.45
-  # top_k/top_p truncation is load-bearing HERE (valid propose_speech tool call);
-  # SPEAK runs untruncated. See presets.py.
+  # EDT (cool/adaptive), not hvh_drift: a hot inner strategy corrupts the
+  # propose_speech tool call even WITH truncation. See presets.py.
+  coherence_inner_strategy: edt
+  edt_base_temp: 0.8
+  # top_k/top_p truncation is load-bearing HERE (valid tool call); SPEAK is free.
   top_k: 50
   top_p: 0.9
   coherence_threshold: 3.5

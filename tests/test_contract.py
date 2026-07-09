@@ -105,8 +105,8 @@ def test_preset_qthought_dict_pinned() -> None:
 def test_preset_qthought_think_dict_pinned() -> None:
     assert BUILTIN_PRESETS[contract.PRESET_QTHOUGHT_THINK] == {
         "temperature_strategy": "coherence_gate",
-        "coherence_inner_strategy": "hvh_drift",
-        "hvh_t_base": 1.45,
+        "coherence_inner_strategy": "edt",
+        "edt_base_temp": 0.8,
         "top_k": 50,
         "top_p": 0.9,
         "coherence_threshold": 3.5,
