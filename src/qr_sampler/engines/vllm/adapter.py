@@ -402,6 +402,41 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         """
         self._update_state_impl(batch_update)
 
+    @staticmethod
+    def _added_index_and_params(added: Any) -> tuple[int | None, Any]:
+        """Extract ``(batch_index, SamplingParams)`` from one ``BatchUpdate.added`` item.
+
+        vLLM V1 passes ``AddedRequest`` as a TUPLE
+        ``(index, params, prompt_tok_ids, output_tok_ids)`` (see
+        ``vllm.v1.sample.logits_processor.interface``). Earlier/mocked shapes
+        exposed ``.req_index`` / ``.sampling_params`` attributes. BOTH are
+        supported so an ABI wobble degrades to "read the tuple" rather than
+        silently dropping every per-request override — the failure mode where
+        no per-request state is built and every token routes to the process
+        default (per-request ``extra_args`` become dead).
+        """
+        if isinstance(added, (tuple, list)):
+            idx = added[0] if len(added) > 0 else None
+            params = added[1] if len(added) > 1 else None
+            return idx, params
+        return getattr(added, "req_index", None), getattr(added, "sampling_params", None)
+
+    @staticmethod
+    def _moved_indices(moved: Any) -> tuple[int | None, int | None, bool]:
+        """Extract ``(src_index, dst_index, is_swap)`` from one ``BatchUpdate.moved`` item.
+
+        vLLM V1 passes ``MovedRequest`` as ``(index1, index2, MoveDirectionality)``;
+        a directionality whose name is ``SWAP`` exchanges the two batch slots
+        (otherwise it is a one-way move). Mocked shapes exposed
+        ``.src_index`` / ``.dst_index``.
+        """
+        if isinstance(moved, (tuple, list)):
+            src = moved[0] if len(moved) > 0 else None
+            dst = moved[1] if len(moved) > 1 else None
+            direction = moved[2] if len(moved) > 2 else None
+            return src, dst, getattr(direction, "name", "") == "SWAP"
+        return getattr(moved, "src_index", None), getattr(moved, "dst_index", None), False
+
     def _update_state_impl(self, batch_update: Any | None) -> None:
         if batch_update is None:
             return
@@ -435,27 +470,28 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                         },
                     )
 
-        # 2. Process moves (index reassignments).
+        # 2. Process moves / swaps (index reassignments).
         for moved in getattr(batch_update, "moved", []):
-            if hasattr(moved, "src_index") and hasattr(moved, "dst_index"):
-                state = self._request_states.pop(moved.src_index, None)
-                if state is not None:
-                    self._request_states[moved.dst_index] = state
+            src_idx, dst_idx, is_swap = self._moved_indices(moved)
+            if src_idx is None or dst_idx is None:
+                continue
+            src_state = self._request_states.pop(src_idx, None)
+            if is_swap:
+                dst_state = self._request_states.pop(dst_idx, None)
+                if src_state is not None:
+                    self._request_states[dst_idx] = src_state
+                if dst_state is not None:
+                    self._request_states[src_idx] = dst_state
+            elif src_state is not None:
+                self._request_states[dst_idx] = src_state
 
         # 3. Process additions.
         for added in getattr(batch_update, "added", []):
-            req_idx = getattr(added, "req_index", None)
+            req_idx, params = self._added_index_and_params(added)
             if req_idx is None:
                 continue
 
-            extra_args = (
-                getattr(
-                    getattr(added, "sampling_params", None),
-                    "extra_args",
-                    None,
-                )
-                or {}
-            )
+            extra_args = getattr(params, "extra_args", None) or {}
 
             # Resolve per-request config.
             req_config = resolve_config(self._default_config, extra_args)

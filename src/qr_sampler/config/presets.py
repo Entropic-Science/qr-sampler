@@ -91,17 +91,20 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "zscore_calibration_samples": 200,
     },
     # Qthought REFLECT lane — the private inner-voice / propose-speech completion.
-    # Every token now rides a server-integrated 1 MiB draw (qr_purity GetDraw)
-    # under the coherence-gated temperature: the divergent hvh_drift family is
-    # the gate's INNER strategy (hotter base 1.45 for divergent reflection), and
-    # the cross-device coherence statistic boosts it when significant.
+    # Every token rides a server-integrated 1 MiB draw (qr_purity GetDraw) under
+    # the coherence-gated hvh_drift temperature. **top_k=50 / top_p=0.9
+    # truncation is LOAD-BEARING HERE**: REFLECT must emit a parseable
+    # ``propose_speech`` tool call, and quantum-uniform selection over the FULL
+    # untruncated distribution picks low-probability tokens often enough to
+    # corrupt it (→ strength 0.0 → the mind never speaks). Truncation is confined
+    # to this lane; SPEAK runs free (see below).
     # ``sample_count`` / ``zscore_calibration_samples`` are degrade-fallback only.
     PRESET_QTHOUGHT_THINK: {
         "temperature_strategy": "coherence_gate",
         "coherence_inner_strategy": "hvh_drift",
         "hvh_t_base": 1.45,
-        "top_k": 0,
-        "top_p": 1.0,
+        "top_k": 50,
+        "top_p": 0.9,
         "coherence_threshold": 3.5,
         "coherence_t_boost_max": 0.5,
         "coherence_ema_alpha": 0.3,
@@ -111,16 +114,19 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "sample_count": 6000,
         "zscore_calibration_samples": 200,
     },
-    # Qthought SPEAK lane — the user-visible voice. Server-integrated 1 MiB draws
-    # under the coherence gate, with the composed EDT strategy (nucleus + top-k,
-    # cooler than REFLECT) as the gate's INNER strategy.
+    # Qthought SPEAK lane — the user-visible voice, deliberately UNtruncated
+    # (top_k=0 / top_p=1.0): the spoken turn is free text with no structure to
+    # protect, so it samples the FULL distribution over server-integrated 1 MiB
+    # draws under the coherence-gated EDT temperature — all the quantum
+    # randomness and weirdness the entropy affords. Truncation stays on the
+    # REFLECT lane only.
     # ``sample_count`` / ``zscore_calibration_samples`` are degrade-fallback only.
     PRESET_QTHOUGHT_VOICE: {
         "temperature_strategy": "coherence_gate",
         "coherence_inner_strategy": "edt",
         "edt_base_temp": 0.8,
-        "top_k": 50,
-        "top_p": 0.9,
+        "top_k": 0,
+        "top_p": 1.0,
         "coherence_threshold": 3.5,
         "coherence_t_boost_max": 0.5,
         "coherence_ema_alpha": 0.3,

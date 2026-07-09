@@ -20,8 +20,10 @@ overrides:
   temperature_strategy: coherence_gate
   coherence_inner_strategy: hvh_drift
   hvh_t_base: 1.45
-  top_k: 0
-  top_p: 1.0
+  # top_k/top_p truncation is load-bearing HERE (valid propose_speech tool call);
+  # SPEAK runs untruncated. See presets.py.
+  top_k: 50
+  top_p: 0.9
   coherence_threshold: 3.5
   coherence_t_boost_max: 0.5
   coherence_ema_alpha: 0.3

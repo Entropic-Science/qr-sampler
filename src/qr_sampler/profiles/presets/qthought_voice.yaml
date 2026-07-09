@@ -18,8 +18,9 @@ overrides:
   temperature_strategy: coherence_gate
   coherence_inner_strategy: edt
   edt_base_temp: 0.8
-  top_k: 50
-  top_p: 0.9
+  # Deliberately UNtruncated: free text, all the quantum weirdness. See presets.py.
+  top_k: 0
+  top_p: 1.0
   coherence_threshold: 3.5
   coherence_t_boost_max: 0.5
   coherence_ema_alpha: 0.3

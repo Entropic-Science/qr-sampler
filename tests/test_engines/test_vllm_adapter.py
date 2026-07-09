@@ -428,6 +428,54 @@ class TestUpdateState:
         assert 0 not in adapter._request_states
         assert 5 in adapter._request_states
 
+    # ── vLLM V1 TUPLE ABI ──────────────────────────────────────────────────
+    # The object-shaped mocks above masked an ABI drift: real vLLM V1 passes
+    # AddedRequest as a tuple (index, params, prompt_tok_ids, output_tok_ids)
+    # and MovedRequest as (src, dst, MoveDirectionality). Reading .req_index /
+    # .sampling_params off a tuple returns None, so EVERY addition was skipped,
+    # no per-request state was built, and per-request extra_args silently died
+    # (all tokens routed to the process default). These pin the real shape.
+
+    def test_add_request_tuple_abi_applies_extra_args(self) -> None:
+        adapter = _make_adapter()
+        params = MockSamplingParams(extra_args={"qr_top_k": 100})
+        adapter.update_state(MockBatchUpdate(added=[(0, params, None, [])]))
+        assert 0 in adapter._request_states
+        # The whole point: the per-request override actually reached the config.
+        assert adapter._request_states[0].config.top_k == 100
+
+    def test_remove_and_move_tuple_abi(self) -> None:
+        class _Dir:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        adapter = _make_adapter()
+        adapter.update_state(MockBatchUpdate(added=[(0, MockSamplingParams(), None, [])]))
+        assert 0 in adapter._request_states
+        adapter.update_state(MockBatchUpdate(moved=[(0, 5, _Dir("UNIDIRECTIONAL"))]))
+        assert 0 not in adapter._request_states
+        assert 5 in adapter._request_states
+        adapter.update_state(MockBatchUpdate(removed=[5]))
+        assert 5 not in adapter._request_states
+
+    def test_swap_tuple_abi_exchanges_states(self) -> None:
+        class _Dir:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        adapter = _make_adapter()
+        adapter.update_state(
+            MockBatchUpdate(
+                added=[
+                    (0, MockSamplingParams(extra_args={"qr_top_k": 11}), None, []),
+                    (1, MockSamplingParams(extra_args={"qr_top_k": 22}), None, []),
+                ]
+            )
+        )
+        adapter.update_state(MockBatchUpdate(moved=[(0, 1, _Dir("SWAP"))]))
+        assert adapter._request_states[0].config.top_k == 22
+        assert adapter._request_states[1].config.top_k == 11
+
     def test_none_batch_update(self) -> None:
         """None batch_update is a no-op."""
         adapter = _make_adapter()
