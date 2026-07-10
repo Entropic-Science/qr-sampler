@@ -158,6 +158,21 @@ Paste each created key into its consuming process:
 **No key binds draws to `dragonfly-1`.** That card is the coherence reference
 only.
 
+## `GET /health/entropy` — the passive health route
+
+The shared unit wires `--middleware
+qr_sampler.engines.vllm.health.entropy_health_middleware` (note the
+`module.callable` argv form — a `module:callable` typo crashes only after
+minutes of engine init), restoring the health route a bare `vllm serve`
+lacks. It is **passive**: it answers from the cross-process status files
+described below in O(one file read) and never opens a gRPC channel to the
+QRNG, so health polling adds zero entropy-daemon load. Consumers: the OWUI
+setup guard (`rpc_ok`/`tcp_ok`/`summary`), the `/api/qr-status` chip, and the
+comparison Pipe's no-silent-PRNG banner (`fallback_count` +
+`sampler.currently_degraded`/`age_s`). A 404 from this path means the flag or
+the installed qr-sampler is missing — probes then fail *open* ("unknown": no
+false banner, but no banner on a real degrade either).
+
 ## Honest degradation — the cross-process status file
 
 Fallback labelling stays a property of each entropy-consuming process, surfaced
