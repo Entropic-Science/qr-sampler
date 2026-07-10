@@ -60,6 +60,8 @@ except ImportError:  # pragma: no cover - exercised where vLLM is not installed
     _VLLMLogitsProcessorBase = object  # type: ignore[assignment,misc]
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from qr_sampler.amplification.base import SignalAmplifier
     from qr_sampler.logging.logger import SamplingLogger
     from qr_sampler.temperature.base import TemperatureStrategy
@@ -197,7 +199,8 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # The default source from QR_ENTROPY_SOURCE_TYPE is always included
         # so a request with no per-request override still resolves cleanly.
         self._preinit_sources = self._resolve_preinit_sources(
-            self._default_config.entropy_source_type
+            self._default_config.entropy_source_type,
+            self._default_config.entropy_source_instances,
         )
         self._pipelines: dict[str, SamplingPipeline] = {}
         for source_type in self._preinit_sources:
@@ -271,15 +274,24 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         )
 
     @staticmethod
-    def _resolve_preinit_sources(default_source_type: str) -> list[str]:
+    def _resolve_preinit_sources(
+        default_source_type: str,
+        instance_names: Iterable[str] = (),
+    ) -> list[str]:
         """Parse the pre-init source list from env, deduped and ordered.
 
-        The default source is always included so the no-override path is
-        always serviceable. Order is preserved (first occurrence wins) so
-        operators can document a canonical order in their env config.
+        The result is the UNION of the ``QR_PREINIT_ENTROPY_SOURCES``
+        entries, every declared entropy-source instance name
+        (``entropy_source_instances`` — declaring an instance means you
+        intend to route to it, so it is always pre-initialised), and the
+        default source (so the no-override path is always serviceable).
+        Order is preserved (first occurrence wins) so operators can
+        document a canonical order in their env config. With no declared
+        instances the behavior is identical to the pre-instances adapter.
         """
         raw = os.environ.get(_PREINIT_ENV_VAR, _DEFAULT_PREINIT)
         parsed = [part.strip() for part in raw.split(",") if part.strip()]
+        parsed.extend(name for name in instance_names if name not in parsed)
         if default_source_type not in parsed:
             parsed.append(default_source_type)
         seen: set[str] = set()

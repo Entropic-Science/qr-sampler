@@ -27,6 +27,7 @@ from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig
 from qr_sampler.core.types import PrefetchContext, SamplingResult
 from qr_sampler.entropy.fallback import FallbackEntropySource
+from qr_sampler.entropy.named import InstanceNamedSource
 from qr_sampler.entropy.registry import EntropySourceRegistry
 from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.logging.logger import SamplingLogger
@@ -129,12 +130,31 @@ def accepts_config(cls: type) -> bool:
 def build_entropy_source(config: QRSamplerConfig) -> EntropySource:
     """Build the entropy source from config, wrapping with fallback if needed.
 
+    When ``config.entropy_source_type`` names a declared entropy-source
+    INSTANCE (``config.entropy_source_instances``), the instance is resolved
+    here: the underlying source type is constructed against a config copy
+    carrying the instance's infrastructure overrides (validated against the
+    allowlist at config-construction time), and the built source is wrapped
+    in :class:`~qr_sampler.entropy.named.InstanceNamedSource` so every
+    diagnostic surface reports the INSTANCE name — the loud-labelling
+    contract for e.g. PRNG comparison lanes served through a
+    ``quantum_grpc``-shaped transport.
+
     Args:
         config: Sampler configuration specifying source type and fallback mode.
 
     Returns:
         An EntropySource, potentially wrapped in FallbackEntropySource.
     """
+    instance_name: str | None = None
+    instance_spec = config.entropy_source_instances.get(config.entropy_source_type)
+    if instance_spec is not None:
+        instance_name = config.entropy_source_type
+        merged = config.model_dump()
+        merged.update({key: value for key, value in instance_spec.items() if key != "type"})
+        merged["entropy_source_type"] = instance_spec["type"]
+        config = QRSamplerConfig.model_validate(merged)
+
     source_cls = EntropySourceRegistry.get(config.entropy_source_type)
 
     # Only pass config if the constructor expects it.
@@ -142,6 +162,12 @@ def build_entropy_source(config: QRSamplerConfig) -> EntropySource:
         primary: EntropySource = source_cls(config)  # type: ignore[call-arg]
     else:
         primary = source_cls()
+
+    if instance_name is not None:
+        # Rename the PRIMARY (not the outer fallback wrapper): the fallback
+        # wrapper's log legs and status-file writes all read primary.name,
+        # so this one wrap labels every operator-visible surface.
+        primary = InstanceNamedSource(primary, instance_name)
 
     if config.fallback_mode == "error":
         return primary

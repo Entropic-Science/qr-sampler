@@ -554,3 +554,106 @@ class TestOpenEntropyConfigFields:
         """Verify oe_timeout cannot be overridden per-request."""
         with pytest.raises(ConfigValidationError, match="infrastructure field"):
             validate_extra_args({"qr_oe_timeout": "10.0"})
+
+
+# ---------------------------------------------------------------------------
+# Named entropy-source instances (entropy_source_instances)
+# ---------------------------------------------------------------------------
+
+
+class TestEntropySourceInstances:
+    """Validation of the named entropy-source instances infrastructure field."""
+
+    def test_default_is_empty(self, default_config: QRSamplerConfig) -> None:
+        assert default_config.entropy_source_instances == {}
+
+    def test_valid_instances_accepted(self) -> None:
+        config = QRSamplerConfig(
+            entropy_source_instances={
+                "qbert_prng_uniform": {
+                    "type": "quantum_grpc",
+                    "grpc_api_key": "key-a",
+                },
+                "qbert_prng_markov": {
+                    "type": "quantum_grpc",
+                    "grpc_api_key": "key-b",
+                    "grpc_server_address": "unix:///run/qbert0g/qbert0g.sock",
+                },
+            },
+            _env_file=None,  # type: ignore[call-arg]
+        )
+        assert set(config.entropy_source_instances) == {
+            "qbert_prng_uniform",
+            "qbert_prng_markov",
+        }
+
+    def test_env_var_json_loading(self) -> None:
+        env = {
+            "QR_ENTROPY_SOURCE_INSTANCES": (
+                '{"qbert_prng_uniform":{"type":"quantum_grpc","grpc_api_key":"k"}}'
+            )
+        }
+        with patch.dict(os.environ, env):
+            config = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
+        assert config.entropy_source_instances == {
+            "qbert_prng_uniform": {"type": "quantum_grpc", "grpc_api_key": "k"}
+        }
+
+    def test_unknown_override_key_rejected(self) -> None:
+        """Only the conservative infrastructure allowlist may be overridden."""
+        with pytest.raises(ConfigValidationError, match="outside the allowlist"):
+            QRSamplerConfig(
+                entropy_source_instances={"lane": {"type": "quantum_grpc", "sample_count": 5000}},
+                _env_file=None,  # type: ignore[call-arg]
+            )
+
+    def test_sampling_field_never_allowlisted(self) -> None:
+        """The allowlist stays infrastructure-only (transport + timeout/retry)."""
+        from qr_sampler.config import ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST
+
+        assert {
+            "grpc_server_address",
+            "grpc_api_key",
+            "grpc_mode",
+            "grpc_timeout_ms",
+            "grpc_retry_count",
+        } == ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST
+
+    def test_instance_name_shadowing_builtin_rejected(self) -> None:
+        with pytest.raises(ConfigValidationError, match="shadows a registered"):
+            QRSamplerConfig(
+                entropy_source_instances={"system": {"type": "quantum_grpc"}},
+                _env_file=None,  # type: ignore[call-arg]
+            )
+
+    def test_missing_type_rejected(self) -> None:
+        with pytest.raises(ConfigValidationError, match="must declare 'type'"):
+            QRSamplerConfig(
+                entropy_source_instances={"lane": {"grpc_api_key": "k"}},
+                _env_file=None,  # type: ignore[call-arg]
+            )
+
+    def test_unknown_type_rejected(self) -> None:
+        with pytest.raises(ConfigValidationError, match="must declare 'type'"):
+            QRSamplerConfig(
+                entropy_source_instances={"lane": {"type": "no_such_source"}},
+                _env_file=None,  # type: ignore[call-arg]
+            )
+
+    def test_not_per_request_overridable(self) -> None:
+        """Instances are infrastructure — rejected in per-request extra_args."""
+        assert "entropy_source_instances" not in PER_REQUEST_FIELDS
+        with pytest.raises(ConfigValidationError, match="infrastructure field"):
+            validate_extra_args({"qr_entropy_source_instances": {"lane": {"type": "system"}}})
+
+    def test_instance_name_is_valid_per_request_source_type(self) -> None:
+        """qr_entropy_source_type accepts instance names (a plain string
+        field); the adapter constrains it to pre-initialised names."""
+        defaults = QRSamplerConfig(
+            entropy_source_instances={"qbert_prng_uniform": {"type": "quantum_grpc"}},
+            _env_file=None,  # type: ignore[call-arg]
+        )
+        resolved = resolve_config(defaults, {"qr_entropy_source_type": "qbert_prng_uniform"})
+        assert resolved.entropy_source_type == "qbert_prng_uniform"
+        # The instances declaration itself rides along unchanged.
+        assert resolved.entropy_source_instances == defaults.entropy_source_instances

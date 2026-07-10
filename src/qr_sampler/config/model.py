@@ -22,9 +22,24 @@ from typing import Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from qr_sampler.exceptions import ConfigValidationError
+
 #: Marker for per-request-overridable fields (see module docstring).
 #: ``dict[str, Any]`` keeps it assignable to pydantic's invariant JsonDict.
 _PER_REQUEST: dict[str, Any] = {"per_request": True}
+
+#: Infrastructure fields a named entropy-source instance may override.
+#: Deliberately conservative: transport address, credentials, transport
+#: mode, and timeout/retry — nothing that changes sampling semantics.
+ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "grpc_server_address",
+        "grpc_api_key",
+        "grpc_mode",
+        "grpc_timeout_ms",
+        "grpc_retry_count",
+    }
+)
 
 
 class QRSamplerConfig(BaseSettings):
@@ -123,14 +138,79 @@ class QRSamplerConfig(BaseSettings):
             return "system"
         return v
 
+    entropy_source_instances: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Named entropy-source instances: instance_name -> {'type': "
+            "<builtin source type>, <infrastructure overrides>}. Lets one "
+            "engine pre-initialise several pipelines of the SAME source "
+            "type with different transport config (e.g. two quantum_grpc "
+            "lanes whose API keys bind to different Qbert0G devices), each "
+            "selectable per-request via qr_entropy_source_type. Override "
+            "keys are restricted to ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST. "
+            "Env: QR_ENTROPY_SOURCE_INSTANCES (JSON). Infrastructure — "
+            "NOT per-request overridable."
+        ),
+    )
+
+    @field_validator("entropy_source_instances")
+    @classmethod
+    def _validate_entropy_source_instances(
+        cls, v: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Validate instance declarations loudly at config-construction time.
+
+        Raises :class:`~qr_sampler.exceptions.ConfigValidationError` (NOT a
+        pydantic ``ValidationError``) so a bad ``QR_ENTROPY_SOURCE_INSTANCES``
+        fails startup with the same exception type the rest of the config
+        surface uses. Checks:
+
+        - instance names must not shadow a registered source type;
+        - every instance must declare ``type`` naming a registered source;
+        - override keys are restricted to
+          :data:`ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST`.
+        """
+        if not v:
+            return v
+        # Lazy import: the registry module is import-light (its builtin
+        # table is resolved on demand), and importing it here rather than
+        # at module top keeps config.model free of an entropy-package
+        # import edge at import time.
+        from qr_sampler.entropy.registry import EntropySourceRegistry
+
+        known_types = set(EntropySourceRegistry.list_available())
+        for name, spec in v.items():
+            if name in known_types:
+                raise ConfigValidationError(
+                    f"Entropy-source instance name {name!r} shadows a registered "
+                    f"source type. Instance names must be distinct from source "
+                    f"types: {sorted(known_types)}"
+                )
+            source_type = spec.get("type")
+            if not isinstance(source_type, str) or source_type not in known_types:
+                raise ConfigValidationError(
+                    f"Entropy-source instance {name!r} must declare 'type' naming "
+                    f"a registered source type (got {source_type!r}). "
+                    f"Available: {sorted(known_types)}"
+                )
+            bad_keys = sorted(set(spec) - {"type"} - ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST)
+            if bad_keys:
+                raise ConfigValidationError(
+                    f"Entropy-source instance {name!r} carries override keys "
+                    f"outside the allowlist: {bad_keys}. Allowed overrides: "
+                    f"{sorted(ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST)}"
+                )
+        return v
+
     entropy_source_type: str = Field(
         default="system",
         description=(
-            "Primary entropy source identifier. Per-request switchable so "
-            "comparison mode can fan out two requests to the same engine "
-            "instance with different entropy sources. The engine adapter "
-            "additionally constrains the allowed values at startup to the "
-            "set of entropy sources it has pre-initialised."
+            "Primary entropy source identifier — a registered source type "
+            "or a declared entropy_source_instances name. Per-request "
+            "switchable so comparison mode can fan out two requests to the "
+            "same engine instance with different entropy sources. The "
+            "engine adapter additionally constrains the allowed values at "
+            "startup to the set of entropy sources it has pre-initialised."
         ),
         json_schema_extra=_PER_REQUEST,
     )

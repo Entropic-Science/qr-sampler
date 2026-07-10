@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — named entropy-source instances (qr-llm-research enabler)
+
+- **`entropy_source_instances` infrastructure config field**
+  (`QR_ENTROPY_SOURCE_INSTANCES`, JSON): declare named instances of a
+  registered source type with per-instance transport overrides
+  (allowlist: `grpc_server_address`, `grpc_api_key`, `grpc_mode`,
+  `grpc_timeout_ms`, `grpc_retry_count`). Validated loudly at
+  config-construction time (`ConfigValidationError` on unknown override
+  keys, names shadowing source types, or unknown/missing `type`). NOT
+  per-request overridable.
+- **Adapter preinit union**: the vLLM adapter pre-initialises one pipeline
+  per declared instance (union with `QR_PREINIT_ENTROPY_SOURCES`); a
+  per-request `qr_entropy_source_type` may name an instance, and
+  un-preinitialised names keep the existing clean rejection. With no
+  declared instances behavior is byte-identical to before (test-pinned).
+- **`InstanceNamedSource`** (`entropy/named.py`): rename wrapper applied to
+  the primary source, so `TokenSamplingRecord.entropy_source_used`, the
+  degraded/recovered log legs, and the status file's `primary_name` all
+  carry the instance name end-to-end — PRNG comparison lanes served through
+  a `quantum_grpc`-shaped transport are loudly labelled as PRNG.
+- No `contract.py` change; `CONTRACT_VERSION` unchanged.
+
 ### Removed (2026-07 refactor) — BREAKING, no compatibility kept
 
 - **The entire Modal deployment surface**: `src/qr_sampler/connectors/`

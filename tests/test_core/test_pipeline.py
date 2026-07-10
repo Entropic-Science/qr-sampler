@@ -443,3 +443,103 @@ class TestImportConstraints:
                 continue
             assert not stripped.startswith("import vllm"), f"Forbidden import found: {stripped}"
             assert not stripped.startswith("from vllm"), f"Forbidden import found: {stripped}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: named entropy-source instances in build_entropy_source
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEntropySourceInstances:
+    """Instance names resolve to their underlying type with overrides applied,
+    and the built source reports the INSTANCE name end-to-end."""
+
+    @staticmethod
+    def _register_probe() -> type[Any]:
+        """Register a temporary config-capturing source under 'cfg_probe'."""
+        from qr_sampler.entropy.base import EntropySource
+        from qr_sampler.entropy.registry import EntropySourceRegistry
+
+        @EntropySourceRegistry.register("cfg_probe")
+        class ConfigProbeSource(EntropySource):
+            def __init__(self, config: QRSamplerConfig) -> None:
+                self.captured_config = config
+
+            @property
+            def name(self) -> str:
+                return "cfg_probe"
+
+            @property
+            def is_available(self) -> bool:
+                return True
+
+            def get_random_bytes(self, n: int) -> bytes:
+                return b"\x7f" * n
+
+            def close(self) -> None:
+                pass
+
+        return ConfigProbeSource
+
+    @staticmethod
+    def _unregister_probe() -> None:
+        from qr_sampler.entropy.registry import EntropySourceRegistry
+
+        EntropySourceRegistry._registry.pop("cfg_probe", None)
+
+    def test_instance_resolves_type_and_overrides(self) -> None:
+        """The instance's underlying source is built against a config copy
+        carrying the allowlisted infrastructure overrides."""
+        from qr_sampler.entropy.named import InstanceNamedSource
+
+        self._register_probe()
+        try:
+            config = _make_config(
+                entropy_source_type="prng_lane",
+                entropy_source_instances={
+                    "prng_lane": {
+                        "type": "cfg_probe",
+                        "grpc_api_key": "lane-key",
+                        "grpc_server_address": "unix:///lane.sock",
+                    }
+                },
+            )
+            source = build_entropy_source(config)
+            assert isinstance(source, InstanceNamedSource)
+            assert source.name == "prng_lane"
+            captured = source.inner.captured_config  # type: ignore[attr-defined]
+            assert captured.entropy_source_type == "cfg_probe"
+            assert captured.grpc_api_key == "lane-key"
+            assert captured.grpc_server_address == "unix:///lane.sock"
+        finally:
+            self._unregister_probe()
+
+    def test_instance_with_fallback_labels_primary_leg(self) -> None:
+        """With fallback wrapping, the PRIMARY leg carries the instance name —
+        the status-file/log leg labels read primary.name."""
+        config = _make_config(
+            entropy_source_type="prng_lane",
+            fallback_mode="system",
+            entropy_source_instances={"prng_lane": {"type": "mock_uniform"}},
+        )
+        source = build_entropy_source(config)
+        assert isinstance(source, FallbackEntropySource)
+        assert source.primary_name == "prng_lane"
+        assert source.name == "prng_lane+system"
+
+    def test_record_carries_instance_name(self) -> None:
+        """TokenSamplingRecord.entropy_source_used reports the instance name."""
+        pipeline = _make_pipeline(
+            entropy_source_type="prng_lane",
+            entropy_source_instances={"prng_lane": {"type": "mock_uniform"}},
+        )
+        logits = np.array([3.0, 2.0, 1.0, 0.5, 0.0, -0.5, -1.0, -2.0, -3.0, -4.0])
+        result = pipeline.sample_token(logits)
+        assert result.record.entropy_source_used == "prng_lane"
+
+    def test_non_instance_path_unchanged(self) -> None:
+        """Regression: without declared instances the built source is the
+        plain type-named source, exactly as before."""
+        config = _make_config()
+        source = build_entropy_source(config)
+        assert source.name == "mock_uniform"

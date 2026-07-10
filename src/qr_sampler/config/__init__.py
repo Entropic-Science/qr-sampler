@@ -13,7 +13,12 @@ All public names are re-exported at the package level; downstream
 consumers outside this repo must import them via ``qr_sampler.contract``.
 """
 
-from qr_sampler.config.model import ALL_FIELDS, PER_REQUEST_FIELDS, QRSamplerConfig
+from qr_sampler.config.model import (
+    ALL_FIELDS,
+    ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST,
+    PER_REQUEST_FIELDS,
+    QRSamplerConfig,
+)
 from qr_sampler.config.presets import (
     BUILTIN_PRESETS,
     PRESET_QTHOUGHT,
@@ -28,6 +33,7 @@ from qr_sampler.config.resolve import resolve_config, validate_extra_args
 __all__ = [
     "ALL_FIELDS",
     "BUILTIN_PRESETS",
+    "ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST",
     "PER_REQUEST_FIELDS",
     "PRESET_QTHOUGHT",
     "PRESET_QTHOUGHT_PURITY",

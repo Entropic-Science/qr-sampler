@@ -10,6 +10,7 @@ for convenient access::
 from qr_sampler.entropy.base import EntropySource
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.entropy.mock import MockUniformSource
+from qr_sampler.entropy.named import InstanceNamedSource
 from qr_sampler.entropy.registry import EntropySourceRegistry, register_entropy_source
 from qr_sampler.entropy.system import SystemEntropySource
 
@@ -22,6 +23,7 @@ __all__ = [
     "EntropySource",
     "EntropySourceRegistry",
     "FallbackEntropySource",
+    "InstanceNamedSource",
     "MockUniformSource",
     "SystemEntropySource",
     "register_entropy_source",

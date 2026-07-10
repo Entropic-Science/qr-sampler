@@ -768,3 +768,112 @@ class TestPerRequestEntropySourceOverride:
 
         assert adapter._request_states[0].source.__class__ is MockUniformSource
         adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: named entropy-source instances
+# ---------------------------------------------------------------------------
+
+_INSTANCES_JSON = '{"qbert_prng_uniform": {"type": "mock_uniform"}}'
+
+
+class TestEntropySourceInstances:
+    """Preinit + per-request routing for named entropy-source instances."""
+
+    def test_declared_instances_are_preinitialised(self) -> None:
+        """Declared instances get their own pipeline even when absent from
+        QR_PREINIT_ENTROPY_SOURCES (union semantics)."""
+        adapter = _make_adapter(
+            preinit_sources="mock_uniform",
+            entropy_source_instances=_INSTANCES_JSON,
+        )
+        try:
+            assert sorted(adapter._pipelines) == ["mock_uniform", "qbert_prng_uniform"]
+            instance_pipeline = adapter._pipelines["qbert_prng_uniform"]
+            assert instance_pipeline.entropy_source.name == "qbert_prng_uniform"
+        finally:
+            adapter.close()
+
+    def test_per_request_instance_routing_and_record_label(self) -> None:
+        """A request selecting the instance routes to its pipeline, and the
+        TokenSamplingRecord carries the INSTANCE name (loud PRNG labelling)."""
+        adapter = _make_adapter(
+            preinit_sources="mock_uniform",
+            entropy_source_instances=_INSTANCES_JSON,
+            diagnostic_mode="true",
+        )
+        try:
+            params = MockSamplingParams(extra_args={"qr_entropy_source_type": "qbert_prng_uniform"})
+            adapter.update_state(
+                MockBatchUpdate(added=[MockAddedRequest(req_index=0, sampling_params=params)])
+            )
+            state = adapter._request_states[0]
+            assert state.pipeline is adapter._pipelines["qbert_prng_uniform"]
+            assert state.dominant_source_name == "qbert_prng_uniform"
+
+            logits = np.array([[5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]])
+            adapter.apply(logits)
+            records = adapter._pipelines["qbert_prng_uniform"].sampling_logger.get_diagnostic_data()
+            assert records, "instance pipeline logged no records"
+            assert records[-1].entropy_source_used == "qbert_prng_uniform"
+        finally:
+            adapter.close()
+
+    def test_unpreinitialised_instance_name_rejected(self) -> None:
+        """An instance name that was never declared keeps the existing clean
+        rejection at request-add time."""
+        adapter = _make_adapter(
+            preinit_sources="mock_uniform",
+            entropy_source_instances=_INSTANCES_JSON,
+        )
+        try:
+            params = MockSamplingParams(extra_args={"qr_entropy_source_type": "undeclared_lane"})
+            with pytest.raises(ConfigValidationError, match="not pre-initialised"):
+                adapter.update_state(
+                    MockBatchUpdate(added=[MockAddedRequest(req_index=0, sampling_params=params)])
+                )
+        finally:
+            adapter.close()
+
+    def test_no_instances_regression(self) -> None:
+        """Risk §8.1 pin: with QR_ENTROPY_SOURCE_INSTANCES unset, preinit
+        resolution and pipeline set are identical to the pre-instances
+        adapter."""
+        import os
+
+        assert "QR_ENTROPY_SOURCE_INSTANCES" not in os.environ
+        adapter = _make_adapter()
+        try:
+            assert adapter.default_config.entropy_source_instances == {}
+            assert sorted(adapter._pipelines) == ["mock_uniform"]
+        finally:
+            adapter.close()
+        # The one-argument call (no instances) is the legacy shape.
+        old_env = os.environ.get("QR_PREINIT_ENTROPY_SOURCES")
+        os.environ["QR_PREINIT_ENTROPY_SOURCES"] = "quantum_grpc,system"
+        try:
+            assert VLLMAdapter._resolve_preinit_sources("system") == [
+                "quantum_grpc",
+                "system",
+            ]
+        finally:
+            if old_env is None:
+                os.environ.pop("QR_PREINIT_ENTROPY_SOURCES", None)
+            else:
+                os.environ["QR_PREINIT_ENTROPY_SOURCES"] = old_env
+
+    def test_preinit_union_order(self) -> None:
+        """Env entries first (documented order), then declared instances,
+        then the default source — first occurrence wins."""
+        import os
+
+        old_env = os.environ.get("QR_PREINIT_ENTROPY_SOURCES")
+        os.environ["QR_PREINIT_ENTROPY_SOURCES"] = "quantum_grpc,lane_a"
+        try:
+            resolved = VLLMAdapter._resolve_preinit_sources("system", ["lane_a", "lane_b"])
+            assert resolved == ["quantum_grpc", "lane_a", "lane_b", "system"]
+        finally:
+            if old_env is None:
+                os.environ.pop("QR_PREINIT_ENTROPY_SOURCES", None)
+            else:
+                os.environ["QR_PREINIT_ENTROPY_SOURCES"] = old_env
