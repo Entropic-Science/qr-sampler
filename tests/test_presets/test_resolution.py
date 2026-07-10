@@ -231,3 +231,36 @@ class TestBuiltinPresetsShape:
                 assert key in valid_fields, (
                     f"BUILTIN_PRESETS[{preset_name!r}] references unknown field {key!r}"
                 )
+
+
+class TestChatLightPreset:
+    """The lighter owui / external-caller lane (spec §4.1).
+
+    Pins the lighter-lane contract: fresh quantum entropy into the sampler
+    with NO coherence gate — the cross-device coherence statistic is a
+    qthought scientific-lineage concern, not a general chatbot one.
+    """
+
+    def test_chat_light_is_a_builtin_preset(self) -> None:
+        assert "chat_light" in BUILTIN_PRESETS
+
+    def test_chat_light_resolves_and_uses_quantum_entropy(self) -> None:
+        defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
+        result = resolve_config(defaults, {"qr_preset": "chat_light"})
+        assert result.entropy_source_type == "quantum_grpc"
+
+    def test_chat_light_temperature_strategy_is_not_coherence_gate(self) -> None:
+        """The lighter lane must never ride the coherence gate."""
+        defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
+        result = resolve_config(defaults, {"qr_preset": "chat_light"})
+        assert result.temperature_strategy != "coherence_gate"
+        assert result.temperature_strategy == "fixed"
+
+    def test_chat_light_uses_plain_local_amplifier_not_server_draw(self) -> None:
+        """A plain amplifier (local byte fetch + z-score), not the
+        server-integrated qr_purity draw the qthought* lanes use."""
+        overrides = BUILTIN_PRESETS["chat_light"]
+        assert overrides["signal_amplifier_type"] == "zscore_mean"
+        # No server-draw / coherence keys leak into the lighter lane.
+        assert "coherence_inner_strategy" not in overrides
+        assert not any(key.startswith("coherence_") for key in overrides)

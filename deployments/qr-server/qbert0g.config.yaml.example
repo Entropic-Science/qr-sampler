@@ -1,0 +1,116 @@
+# Qbert0G — shared qr-server deployment (single entropy daemon, sole owner
+# of both Dragonfly cards).
+#
+# This is the box-level "self-containment" entropy config: ONE qbert0g
+# daemon owns dragonfly-0 (the sole DRAW card) and dragonfly-1 (COHERENCE
+# reference only). Every client — the shared qr-sampler vLLM, qthought's
+# broker, owui, any future external caller — draws through this one daemon
+# on /run/qbert0g.sock, so the per-read device lock (devices.py) is a single
+# serialization point: no measured byte is ever served twice, under any
+# interleaving of clients.
+#
+# CANONICAL COPY: this file is kept byte-identical to
+#   qr-sampler/deployments/qr-server/qbert0g.config.yaml.example
+# (the qr-server profile consumes it). Edit both together.
+#
+# Validation is strict: unknown keys are rejected at startup (a typo must
+# never silently change what randomness is served). Copy to
+# /etc/qthought/qbert0g.config.yaml and fill in the bootstrap key.
+
+# ── Wire / transport ─────────────────────────────────────────────────────────
+server:
+  # Loopback TCP for on-box CLI/probe use; the preferred client transport is
+  # the UNIX domain socket below (lowest latency, on-box only).
+  listen: "127.0.0.1:50051"
+  unix_socket: "/run/qbert0g.sock"
+  request_timeout: 5.0
+  max_message_size: 16777216   # 16 MB
+  failover_enabled: false       # ONE draw card — there is nothing to fail over to
+
+# ── Database (API keys + usage tracking) ─────────────────────────────────────
+database:
+  path: "/var/lib/qbert0g/qbert0g.db"
+
+# ── API-key auth ─────────────────────────────────────────────────────────────
+# Bootstrap admin key (device "*"), created on first startup. Provision the
+# three per-client keys with `qbert0g keys`, ALL bound to dragonfly-0:
+#   qbert0g keys create --name qr-sampler --device dragonfly-0 --max-bytes 2097152
+#   qbert0g keys create --name qthought   --device dragonfly-0
+#   # (future) external caller:
+#   qbert0g keys create --name external   --device dragonfly-0 --max-bytes 2097152
+# No key binds draws to dragonfly-1 — it is the coherence reference only.
+auth:
+  api_key: "sample-only-your-secure-bootstrap-key"
+  header: "api-key"
+
+# ── Service-wide default caps (overridable per API key) ──────────────────────
+# A PurityService draw accounts its whole integration block (2 MiB) against
+# the key's limits, so draw-serving keys need max_bytes_per_request >=
+# integration.block_bytes. rate_limit_per_minute must be high: the default
+# 200 exhausts instantly under the always-on qthought loop + owui traffic and
+# would flip callers to labelled fallback.
+limits:
+  max_bytes_per_request: 2097152     # 2 MiB — matches integration.block_bytes
+  max_bytes_per_day: 107374182400    # 100 GiB
+  rate_limit_per_minute: 100000
+
+# ── Post-processing ──────────────────────────────────────────────────────────
+# Entropy-research deployments REQUIRE raw — SHA-256 launders away exactly the
+# signal they study. (chardev devices ignore this: they serve whatever the
+# driver DMA delivers.)
+post_processing:
+  mode: raw
+
+# ── Freshness (the just-in-time measurement contract) ────────────────────────
+freshness:
+  flush_device_buffer: true       # drain the card FIFO before EVERY measurement
+  emit_generation_timestamp: true # stamp generation_timestamp_ns at measurement
+  allow_pooling: false            # declarative guard — true is refused at startup
+  allow_pregeneration: false      # declarative guard — true is refused at startup
+
+# ── Devices ──────────────────────────────────────────────────────────────────
+# Both Crypta Labs Dragonfly PCIe cards, driven via the dfqrng chardev
+# (/dev/qrngDF*). Each carries a fitted fingerprint (scripts/fit_fingerprint.py).
+# dragonfly-0 is the sole DRAW card (see integration.sources); dragonfly-1 is
+# read ONLY by the background coherence monitor (see coherence.pair). Qbert0G
+# must be the ONLY process reading these nodes (error_bits is clear-on-read).
+devices:
+  - id: "dragonfly-0"
+    type: "chardev"
+    path: "/dev/qrngDF0"
+    pci_address: "0000:09:00.0"
+    fingerprint: "/etc/qthought/fingerprints/dragonfly-0_v1.json"
+  - id: "dragonfly-1"
+    type: "chardev"
+    path: "/dev/qrngDF1"
+    pci_address: "0000:0a:00.0"
+    fingerprint: "/etc/qthought/fingerprints/dragonfly-1_v1.json"
+
+# ── QPI: server-side integration, coherence, purity ─────────────────────────
+# One whole-block integrated draw (u) per PurityService request. ONLY
+# dragonfly-0 is drawable — dragonfly-1 never appears here.
+integration:
+  block_bytes: 2097152        # 2 MiB per draw
+  default_integrator: bit_z   # bit_z | byte_z
+  secondaries: []
+  sources: ["dragonfly-0"]    # the SOLE draw card — dragonfly-1 is NOT drawable
+
+# Background block-correlation monitor between the two cards. dragonfly-1
+# appears ONLY here: it is read by the CoherenceMonitor, never served.
+coherence:
+  enabled: true
+  pair: ["dragonfly-0", "dragonfly-1"]
+  block_bytes: 1024
+  blocks_per_side: 32
+  lag_scan_blocks: 4
+  min_valid_blocks: 24
+  refresh_s: 1.0
+  max_age_s: 5.0
+
+purity:
+  verify_sigma: 6.0
+
+# ── Provenance log ───────────────────────────────────────────────────────────
+provenance:
+  path: "/var/lib/qbert0g/provenance.jsonl"
+  strict: false

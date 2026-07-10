@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# qr-sampler-vllm.service — the ONE shared inference engine on the qr-server box
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-containment deliverable (spec §4.1). This single vLLM + qr-sampler engine
+# REPLACES the two former per-app units (qthought-vllm.service and
+# qr-llm-owui-vllm.service). Both apps — qthought's THINK/SPEAK lanes and owui's
+# lighter chat lane — plus any future external caller are now pure OpenAI-API
+# clients of THIS endpoint on 127.0.0.1:8000. qr-sampler's V1 logits processor
+# auto-registers via its `vllm.logits_processors` entry point, so the per-token
+# quantum amplification is wired with NO extra flag here; the entropy source is
+# selected entirely through the environment (QR_* vars in the profile .env),
+# pointing at the co-located shared qbert0g daemon over its UNIX socket.
+#
+# Each request fully determines its own quantum behaviour per-request via
+# `vllm_xargs` (qr_* keys) → SamplingParams.extra_args → qr-sampler's
+# resolve_config. qthought sends qthought_think / qthought_voice (coherence-gated
+# lineage lanes); owui sends the lighter `chat_light` preset (fresh entropy, NO
+# coherence gate). See deployments/qr-server/README.md.
+#
+# Install:
+#   sudo cp qr-sampler-vllm.service /etc/systemd/system/
+#   sudo install -D -m 600 qr-server.env.example /etc/qr-server/qr-server.env
+#   sudo nano /etc/qr-server/qr-server.env   # fill CHANGEME_ values
+#   sudo systemctl daemon-reload && sudo systemctl enable --now qr-sampler-vllm
+[Unit]
+Description=qr-sampler shared vLLM (OpenAI API @127.0.0.1:8000, PP=4, serialized)
+Documentation=https://github.com/Entropic-Science/qr-sampler
+After=network-online.target
+Wants=network-online.target
+# vLLM does not need entropy to boot (entropy rides per-request via the sampler's
+# gRPC draws), but ordering it after the shared entropy daemon keeps the box's
+# startup coherent.
+After=qbert0g.service
+Wants=qbert0g.service
+
+[Service]
+Type=simple
+# One .env on the box is the single config source. Holds $SHARED_MODEL_PATH,
+# $SHARED_MODEL_NAME and the QR_ENTROPY_* / QR_GRPC_* / QR_PREINIT_ENTROPY_SOURCES
+# / QR_FALLBACK_MODE vars that bind the shared vLLM to the co-located qbert0g
+# daemon with the `qr-sampler` API key. See qr-server.env.example.
+EnvironmentFile=/etc/qr-server/qr-server.env
+# Pipeline parallelism (not tensor) because the 4x RTX 5060s have no NVLink: TP
+# would all-reduce across PCIe every layer and choke; PP crosses the bus only a
+# handful of times per forward pass.
+#
+# --max-num-seqs 1 is LOAD-BEARING (spec §3.2 / AC-7): the running batch is
+# exactly one sequence, so concurrent requests wait in vLLM's FCFS (arrival-order)
+# queue and are admitted one at a time. This gives (a) serialization — one output
+# sequence completes before the next begins, so token entropy draws never
+# interleave across sequences; and (b) fairness — an interactive owui/API request
+# waits at most one in-flight sequence behind qthought's always-on loop. The
+# throughput cost is explicitly accepted for this low-concurrency box.
+#
+# --enable-auto-tool-choice + qwen3_xml parser back qthought's propose_speech
+# REFLECT tool call. They are HARMLESS to owui's plain-text lane, so the single
+# shared engine keeps them (unifying the two former units' flag sets). The parser
+# MUST be qwen3_xml (not hermes): the checkpoint emits <function=...> XML tool
+# calls the hermes parser silently swallows.
+#
+# No --quantization flag — the checkpoint ships pre-quantized and vLLM
+# auto-detects the scheme from the config; forcing one is repo-vs-box drift.
+ExecStart=/usr/bin/env vllm serve ${SHARED_MODEL_PATH} \
+    --pipeline-parallel-size 4 --tensor-parallel-size 1 \
+    --served-model-name ${SHARED_MODEL_NAME} \
+    --host 127.0.0.1 --port 8000 \
+    --max-num-seqs 1 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+    --max-model-len 8192 --gpu-memory-utilization 0.85
+Restart=on-failure
+RestartSec=5
+# vLLM is slow to load the weights across four cards; give it room before timeout.
+TimeoutStartSec=600
+# Every app reaches vLLM on loopback only; do not expose it. The only public hop
+# is each app's own cloudflared frontend edge. To expose the model externally
+# later, add an auth edge IN FRONT of :8000 — do not change --host (see README §5).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qr-sampler-vllm
+
+[Install]
+WantedBy=multi-user.target

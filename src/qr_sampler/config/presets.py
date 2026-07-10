@@ -69,6 +69,24 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "top_k": 0,
         "top_p": 1.0,
     },
+    # Lighter chat lane for owui and any future external caller. Fresh quantum
+    # entropy drives selection (entropy_source_type=quantum_grpc via the local
+    # zscore_mean amplifier — a plain per-token byte fetch + z-score, NOT the
+    # server-integrated qr_purity draw), under a plain fixed T=1 with no
+    # truncation. Deliberately carries NO coherence_gate: the cross-device
+    # coherence statistic is a qthought scientific-lineage concern, not a
+    # general chatbot one, so this lane never asks the server for the coherence
+    # triple and never boosts temperature. This preset is NOT scientific
+    # lineage and is referenced by the plain qr_preset string, so it does not
+    # cross contract.py.
+    "chat_light": {
+        "entropy_source_type": "quantum_grpc",
+        "signal_amplifier_type": "zscore_mean",
+        "temperature_strategy": "fixed",
+        "fixed_temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0,
+    },
     # Qthought decode lane (qr_sampler.qthought.QthoughtRoller). The grammar
     # makes one full-size entropy fetch per case-frame decision, each reduced to
     # a uniform via the amplifier — same shape as one token-sampling step's

@@ -13,9 +13,14 @@ to connect to a specific entropy source. Every profile contains:
 
 | Profile | Entropy source | What it runs |
 |---------|---------------|--------------|
+| [`qr-server/`](qr-server/) | Dragonfly QRNG via co-located Qbert0G (UDS) | **systemd** box profile: ONE shared vLLM + ONE shared Qbert0G daemon that qthought, owui, and future external callers share as thin clients |
 | [`urandom/`](urandom/) | `os.urandom()` via gRPC | vLLM + co-located gRPC entropy server |
 | [`openentropy/`](openentropy/) | OpenEntropy device via gRPC | vLLM + co-located gRPC entropy server |
 | [`_template/`](_template/) | Your custom source | Starting point for new profiles |
+
+> The `qr-server/` profile is a **systemd** deployment (not Docker Compose): it is
+> the box-level "self-containment" layout where two shared servers own the hardware
+> and every app is a loopback/UDS client. See [`qr-server/README.md`](qr-server/README.md).
 
 > The `firefly-1` external-QRNG profile was retired 2026-07 — the qthought
 > deployment draws all entropy locally (co-located Dragonfly QRNG over a UNIX

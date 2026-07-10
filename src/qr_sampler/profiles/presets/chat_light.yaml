@@ -1,0 +1,27 @@
+id: chat_light
+name: "Chat (light)"
+description: |
+  Lighter chat lane for qr-llm-owui and any future external OpenAI-API
+  caller. Fresh quantum entropy still drives token selection
+  (``entropy_source_type: quantum_grpc``), amplified locally by the plain
+  ``zscore_mean`` amplifier — a per-token byte fetch + z-score, NOT the
+  server-integrated ``qr_purity`` draw path used by the ``qthought*`` lanes.
+
+  Temperature is a plain fixed 1.0 with no top-k / top-p truncation, so the
+  full distribution is sampled under quantum-driven selection.
+
+  Deliberately carries **no** ``coherence_gate``: the cross-device coherence
+  statistic is a qthought scientific-lineage concern, not a general chatbot
+  one. This lane never requests the coherence triple and never boosts
+  temperature. Not scientific lineage; referenced by the plain ``qr_preset``
+  string, so it does not cross ``contract.py`` (no CONTRACT_VERSION bump).
+
+experimental: false
+origin: null
+overrides:
+  entropy_source_type: quantum_grpc
+  signal_amplifier_type: zscore_mean
+  temperature_strategy: fixed
+  fixed_temperature: 1.0
+  top_k: 0
+  top_p: 1.0

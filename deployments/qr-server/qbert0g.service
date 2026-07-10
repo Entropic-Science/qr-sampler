@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# qbert0g.service — the ONE shared QRNG entropy daemon on the qr-server box
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-containment deliverable (spec §4.2). This single Qbert0G daemon REPLACES
+# the two former per-app units (qthought-qbert0g.service and
+# qr-llm-owui-qbert0g.service). It is the SOLE owner of both Dragonfly cards:
+#   * dragonfly-0 — the ONLY draw card (integration.sources: [dragonfly-0])
+#   * dragonfly-1 — COHERENCE reference only (coherence.pair; never served)
+# and serves three protocols on one socket:
+#   * qr_entropy.EntropyService  — qr-sampler's native byte fetches
+#   * qr_purity.PurityService    — server-integrated draws (the u for each lane)
+#   * qrng.QuantumRNG            — the public draw API
+# Every client — the shared qr-sampler vLLM (key: qr-sampler), qthought's broker
+# (key: qthought), owui, and any future external caller (key: external) — draws
+# through THIS one daemon over /run/qbert0g.sock. Because all draws funnel through
+# the single draw card, the per-read device lock (devices.py: flush buffer →
+# measure fresh → stamp generation_timestamp_ns → serve exclusively) is a single
+# serialization point: no measured byte is ever served twice, under ANY
+# interleaving of clients (spec §3.1, the freshness/non-reuse guarantee).
+#
+# Entropy stays LOCAL: this daemon binds a UDS / loopback only and is NEVER
+# exposed off-box. There is no entropy tunnel — each app's cloudflared unit
+# carries only its frontend hop.
+#
+# The config pins the honesty invariants (see qbert0g.config.yaml.example):
+# post_processing=raw (NOT sha256), freshness.flush_device_buffer=true,
+# allow_pooling/allow_pregeneration=false (refused at startup), and
+# max_bytes_per_request >= integration.block_bytes (2 MiB).
+#
+# Install:
+#   sudo cp qbert0g.service /etc/systemd/system/
+#   sudo install -D -m 600 qbert0g.config.yaml.example /etc/qbert0g/qbert0g.config.yaml
+#   sudo nano /etc/qbert0g/qbert0g.config.yaml   # set auth.api_key + device paths
+#   sudo systemctl daemon-reload && sudo systemctl enable --now qbert0g
+#   # then provision the three dragonfly-0 keys (see README §"Provisioning keys")
+[Unit]
+Description=qbert0g shared QRNG entropy daemon (raw, flushed, JIT; both cards)
+Documentation=https://github.com/Entropic-Science/Qbert0G
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# config.yaml is the single source of truth (auth key, devices, integration,
+# coherence pair, freshness). See qbert0g.config.yaml.example — kept
+# byte-identical to Qbert0G/deployments/qr-server/qbert0g.config.yaml.example.
+ExecStart=/usr/bin/env qbert0g serve --config /etc/qbert0g/qbert0g.config.yaml
+Restart=on-failure
+RestartSec=3
+# The chardev QRNG nodes (/dev/qrngDF*) need exclusive access — Qbert0G must be
+# the ONLY process reading them (error_bits is clear-on-read). Run as a dedicated
+# user with device access on the real box (set User=/Group= when provisioning).
+# RuntimeDirectory ensures /run/qbert0g exists for the UDS with the right perms.
+RuntimeDirectory=qbert0g
+RuntimeDirectoryMode=0750
+# StateDirectory ensures /var/lib/qbert0g exists for the daemon's SQLite key/usage
+# store (config `database.path`). Manage keys with `qbert0g keys --config ...`.
+StateDirectory=qbert0g
+StateDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbert0g
+
+[Install]
+WantedBy=multi-user.target
