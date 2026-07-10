@@ -69,6 +69,27 @@ class TestSystemdUnitsParse:
         # Pipeline (not tensor) parallel across the 4 no-NVLink cards.
         assert "--pipeline-parallel-size 4" in text
 
+    def test_vllm_unit_wires_entropy_health_middleware(self) -> None:
+        """GET /health/entropy must exist on the stock vLLM API server.
+
+        The passive status-file reader (qr_sampler.engines.vllm.health) is
+        what the OWUI setup guard / qr-status chip / no-silent-PRNG banner
+        probe. The argv form MUST be ``module.callable`` (vLLM rsplits on
+        '.'); a ``module:callable`` typo crashes only after minutes of
+        engine init, so pin the exact string here.
+        """
+        text = (_PROFILE / "qr-sampler-vllm.service").read_text(encoding="utf-8")
+        flag = "--middleware qr_sampler.engines.vllm.health.entropy_health_middleware"
+        assert flag in text
+        assert ":entropy_health_middleware" not in text  # the crash-after-3-min typo
+        # The referenced callable must actually exist and be a coroutine
+        # function (vLLM applies functions via app.middleware('http')).
+        import inspect
+
+        from qr_sampler.engines.vllm.health import entropy_health_middleware
+
+        assert inspect.iscoroutinefunction(entropy_health_middleware)
+
     def test_qbert0g_unit_serves_shared_socket(self) -> None:
         text = (_PROFILE / "qbert0g.service").read_text(encoding="utf-8")
         assert "qbert0g serve" in text

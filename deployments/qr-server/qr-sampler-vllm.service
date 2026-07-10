@@ -60,11 +60,19 @@ EnvironmentFile=/etc/qr-server/qr-server.env
 #
 # No --quantization flag — the checkpoint ships pre-quantized and vLLM
 # auto-detects the scheme from the config; forcing one is repo-vs-box drift.
+#
+# --middleware restores GET /health/entropy on the stock vLLM API server: a
+# PASSIVE reader of the cross-process entropy-status file (never a live QRNG
+# probe) that feeds the OWUI setup guard, /api/qr-status chip, and the
+# comparison Pipe's no-silent-PRNG banner. The argv form is
+# `module.callable` (rsplit on '.'), NOT `module:callable` — the wrong form
+# crashes the server only AFTER minutes of engine init.
 ExecStart=/usr/bin/env vllm serve ${SHARED_MODEL_PATH} \
     --pipeline-parallel-size 4 --tensor-parallel-size 1 \
     --served-model-name ${SHARED_MODEL_NAME} \
     --host 127.0.0.1 --port 8000 \
     --max-num-seqs 1 \
+    --middleware qr_sampler.engines.vllm.health.entropy_health_middleware \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --max-model-len 8192 --gpu-memory-utilization 0.85
 Restart=on-failure
