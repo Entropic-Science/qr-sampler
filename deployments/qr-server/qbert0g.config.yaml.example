@@ -5,7 +5,7 @@
 # daemon owns dragonfly-0 (the sole DRAW card) and dragonfly-1 (COHERENCE
 # reference only). Every client — the shared qr-sampler vLLM, qthought's
 # broker, owui, any future external caller — draws through this one daemon
-# on /run/qbert0g.sock, so the per-read device lock (devices.py) is a single
+# on /run/qbert0g/qbert0g.sock, so the per-read device lock (devices.py) is a single
 # serialization point: no measured byte is ever served twice, under any
 # interleaving of clients.
 #
@@ -22,7 +22,7 @@ server:
   # Loopback TCP for on-box CLI/probe use; the preferred client transport is
   # the UNIX domain socket below (lowest latency, on-box only).
   listen: "127.0.0.1:50051"
-  unix_socket: "/run/qbert0g.sock"
+  unix_socket: "/run/qbert0g/qbert0g.sock"
   request_timeout: 5.0
   max_message_size: 16777216   # 16 MB
   failover_enabled: false       # ONE draw card — there is nothing to fail over to

@@ -19,7 +19,7 @@ app's own frontend edge.
 flowchart TD
     subgraph box["qr-server box (all loopback / UDS — nothing off-box except each app's frontend edge)"]
         subgraph shared["SHARED SERVERS (own the hardware)"]
-            QB["qbert0g.service<br/>ONE entropy daemon<br/>EntropyService + PurityService + QuantumRNG<br/>/run/qbert0g.sock"]
+            QB["qbert0g.service<br/>ONE entropy daemon<br/>EntropyService + PurityService + QuantumRNG<br/>/run/qbert0g/qbert0g.sock"]
             VLLM["qr-sampler-vllm.service<br/>ONE vLLM + qr-sampler plugin<br/>OpenAI API @ 127.0.0.1:8000<br/>--max-num-seqs 1 (serialized generation)"]
             D0["dragonfly-0<br/>(DRAW card)"]
             D1["dragonfly-1<br/>(COHERENCE reference only)"]

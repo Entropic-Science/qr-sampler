@@ -12,7 +12,7 @@
 #   * qrng.QuantumRNG            — the public draw API
 # Every client — the shared qr-sampler vLLM (key: qr-sampler), qthought's broker
 # (key: qthought), owui, and any future external caller (key: external) — draws
-# through THIS one daemon over /run/qbert0g.sock. Because all draws funnel through
+# through THIS one daemon over /run/qbert0g/qbert0g.sock. Because all draws funnel through
 # the single draw card, the per-read device lock (devices.py: flush buffer →
 # measure fresh → stamp generation_timestamp_ns → serve exclusively) is a single
 # serialization point: no measured byte is ever served twice, under ANY
