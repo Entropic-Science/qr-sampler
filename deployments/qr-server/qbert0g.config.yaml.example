@@ -38,6 +38,11 @@ database:
 #   qbert0g keys create --name qthought   --device dragonfly-0
 #   # (future) external caller:
 #   qbert0g keys create --name external   --device dragonfly-0 --max-bytes 2097152
+# PRNG-vs-QRNG study lanes (qr-llm-research): two more keys, each bound to a
+# seeded control source below — the shared vLLM's named entropy-source
+# instances (QR_ENTROPY_SOURCE_INSTANCES in qr-server.env) carry one each:
+#   qbert0g keys create --name qr-sampler-prng-uniform --device prng_uniform
+#   qbert0g keys create --name qr-sampler-prng-markov  --device prng_markov
 # No key binds draws to dragonfly-1 — it is the coherence reference only.
 auth:
   api_key: "sample-only-your-secure-bootstrap-key"
@@ -86,6 +91,31 @@ devices:
     pci_address: "0000:0a:00.0"
     fingerprint: "/etc/qthought/fingerprints/dragonfly-1_v1.json"
 
+# ── PRNG control sources (matched study controls — loudly NOT quantum) ──────
+# Seeded pseudorandom sources for PRNG-vs-QRNG experiment arms
+# (qr-llm-research). `seed` is REQUIRED (128-bit hex: 0x + 32 digits; no
+# silent time-seeding) so any served block is regenerable offline from
+# (id, seed, stream_offset_bytes). API keys bind to control ids exactly like
+# device ids (see auth above); byte-path draws through these keys produce
+# `kind: "prng"` provenance records — never laundered as quantum. Neither
+# control fronts a card and neither appears in integration.sources, so
+# dragonfly-0 stays the sole drawable device.
+controls:
+  # Canonical uniform stream: numpy PCG64 raw 64-bit outputs, little-endian.
+  - id: "prng_uniform"
+    type: "prng_uniform"
+    seed: "0x9e3779b97f4a7c15f39cc0605cedc834"
+  # Order-1 byte Markov chain replicating dragonfly-0's byte statistics.
+  # OPERATOR PREREQUISITE: fit the npz from raw dragonfly-0 dumps first —
+  #   python scripts/fit_markov.py --device-id dragonfly-0 \
+  #       --out /etc/qthought/models/dragonfly-0_markov_v1.npz dump1.bin [...]
+  # The model file must exist and validate (row-stochastic within 1e-9) when
+  # the daemon STARTS; parsing this config does not require it.
+  - id: "prng_markov"
+    type: "prng_markov"
+    model: "/etc/qthought/models/dragonfly-0_markov_v1.npz"
+    seed: "0x243f6a8885a308d313198a2e03707344"
+
 # ── QPI: server-side integration, coherence, purity ─────────────────────────
 # One whole-block integrated draw (u) per PurityService request. ONLY
 # dragonfly-0 is drawable — dragonfly-1 never appears here.
@@ -111,6 +141,10 @@ purity:
   verify_sigma: 6.0
 
 # ── Provenance log ───────────────────────────────────────────────────────────
+# RECOMMENDED for PRNG-vs-QRNG study runs: `strict: true` — a provenance
+# write failure then fails the draw instead of logging-and-serving, so a
+# study arm can never contain unattributable bytes. Shipped false for
+# day-to-day serving (availability over auditability).
 provenance:
   path: "/var/lib/qbert0g/provenance.jsonl"
   strict: false

@@ -117,6 +117,15 @@ an un-preinitialised value is rejected cleanly. Keep `system` in the list: it is
 the labelled `os.urandom` fallback leg and it enables a quantum-vs-PRNG comparison
 request without a restart.
 
+**Named instances:** `QR_ENTROPY_SOURCE_INSTANCES` (JSON) declares named
+instances of a source type with per-instance infrastructure overrides — the
+qr-server profile ships `qbert_prng_uniform` and `qbert_prng_markov`, both
+`quantum_grpc` pipelines whose API keys are bound to the daemon's seeded PRNG
+control sources (see key provisioning below). Declared instances are always
+pre-initialised (union with the list above) and are selected per-request via
+`qr_entropy_source_type: "<instance name>"`; the instance name is carried
+end-to-end in diagnostics, so a PRNG lane is loudly labelled, never laundered.
+
 ## Per-request lanes (no new server, no contract bump)
 
 Each caller fully determines its own quantum behaviour per-request through the
@@ -134,10 +143,11 @@ fresh quantum entropy into the sampler with **no** coherence gate. It is
 referenced by the plain `qr_preset` string, so it does **not** cross `contract.py`
 and needs no `CONTRACT_VERSION` bump.
 
-## Provisioning keys — three keys, all bound to `dragonfly-0`
+## Provisioning keys — draw keys on `dragonfly-0`, study keys on the controls
 
-One daemon, three API keys, **all bound to the draw card** and created with
-`qbert0g keys create`:
+One daemon. The three original API keys are **all bound to the draw card**;
+the two PRNG study keys are bound to the seeded control sources. All created
+with `qbert0g keys create`:
 
 ```bash
 # 1) The shared vLLM (PurityService draws account the whole 2 MiB integration
@@ -149,14 +159,48 @@ qbert0g keys create --name qthought   --device dragonfly-0
 
 # 3) (future) an external caller — provisioned later; nothing else changes.
 qbert0g keys create --name external   --device dragonfly-0 --max-bytes 2097152
+
+# 4+5) PRNG-vs-QRNG study lanes (qr-llm-research) — each bound to a seeded
+#      control source declared in qbert0g.config.yaml (`controls:`), NOT to a
+#      card. Draws through them produce `kind: "prng"` provenance records.
+qbert0g keys create --name qr-sampler-prng-uniform --device prng_uniform
+qbert0g keys create --name qr-sampler-prng-markov  --device prng_markov
 ```
 
 Paste each created key into its consuming process:
 `qr-sampler` → `QR_GRPC_API_KEY` in this profile's `qr-server.env`;
-`qthought` → `QR_GRPC_API_KEY` in qthought's own env.
+`qthought` → `QR_GRPC_API_KEY` in qthought's own env;
+the two study keys → the matching `grpc_api_key` values inside
+`QR_ENTROPY_SOURCE_INSTANCES` in this profile's `qr-server.env`
+(`qbert_prng_uniform` / `qbert_prng_markov` instances).
 
 **No key binds draws to `dragonfly-1`.** That card is the coherence reference
 only.
+
+### `prng_markov` prerequisite — fit the model first (operator step)
+
+The `prng_markov` control needs an order-1 byte Markov model fitted to
+dragonfly-0's byte statistics **before the daemon starts** (config parsing
+alone does not require the file; startup validation does):
+
+```bash
+# In the Qbert0G repo, from raw dragonfly-0 dumps:
+python scripts/fit_markov.py --device-id dragonfly-0 \
+    --out /etc/qthought/models/dragonfly-0_markov_v1.npz dump1.bin [dump2.bin ...]
+```
+
+The script prints a model-vs-dumps fingerprint summary (byte mean, per-bit
+P(1), lag-1 correlation) — eyeball it before use. Until the npz exists, either
+comment out the `prng_markov` control (and skip its key) or keep the daemon on
+the previous config; the `qbert_prng_markov` vLLM instance then simply rejects
+cleanly per-request.
+
+### `provenance.strict: true` — recommended for study runs
+
+For PRNG-vs-QRNG study sessions, flip `provenance.strict: true` in
+`qbert0g.config.yaml` so a provenance write failure **fails the draw** instead
+of logging-and-serving — a study arm must never contain unattributable bytes.
+Ship-state is `false` (availability over auditability for day-to-day serving).
 
 ## `GET /health/entropy` — the passive health route
 
