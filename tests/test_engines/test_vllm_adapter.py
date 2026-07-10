@@ -744,10 +744,64 @@ class TestPerRequestEntropySourceOverride:
 
     def test_validate_params_accepts_entropy_source_type(self) -> None:
         """validate_params() accepts qr_entropy_source_type — the field is
-        per-request overridable. The hard rejection for un-preinit'd values
-        happens later in update_state(), once the adapter is in the loop."""
+        per-request overridable, and 'system' is in the default preinit
+        allowlist. update_state() keeps the authoritative pipeline check."""
         params = MockSamplingParams(extra_args={"qr_entropy_source_type": "system"})
         VLLMAdapter.validate_params(params)  # Should not raise.
+
+    def test_validate_params_rejects_unknown_source_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AUDIT A-1: an un-preinitialised qr_entropy_source_type VALUE is
+        rejected at request validation (API-server side) — before the request
+        can reach the engine worker, where a raise kills the shared engine."""
+        monkeypatch.delenv("QR_PREINIT_ENTROPY_SOURCES", raising=False)
+        monkeypatch.delenv("QR_ENTROPY_SOURCE_INSTANCES", raising=False)
+        params = MockSamplingParams(extra_args={"qr_entropy_source_type": "nonexistent"})
+        with pytest.raises(ConfigValidationError, match="not pre-initialised"):
+            VLLMAdapter.validate_params(params)
+
+    def test_validate_params_accepts_declared_instance_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Instance names declared via QR_ENTROPY_SOURCE_INSTANCES pass
+        request validation; undeclared ones are rejected in the same call."""
+        monkeypatch.setenv(
+            "QR_ENTROPY_SOURCE_INSTANCES",
+            '{"qbert_prng_uniform":{"type":"quantum_grpc","grpc_api_key":"k"}}',
+        )
+        VLLMAdapter.validate_params(
+            MockSamplingParams(extra_args={"qr_entropy_source_type": "qbert_prng_uniform"})
+        )
+        with pytest.raises(ConfigValidationError, match="not pre-initialised"):
+            VLLMAdapter.validate_params(
+                MockSamplingParams(extra_args={"qr_entropy_source_type": "qbert_prng_markov"})
+            )
+
+    def test_validate_params_default_env_allowlist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No-instances regression: with env unset the allowlist is exactly
+        the default preinit set plus the process-default source."""
+        monkeypatch.delenv("QR_PREINIT_ENTROPY_SOURCES", raising=False)
+        monkeypatch.delenv("QR_ENTROPY_SOURCE_INSTANCES", raising=False)
+        monkeypatch.delenv("QR_ENTROPY_SOURCE_TYPE", raising=False)
+        for name in ("quantum_grpc", "system"):
+            VLLMAdapter.validate_params(
+                MockSamplingParams(extra_args={"qr_entropy_source_type": name})
+            )
+        with pytest.raises(ConfigValidationError, match="not pre-initialised"):
+            VLLMAdapter.validate_params(
+                MockSamplingParams(extra_args={"qr_entropy_source_type": "mock_uniform"})
+            )
+
+    def test_validate_params_tolerates_malformed_instances_json(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A malformed QR_ENTROPY_SOURCE_INSTANCES contributes no names (the
+        engine would refuse to start on it) — builtins still validate."""
+        monkeypatch.setenv("QR_ENTROPY_SOURCE_INSTANCES", "{not json")
+        VLLMAdapter.validate_params(
+            MockSamplingParams(extra_args={"qr_entropy_source_type": "system"})
+        )
 
     def test_no_override_uses_default_source(self) -> None:
         """A request with no qr_entropy_source_type override routes to the

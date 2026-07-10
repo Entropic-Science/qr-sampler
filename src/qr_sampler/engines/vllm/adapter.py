@@ -21,9 +21,11 @@ separate instances for different sampling strategies.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import time
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -73,10 +75,44 @@ _DEFAULT_VOCAB_SIZE = 32000
 
 # Env var listing the entropy sources to pre-initialise at adapter startup.
 # Comma-separated; whitespace tolerated. A per-request ``qr_entropy_source_type``
-# override must name one of these — anything else is rejected when the request
-# is added to the batch.
+# override must name one of these — anything else is rejected at request
+# validation (``validate_params``, API-server side) and again when the request
+# is added to the batch (defense in depth).
 _PREINIT_ENV_VAR = "QR_PREINIT_ENTROPY_SOURCES"
 _DEFAULT_PREINIT = "quantum_grpc,system"
+
+# Env var declaring named entropy-source instances (JSON dict). Read here only
+# for the request-validation allowlist; the authoritative parse/validation
+# lives on ``QRSamplerConfig.entropy_source_instances``.
+_INSTANCES_ENV_VAR = "QR_ENTROPY_SOURCE_INSTANCES"
+
+
+@lru_cache(maxsize=8)
+def _allowed_source_names(
+    preinit_raw: str, instances_raw: str, default_source: str
+) -> frozenset[str]:
+    """Allowlist of per-request ``qr_entropy_source_type`` values, from env.
+
+    Mirrors ``VLLMAdapter._resolve_preinit_sources`` (union of the preinit
+    list, declared instance names, and the process-default source) so the
+    API-server process can reject unknown names at request validation instead
+    of letting the raise happen inside the engine worker's ``update_state`` —
+    an uncaught raise there kills the whole shared engine (EngineDeadError;
+    see qr-llm-research LEARNINGS.md GL-01 / AUDIT.md A-1).
+
+    Cached on the raw env values: they are fixed for a process lifetime in
+    production, while tests that monkeypatch env still get fresh results.
+    A malformed instances JSON contributes no names (the engine itself would
+    have refused to start on it, so this path is never load-bearing).
+    """
+    names = [part.strip() for part in preinit_raw.split(",") if part.strip()]
+    if instances_raw:
+        with contextlib.suppress(ValueError, TypeError):
+            parsed = json.loads(instances_raw)
+            if isinstance(parsed, dict):
+                names.extend(str(key) for key in parsed)
+    names.append(default_source)
+    return frozenset(names)
 
 
 class _RequestState:
@@ -397,10 +433,38 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
 
     @classmethod
     def validate_params(cls, params: Any) -> None:
-        """Validate ``qr_*`` keys in ``params.extra_args``."""
+        """Validate ``qr_*`` keys in ``params.extra_args``.
+
+        Besides the generic key/preset validation, the explicit
+        ``qr_entropy_source_type`` *value* is checked against the env-derived
+        allowlist of pre-initialised sources (builtin types + declared
+        instance names). This runs in the API-server process, so an unknown
+        name becomes a clean per-request rejection instead of an engine-worker
+        raise (AUDIT.md A-1). Preset-expanded source types are not re-checked
+        here (builtin presets only ever set ``quantum_grpc``); the
+        ``update_state`` lookup remains the authoritative guard.
+        """
         extra_args = getattr(params, "extra_args", None) or {}
-        if extra_args:
-            validate_extra_args(extra_args)
+        if not extra_args:
+            return
+        validate_extra_args(extra_args)
+        requested = extra_args.get("qr_entropy_source_type")
+        if isinstance(requested, str):
+            allowed = _allowed_source_names(
+                os.environ.get(_PREINIT_ENV_VAR, _DEFAULT_PREINIT),
+                os.environ.get(_INSTANCES_ENV_VAR, ""),
+                os.environ.get(
+                    "QR_ENTROPY_SOURCE_TYPE",
+                    str(QRSamplerConfig.model_fields["entropy_source_type"].default),
+                ),
+            )
+            if requested not in allowed:
+                raise ConfigValidationError(
+                    f"Entropy source {requested!r} is not pre-initialised for "
+                    f"this deployment. Pre-initialised sources: "
+                    f"{sorted(allowed)}. Set {_PREINIT_ENV_VAR} / "
+                    f"{_INSTANCES_ENV_VAR} at process startup to include it."
+                )
 
     def update_state(self, batch_update: Any | None) -> None:
         """Process batch composition changes.

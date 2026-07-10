@@ -320,6 +320,19 @@ extra_args (qr_*, incl. qr_preset) -> resolve_config(defaults, extra_args)
   -> expand_extra_args (preset expansion) -> validate_extra_args -> new instance
 ```
 
+Named entropy-source instances (2026-07): `entropy_source_instances`
+(env `QR_ENTROPY_SOURCE_INSTANCES`, JSON, infrastructure-only — never
+per-request) declares `instance_name -> {"type": <builtin source type>,
+<allowlisted infra overrides>}`. The vLLM adapter pre-initialises one
+pipeline per instance (union with `QR_PREINIT_ENTROPY_SOURCES`), and the
+per-request `qr_entropy_source_type` accepts instance names; the instance
+name rides `TokenSamplingRecord.entropy_source` and the status-file leg
+labels end-to-end. Un-preinitialised source-name *values* are rejected
+twice: at request validation (`validate_params`, API-server side, against
+the env-derived allowlist — so a bogus name becomes a per-request error,
+never an engine-worker raise; qr-llm-research `AUDIT.md` A-1) and again at
+the `update_state` pipeline lookup (authoritative, defense in depth).
+
 ### QthoughtRoller (`qthought.py`)
 
 One decision = one full-size entropy fetch reduced to a uniform `u` — the
