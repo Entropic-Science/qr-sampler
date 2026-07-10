@@ -51,10 +51,11 @@ class TokenSelector:
         top_p: float,
         u: float,
         min_p: float = 0.0,
+        truncate_first: bool = False,
     ) -> SelectionResult:
         """Select one token from the logit distribution using CDF lookup.
 
-        Pipeline:
+        Pipeline (default order — AGENTS.md invariant 15):
             1. Temperature scaling: logits / T
             2. Top-k filtering: keep only k highest logits
             3. Softmax: convert to probabilities
@@ -63,6 +64,13 @@ class TokenSelector:
             6. Descending sort by probability
             7. Build CDF via cumulative sum
             8. Binary search with u to select token
+
+        With ``truncate_first=True`` (EVDT-TT order) the min-p mask is
+        applied to the RAW (temperature-free) distribution and temperature
+        is applied to the kept support afterwards — see
+        :meth:`_select_truncate_first`. The default ``False`` is a strict
+        no-op: this method's behavior is byte-identical to the pre-flag
+        selector.
 
         Args:
             logits: 1-D logit array (vocab_size,).
@@ -73,6 +81,9 @@ class TokenSelector:
             min_p: Dynamic floor relative to peak probability. Keeps tokens with
                 ``prob >= min_p * max_prob``. ``0.0`` (default) disables, making
                 this a no-op so existing call sites are unaffected.
+            truncate_first: When True, apply the min-p mask BEFORE
+                temperature (truncate-first-then-temperature order).
+                Default False preserves the pinned selector order.
 
         Returns:
             SelectionResult with the selected token and diagnostics.
@@ -80,6 +91,9 @@ class TokenSelector:
         Raises:
             TokenSelectionError: If no candidate tokens survive filtering.
         """
+        if truncate_first:
+            return self._select_truncate_first(logits, temperature, top_k, top_p, u, min_p)
+
         # 1. Temperature scaling.
         if temperature > 0:
             scaled = logits / temperature
@@ -124,6 +138,102 @@ class TokenSelector:
                 "effective_min_p_candidates": effective_min_p_candidates,
                 "min_p_used": min_p,
                 "u": u,
+            },
+        )
+
+    def _select_truncate_first(
+        self,
+        logits: np.ndarray,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        u: float,
+        min_p: float,
+    ) -> SelectionResult:
+        """Truncate-first-then-temperature selection (EVDT-TT order).
+
+        Pipeline:
+            1. Top-k filtering on raw logits (temperature-invariant, so its
+               position relative to T is immaterial — kept first to reuse
+               the logit-space implementation).
+            2. Softmax of the RAW (temperature-free) logits.
+            3. Min-p mask on the raw probabilities: keep tokens with
+               ``p >= min_p * max(p)``.
+            4. Temperature on the kept support: ``softmax(kept_logits / T)``
+               — mathematically identical to ``softmax(log(p_kept) / T)``
+               because renormalisation is a constant offset in log space.
+            5. Top-p (nucleus) filtering.
+            6-8. Descending sort -> CDF -> binary search with u.
+
+        The kept SUPPORT is decided before temperature, so it depends on
+        the raw distribution's shape — the support set is unreachable by
+        any static scale-then-truncate ``(T, min_p)`` configuration.
+
+        Args:
+            logits: 1-D logit array (vocab_size,).
+            temperature: Sampling temperature (<= 0 falls back to greedy,
+                same contract as the default order).
+            top_k: Number of top tokens to keep (<=0 disables).
+            top_p: Nucleus sampling threshold in (0, 1] (1.0 disables).
+            u: Uniform random value from signal amplification, in (0, 1).
+            min_p: Dynamic floor relative to peak RAW probability.
+
+        Returns:
+            SelectionResult with the selected token and diagnostics
+            (including ``"truncate_first": True``).
+
+        Raises:
+            TokenSelectionError: If no candidate tokens survive filtering.
+        """
+        if temperature <= 0:
+            # Greedy: identical contract to the default-order path.
+            max_idx = int(np.argmax(logits))
+            return SelectionResult(
+                token_id=max_idx,
+                token_rank=0,
+                token_prob=1.0,
+                num_candidates=1,
+                diagnostics={"greedy": True, "truncate_first": True},
+            )
+
+        # 1. Top-k on raw logits.
+        filtered, effective_k = self._apply_top_k(logits, top_k)
+
+        # 2. Softmax of the RAW distribution (no temperature).
+        raw_probs = self._stable_softmax(filtered)
+
+        # 3. Min-p mask on raw probabilities.
+        kept_probs, effective_min_p_candidates = self._apply_min_p(raw_probs, min_p)
+        kept_mask = kept_probs > 0
+
+        # 4. Temperature on the kept support. Masking pruned logits to
+        # -inf then dividing by T is equivalent to softmax(log(p_kept)/T):
+        # log(p_kept) = logit - logZ on the kept support, and the constant
+        # -logZ/T offset cancels in the softmax.
+        scaled = np.where(kept_mask, filtered, -np.inf) / temperature
+        probs = self._stable_softmax(scaled)
+
+        # 5. Top-p (nucleus) filtering.
+        probs, effective_n = self._apply_top_p(probs, top_p)
+
+        if effective_n == 0:
+            raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
+
+        # 6-8. CDF selection.
+        vocab_idx, rank, prob, num_candidates = self._cdf_select(probs, u)
+
+        return SelectionResult(
+            token_id=vocab_idx,
+            token_rank=rank,
+            token_prob=prob,
+            num_candidates=num_candidates,
+            diagnostics={
+                "effective_top_k": effective_k,
+                "effective_top_p_candidates": effective_n,
+                "effective_min_p_candidates": effective_min_p_candidates,
+                "min_p_used": min_p,
+                "u": u,
+                "truncate_first": True,
             },
         )
 

@@ -480,6 +480,71 @@ class QRSamplerConfig(BaseSettings):
         json_schema_extra=_PER_REQUEST,
     )
 
+    # --- TT-Entropy-Exchange Temperature Strategy (per-request overridable) ---
+    # V6 research spec §7.3 predicted defaults. Dormant unless
+    # temperature_strategy = "tt_exchange" is explicitly set.
+
+    tt_t_base: float = Field(
+        default=1.0,
+        description="TT-Exchange base temperature (V6 §7.3 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    tt_gamma: float = Field(
+        default=0.6,
+        description=(
+            "TT-Exchange gain on the entropy removed by truncation "
+            "(T = tt_t_base + tt_gamma * max(0, H - H_kept))"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    tt_min_p_base: float = Field(
+        default=0.005,
+        description="TT-Exchange min-p base term (V6 §7.3 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    tt_min_p_scale: float = Field(
+        default=0.025,
+        description="TT-Exchange min-p entropy coefficient (V6 §7.3 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- EVDT-TT Temperature Strategy (per-request overridable) ---
+    # V6 research spec §7.1 predicted defaults. Dormant unless
+    # temperature_strategy = "evdt_tt" is explicitly set. The family's
+    # defining truncate-before-temperature order additionally requires
+    # the per-request selector flag `qr_truncate_first: true`.
+
+    evdt_t_base: float = Field(
+        default=1.25,
+        description="EVDT-TT base temperature (V6 §7.1 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    evdt_alpha: float = Field(
+        default=0.35,
+        description="EVDT-TT entropy coefficient (V6 §7.1 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    evdt_beta: float = Field(
+        default=-0.10,
+        description="EVDT-TT varentropy coefficient (V6 §7.1 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    evdt_min_p_base: float = Field(
+        default=0.008,
+        description="EVDT-TT min-p base term (V6 §7.1 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    evdt_min_p_scale: float = Field(
+        default=0.015,
+        description="EVDT-TT min-p entropy coefficient (V6 §7.1 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    evdt_min_p_vh: float = Field(
+        default=0.005,
+        description="EVDT-TT min-p varentropy coefficient (V6 §7.1 predicted default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+
     # --- Coherence-Gate Temperature Strategy (per-request overridable) ---
     # Dormant unless temperature_strategy = "coherence_gate" is explicitly
     # set. The gate reads the coherence triple from the PREVIOUS
@@ -540,6 +605,18 @@ class QRSamplerConfig(BaseSettings):
             "Default min-p truncation threshold used by the selector when the "
             "active temperature strategy does not emit a per-token min_p. "
             "Default 0.0 disables min-p (preserves prior behavior; NFR-7)."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    truncate_first: bool = Field(
+        default=False,
+        description=(
+            "Selector-order option for truncate-first-then-temperature "
+            "families (EVDT-TT): apply the min-p mask on the RAW "
+            "(temperature-free) distribution, then temperature on the kept "
+            "support. Default False preserves the pinned selector order "
+            "(top-k -> softmax -> min-p -> top-p -> CDF; AGENTS.md "
+            "invariant 15) as a strict no-op."
         ),
         json_schema_extra=_PER_REQUEST,
     )

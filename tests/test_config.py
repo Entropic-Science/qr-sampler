@@ -444,6 +444,17 @@ class TestFieldSets:
                 "coherence_t_boost_max",
                 "coherence_ema_alpha",
                 "coherence_inner_strategy",
+                "tt_t_base",
+                "tt_gamma",
+                "tt_min_p_base",
+                "tt_min_p_scale",
+                "evdt_t_base",
+                "evdt_alpha",
+                "evdt_beta",
+                "evdt_min_p_base",
+                "evdt_min_p_scale",
+                "evdt_min_p_vh",
+                "truncate_first",
             }
         )
         assert intended == PER_REQUEST_FIELDS

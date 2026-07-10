@@ -414,6 +414,7 @@ class SamplingPipeline:
             active_config.top_p,
             u_value,
             min_p=min_p,
+            truncate_first=active_config.truncate_first,
         )
         select_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 

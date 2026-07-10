@@ -196,6 +196,14 @@ deployments/                   # Per-host compose profiles (generic, non-Modal)
     state lives on a per-request instance via `_RequestState`).
 15. **Selector order is `top-k -> softmax -> min-p -> top-p -> CDF`**;
     `min_p=0.0` is a strict no-op. Pinned by `tests/test_selection/`.
+    One explicit, test-pinned exception: the per-request flag
+    `qr_truncate_first` (config `truncate_first`, default `false` = strict
+    no-op) switches to the truncate-first-then-temperature order used by
+    the EVDT-TT family — min-p is applied to the RAW (temperature-free)
+    distribution and temperature to the kept support afterwards
+    (`top-k -> softmax(raw) -> min-p -> temperature -> top-p -> CDF`).
+    Pinned by `tests/test_selection/test_truncate_first.py`; the default
+    path is byte-identical to the pre-flag selector.
 16. **Presets are a thin resolution layer over `extra_args`.**
     `BUILTIN_PRESETS` in `config/presets.py` is the runtime source of truth;
     YAML files under `profiles/presets/` are documentation kept in sync by

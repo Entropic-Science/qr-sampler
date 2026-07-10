@@ -1,0 +1,41 @@
+id: tt_exchange
+name: "TT-Entropy-Exchange"
+description: |
+  Entropy removed by truncation is redeployed as temperature. Ported from
+  the V6 research spec (§7.3).
+
+  Formula:
+    min_p_t = clip(min_p_base + min_p_scale * H, 0, 0.15)
+    p_kept  = renormalise(p >= min_p_t * max(p))      # measured on RAW probs
+    T_t     = clip(T_base + gamma * max(0, H - H_kept), 0.3, 2.2)
+
+  Behavior:
+    - Light truncation (H ~ H_kept) -> T stays near T_base
+    - Aggressive truncation (large H - H_kept) -> T scales up to
+      "compensate" for the information removed
+    - The state variable is the EFFECT of truncation, not the raw
+      (H, VH) measurements — this distinguishes it from EVDT-TT's
+      linear-in-raw form.
+
+  Configuration (V6 §7.3 predicted defaults):
+    QR_TEMPERATURE_STRATEGY=tt_exchange
+    QR_TT_T_BASE=1.0
+    QR_TT_GAMMA=0.6
+    QR_TT_MIN_P_BASE=0.005
+    QR_TT_MIN_P_SCALE=0.025
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "tt_exchange",
+      "qr_tt_gamma": 0.8
+    }
+
+  On the default selector order (invariant 15) this is a
+  scale-then-truncate port. The exact V6 sampling order — min-p on the
+  raw distribution, then temperature on the kept support — additionally
+  requires "qr_truncate_first": true.
+
+sampler_class: "qr_sampler.temperature.tt_exchange:TTExchangeStrategy"
+performance_impact: none
+build_time_locked: false
+requires_vocab_size: true

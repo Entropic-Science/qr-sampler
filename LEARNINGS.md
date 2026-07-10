@@ -117,6 +117,36 @@ argv anywhere, validate flags against
 `vllm.entrypoints.openai.cli_args:make_arg_parser` at startup rather
 than discovering renames in production tracebacks.
 
+### V6 temperature-strategy tranche parity check (2026-07)
+
+Recorded while porting the V6 families `tt_exchange` / `evdt_tt` from
+createmp-evalsuite (research spec §7.1/§7.3). Documented check only — no
+behavior changes:
+
+- **`hvh_drift` matches V6 §8.3 exactly**: temperature and min-p
+  formulas, EMA update `(1−λ)·ema + λ·x`, first-token seeding (Δ = 0,
+  no cold-start branch), drift-after-update ordering, and the guardrail
+  box `T ∈ [0.3, 2.2]`, `min_p ∈ [0, 0.15]`. Defaults deliberately pin
+  the **V6_HVD_R01_01 BO winner**, not the §8.4 *predicted* defaults —
+  that divergence is intentional and documented on the config fields.
+- **`edt` is NOT the createmp/V5 EDT formula.** qr-sampler's `edt`
+  computes `T = base · (H/ln V)^exponent` (power-law of normalised
+  entropy); createmp's `EDTProcessor` computes `T = T0 · N^(θ/H)`
+  (the original entropy-dependent-temperature paper form). Both are
+  entropy-monotone but numerically different. Re-scoping to align them
+  would be a behavior change to a shipped strategy — deferred until a
+  study actually needs createmp-parity EDT (if so, port it as a NEW
+  strategy id, e.g. `edt_v5`, rather than mutating `edt`).
+- The remaining V6 families are deferred: DeCoupT-Smooth (LL-15 R00
+  gate failures), Mixture-of-Temperatures / Nonlinear remap /
+  Ring-buffer (need a probability-transform seam — they reshape the
+  distribution, not just `(T, min_p)`). The seam design is recorded in
+  the qr-llm-research area docs, not here. (LL-14's `T_hot = 1.45`
+  correction applies to the deferred Mixture-of-Temperatures family,
+  so it is not exercised by this tranche.)
+- `qr_truncate_first` (EVDT-TT's truncate-before-temperature order) is
+  the one pinned exception to selector invariant 15 — see AGENTS.md.
+
 ---
 
 ## History (Modal / Open WebUI / Cipherstone era — surface removed 2026-07)

@@ -1,0 +1,43 @@
+id: evdt_tt
+name: "EVDT-TT (truncate-first-then-temperature)"
+description: |
+  Entropy/varentropy-dependent temperature with truncation applied BEFORE
+  temperature. Ported from the V6 research spec (§7.1).
+
+  Formula:
+    min_p_t = clip(min_p_base + min_p_scale * H + min_p_vh * VH, 0, 0.15)
+    T_t     = clip(T_base + alpha * H + beta * VH, 0.3, 2.2)
+
+  Behavior:
+    - Both outputs are linear in the RAW entropy H and varentropy VH of
+      the current token's distribution.
+    - The family's defining property: with truncate-first ordering the
+      kept SUPPORT depends on the raw distribution's shape — a support
+      set unreachable by any static scale-then-truncate (T, min_p)
+      configuration. This requires the per-request selector flag
+      "qr_truncate_first": true (default false preserves the pinned
+      selector order, AGENTS.md invariant 15).
+
+  Configuration (V6 §7.1 predicted defaults):
+    QR_TEMPERATURE_STRATEGY=evdt_tt
+    QR_EVDT_T_BASE=1.25
+    QR_EVDT_ALPHA=0.35
+    QR_EVDT_BETA=-0.10
+    QR_EVDT_MIN_P_BASE=0.008
+    QR_EVDT_MIN_P_SCALE=0.015
+    QR_EVDT_MIN_P_VH=0.005
+
+  Per-request override (canonical family form):
+    "extra_args": {
+      "qr_temperature_strategy": "evdt_tt",
+      "qr_truncate_first": true
+    }
+
+  Without qr_truncate_first the strategy still runs, but degenerates to a
+  scale-then-truncate EVDT variant sharing its support set with static
+  configurations.
+
+sampler_class: "qr_sampler.temperature.evdt_tt:EVDTTTStrategy"
+performance_impact: none
+build_time_locked: false
+requires_vocab_size: true

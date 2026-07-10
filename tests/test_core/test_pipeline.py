@@ -543,3 +543,41 @@ class TestBuildEntropySourceInstances:
         config = _make_config()
         source = build_entropy_source(config)
         assert source.name == "mock_uniform"
+
+
+# ---------------------------------------------------------------------------
+# Tests: truncate_first wiring (V6 EVDT-TT selector-order flag)
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateFirstWiring:
+    """config.truncate_first reaches the TokenSelector on every sample."""
+
+    def test_truncate_first_flag_reaches_selector(self) -> None:
+        pipeline = _make_pipeline(truncate_first=True)
+        captured: dict[str, Any] = {}
+        original = pipeline._selector.select
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(*args, **kwargs)
+
+        pipeline._selector.select = spy  # type: ignore[method-assign]
+        logits = np.array([3.0, 2.0, 1.0, 0.5, 0.0, -0.5, -1.0, -2.0, -3.0, -4.0])
+        result = pipeline.sample_token(logits)
+        assert isinstance(result, SamplingResult)
+        assert captured["truncate_first"] is True
+
+    def test_truncate_first_default_off(self) -> None:
+        pipeline = _make_pipeline()
+        captured: dict[str, Any] = {}
+        original = pipeline._selector.select
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(*args, **kwargs)
+
+        pipeline._selector.select = spy  # type: ignore[method-assign]
+        logits = np.array([3.0, 2.0, 1.0, 0.5, 0.0, -0.5, -1.0, -2.0, -3.0, -4.0])
+        pipeline.sample_token(logits)
+        assert captured["truncate_first"] is False
