@@ -49,13 +49,17 @@ auth:
   header: "api-key"
 
 # ── Service-wide default caps (overridable per API key) ──────────────────────
-# A PurityService draw accounts its whole integration block (2 MiB) against
-# the key's limits, so draw-serving keys need max_bytes_per_request >=
-# integration.block_bytes. rate_limit_per_minute must be high: the default
-# 200 exhausts instantly under the always-on qthought loop + owui traffic and
-# would flip callers to labelled fallback.
+# A PurityService draw accounts its whole integration block against the
+# key's limits, so draw-serving keys need max_bytes_per_request >= the
+# largest block a caller can request. Per-token draws are 100 KiB since
+# the 2026-07 throughput tranche (the qr-sampler / qthought presets pin
+# qr_draw_block_bytes=102400, and integration.block_bytes below matches
+# for deferred draws); the 2 MiB cap keeps headroom for legacy-sized
+# explicit requests. rate_limit_per_minute must be high: the default
+# 200 exhausts instantly under the always-on qthought loop + owui traffic
+# and would flip callers to labelled fallback.
 limits:
-  max_bytes_per_request: 2097152     # 2 MiB — matches integration.block_bytes
+  max_bytes_per_request: 2097152     # 2 MiB — headroom above the 100 KiB block
   max_bytes_per_day: 107374182400    # 100 GiB
   rate_limit_per_minute: 100000
 
@@ -120,7 +124,12 @@ controls:
 # One whole-block integrated draw (u) per PurityService request. ONLY
 # dragonfly-0 is drawable — dragonfly-1 never appears here.
 integration:
-  block_bytes: 2097152        # 2 MiB per draw
+  # Default block for draws that DEFER (DrawRequest.block_bytes = 0),
+  # matching the 100 KiB the qr-sampler / qthought presets request
+  # explicitly per token/decision (2026-07 throughput tranche: the
+  # per-read device lock serializes draws, so 1 MiB blocks capped the
+  # shared engine at the card's read rate).
+  block_bytes: 102400         # 100 KiB per draw
   default_integrator: bit_z   # bit_z | byte_z
   secondaries: []
   sources: ["dragonfly-0"]    # the SOLE draw card — dragonfly-1 is NOT drawable
