@@ -260,6 +260,19 @@ class TestResolveConfig:
         result = resolve_config(default_config, {"qr_diagnostic_mode": "true"})
         assert result.diagnostic_mode is True
 
+    def test_type_coercion_string_to_bool_bypass(self, default_config: QRSamplerConfig) -> None:
+        """Pydantic should coerce 'true' to True for qr_bypass."""
+        result = resolve_config(default_config, {"qr_bypass": "true"})
+        assert result.bypass is True
+
+    def test_bypass_defaults_false_and_overridable(self, default_config: QRSamplerConfig) -> None:
+        """bypass defaults False (bare requests never bypass) and is
+        per-request overridable via qr_bypass."""
+        assert default_config.bypass is False
+        result = resolve_config(default_config, {"qr_bypass": True})
+        assert result.bypass is True
+        assert default_config.bypass is False  # defaults unchanged
+
     def test_per_request_override_hvh_field(self, default_config: QRSamplerConfig) -> None:
         """An hvh_* hyperparameter is overridable per-request and defaults stay clean."""
         result = resolve_config(default_config, {"qr_hvh_t_base": 1.5})
@@ -455,6 +468,7 @@ class TestFieldSets:
                 "evdt_min_p_scale",
                 "evdt_min_p_vh",
                 "truncate_first",
+                "bypass",
             }
         )
         assert intended == PER_REQUEST_FIELDS

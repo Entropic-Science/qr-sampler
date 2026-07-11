@@ -181,6 +181,20 @@ class _RequestState:
         self.entropy_ticket: Any | None = None
 
 
+class _BypassState:
+    """Per-request marker for ``qr_bypass=true`` requests (invariant 8's
+    test-pinned exception): the row passes through ``apply()`` untouched and
+    vLLM's native sampler applies. Duck-types the three attributes the
+    removal loop reads so removals/moves/swaps need no special-casing."""
+
+    __slots__ = ("dominant_source_name", "entropy_ticket", "tokens_generated")
+
+    def __init__(self) -> None:
+        self.tokens_generated = 0
+        self.dominant_source_name = "native"
+        self.entropy_ticket: Any | None = None
+
+
 class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
     """vLLM V1 LogitsProcessor that replaces token sampling with
     external-entropy-driven selection.
@@ -294,7 +308,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
 
         # --- Per-request state ---
         # Maps request index (batch position) to its state.
-        self._request_states: dict[int, _RequestState] = {}
+        self._request_states: dict[int, _RequestState | _BypassState] = {}
 
         # --- Per-row sampling worker pool (perf tranche 2026-07) ---
         # The apply() loop samples each batch row independently (per-request
@@ -607,6 +621,27 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             # Resolve per-request config.
             req_config = resolve_config(self._default_config, extra_args)
 
+            # Bypass wins over everything else in extra_args: no pipeline
+            # routing (so an un-preinit'd source name cannot raise in the
+            # engine worker and kill the shared engine), no strategy or
+            # amplifier construction, no entropy prefetch.
+            if req_config.bypass:
+                self._request_states[req_idx] = _BypassState()
+                logger.info(
+                    "request %d routed: bypass=True resolved=native",
+                    req_idx,
+                    extra={
+                        "event": "entropy.request.routed",
+                        "req_idx": req_idx,
+                        "requested_source_type": extra_args.get("qr_entropy_source_type"),
+                        "resolved_pipeline_source": "native",
+                        "extra_args_keys": sorted(extra_args.keys()),
+                        "qr_preset": extra_args.get("qr_preset"),
+                        "bypass": True,
+                    },
+                )
+                continue
+
             # Route to the pipeline matching the (possibly-overridden) source.
             target_source_type = req_config.entropy_source_type
             target_pipeline = self._pipelines.get(target_source_type)
@@ -724,38 +759,75 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         is_numpy = isinstance(logits, np.ndarray)
         is_1d = len(logits.shape) == 1
 
-        # --- Extract the WHOLE batch as numpy in one transfer ---
+        # --- Partition bypass rows from sampled rows ---
+        # A row bypasses when its request opted in (qr_bypass=true) or when
+        # it has no state and the process default bypasses (QR_BYPASS=true;
+        # stateless rows only occur on an added-request ABI wobble).
+        # Partitioning is a correctness requirement, not just perf: the
+        # batched one-hot force fills the WHOLE tensor with -inf, which
+        # would destroy bypass rows in a mixed batch.
+        default_bypass = self._default_config.bypass
+        sampled: list[int] = []
+        for i in range(num_requests):
+            state = self._request_states.get(i)
+            if isinstance(state, _BypassState) or (state is None and default_bypass):
+                if state is not None:
+                    # Count steps so the completion event honestly reports
+                    # ``tokens=N source=native`` (K-5 diagnostic preserved).
+                    state.tokens_generated += 1
+                continue
+            sampled.append(i)
+
+        if not sampled:
+            # All-bypass step: zero GPU->CPU sync; vLLM's native sampler
+            # applies the standard request params to every row.
+            return logits
+
+        num_sampled = len(sampled)
+        all_sampled = num_sampled == num_requests
+
+        # --- Extract the sampled rows as numpy in one transfer ---
         # Perf tranche 2026-07: the historical per-row ``logits[i].cpu()``
         # issued one device sync + copy per request per step; one batched
         # copy (into a pinned staging buffer when available) costs a single
-        # sync regardless of batch size.
+        # sync regardless of batch size. A mixed batch gathers only the
+        # sampled rows, so the copy is subset-sized.
         t_stage = time.perf_counter_ns()
-        cpu_logits = logits if is_numpy else self._to_numpy_batched(logits)
-        to_numpy_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0 / num_requests
-
-        rows = [cpu_logits] if is_1d else [cpu_logits[i] for i in range(num_requests)]
+        if is_1d:
+            rows = [logits if is_numpy else self._to_numpy_batched(logits)]
+        elif all_sampled:
+            cpu_logits = logits if is_numpy else self._to_numpy_batched(logits)
+            rows = [cpu_logits[i] for i in range(num_requests)]
+        else:
+            rows = self._gather_rows(logits, sampled, is_numpy)
+        to_numpy_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0 / num_sampled
 
         # --- Per-row sampling (parallel across rows when configured) ---
-        results = self._sample_rows(rows)
+        results = self._sample_rows(sampled, rows)
 
         # --- Force one-hot logits using engine tensor ---
         # Batched: one fill + one scatter for the whole step instead of a
-        # template copy + scalar host->device write per row.
+        # template copy + scalar host->device write per row. Mixed batches
+        # restrict both writes to the sampled rows.
         t_stage = time.perf_counter_ns()
+        token_ids = [r.token_id for r in results]
         if is_1d:
-            self._force_onehot(logits, results[0].token_id, is_numpy)
+            self._force_onehot(logits, token_ids[0], is_numpy)
+        elif all_sampled:
+            self._force_onehot_batch(logits, token_ids, is_numpy)
         else:
-            self._force_onehot_batch(logits, [r.token_id for r in results], is_numpy)
-        onehot_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0 / num_requests
+            self._force_onehot_rows(logits, sampled, token_ids, is_numpy)
+        onehot_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0 / num_sampled
 
         # --- Telemetry (main thread only; _PerfAggregator is not locked) ---
-        # to_numpy/onehot are batch-wide costs attributed evenly per row.
+        # to_numpy/onehot are batch-wide costs attributed evenly per SAMPLED
+        # row (bypass rows cost neither stage and produce no records).
         for result in results:
             self._perf.note(result.record, to_numpy_ms, onehot_ms)
 
         return logits
 
-    def _sample_rows(self, rows: list[np.ndarray]) -> list[Any]:
+    def _sample_rows(self, indices: list[int], rows: list[np.ndarray]) -> list[Any]:
         """Sample every batch row, in parallel when the pool allows it.
 
         Rows are independent: each has its own ``_RequestState`` (strategy
@@ -765,13 +837,18 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         note. Results are returned in row order.
 
         Args:
-            rows: One 1-D numpy logit row per request, in batch order.
+            indices: ORIGINAL batch index of each row (keys
+                ``_request_states``). On a mixed bypass batch the sampled
+                rows are compacted, so positional enumeration would mis-key
+                every row after the first bypass one.
+            rows: One 1-D numpy logit row per sampled request, aligned
+                with ``indices``.
 
         Returns:
             One ``SamplingResult`` per row, in the same order.
         """
         if len(rows) == 1 or self._row_worker_cap <= 1:
-            return [self._sample_row(i, row) for i, row in enumerate(rows)]
+            return [self._sample_row(i, row) for i, row in zip(indices, rows, strict=True)]
         executor = self._row_executor
         if executor is None:
             executor = ThreadPoolExecutor(
@@ -779,7 +856,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 thread_name_prefix="qr-sampler-row",
             )
             self._row_executor = executor
-        return list(executor.map(self._sample_row, range(len(rows)), rows))
+        return list(executor.map(self._sample_row, indices, rows))
 
     def _sample_row(self, i: int, row: np.ndarray) -> Any:
         """Run the sampling pipeline for one batch row.
@@ -791,8 +868,13 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         Returns:
             The pipeline's ``SamplingResult`` for this row.
         """
-        # Get per-request state or fall back to defaults.
-        state = self._request_states.get(i)
+        # Get per-request state or fall back to defaults. Bypass rows never
+        # reach this method (the partition in ``_apply_impl`` excludes them);
+        # the isinstance narrowing keeps the union-typed dict mypy-clean and
+        # routes a hypothetical stray ``_BypassState`` to the default
+        # pipeline instead of an AttributeError in the engine worker.
+        raw_state = self._request_states.get(i)
+        state = raw_state if isinstance(raw_state, _RequestState) else None
         prefetch_ctx: PrefetchContext | None = None
         if state is not None:
             pipeline = state.pipeline
@@ -866,6 +948,34 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         result = tensor.detach().cpu().numpy()
         return result
 
+    def _gather_rows(self, logits: Any, indices: list[int], is_numpy: bool) -> list[np.ndarray]:
+        """Extract only the sampled rows of a mixed bypass batch as numpy.
+
+        numpy inputs stay zero-copy row views. torch tensors gather the
+        sampled rows with ONE ``index_select`` — on-device for GPU inputs,
+        so the device->host transfer that follows is subset-sized instead
+        of whole-batch (a research mixed batch is dominated by bypass
+        rows) — then reuse the batched conversion (pinned staging included).
+
+        Args:
+            logits: 2-D logit array or tensor ``(num_requests, vocab)``.
+            indices: Sampled batch rows to extract, ascending.
+            is_numpy: Whether logits is a numpy array.
+
+        Returns:
+            One 1-D numpy row per index, in ``indices`` order.
+        """
+        if is_numpy:
+            return [logits[i] for i in indices]
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - torch-less env, array-like input
+            arr = np.asarray(logits)
+            return [arr[i] for i in indices]
+        idx = torch.as_tensor(indices, dtype=torch.long, device=logits.device)
+        subset = self._to_numpy_batched(logits.index_select(0, idx))
+        return [subset[i] for i in range(len(indices))]
+
     @staticmethod
     def _to_numpy(tensor: Any) -> np.ndarray:
         """Convert a tensor to a numpy array with zero-copy where possible.
@@ -925,6 +1035,37 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             logits.fill_(float("-inf"))
             idx = torch.as_tensor(token_ids, dtype=torch.long, device=logits.device)
             logits.scatter_(1, idx.unsqueeze(1), 0.0)
+
+    def _force_onehot_rows(
+        self,
+        logits: Any,
+        row_indices: list[int],
+        token_ids: list[int],
+        is_numpy: bool,
+    ) -> None:
+        """Force only ``row_indices`` to one-hot, leaving other rows alone.
+
+        Mixed-batch variant of ``_force_onehot_batch``: bypass rows must
+        keep their raw logits for the engine's native sampler, so the -inf
+        fill and the scatter touch the sampled rows only.
+
+        Args:
+            logits: 2-D logit array or tensor ``(num_requests, vocab)``.
+            row_indices: Batch rows to overwrite, aligned with ``token_ids``.
+            token_ids: Selected token per row in ``row_indices``.
+            is_numpy: Whether logits is a numpy array.
+        """
+        if is_numpy:
+            rows = np.asarray(row_indices)
+            logits[rows, :] = float("-inf")
+            logits[rows, token_ids] = 0.0
+        else:
+            import torch
+
+            idx = torch.as_tensor(row_indices, dtype=torch.long, device=logits.device)
+            tok = torch.as_tensor(token_ids, dtype=torch.long, device=logits.device)
+            logits.index_fill_(0, idx, float("-inf"))
+            logits[idx, tok] = 0.0
 
     def _force_onehot_row(
         self,

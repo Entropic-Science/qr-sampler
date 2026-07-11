@@ -131,6 +131,60 @@ class TestParallelApplyEquivalence:
             adapter.close()
 
 
+def _apply_mixed_bypass_batch(
+    parallel_rows: str, logits: np.ndarray, bypass_rows: set[int]
+) -> np.ndarray:
+    """Like ``_apply_batch`` but with ``bypass_rows`` opting into qr_bypass.
+
+    Also asserts every request's step counter advanced exactly once — a
+    compacted-index bug in the mixed-batch row mapping would advance the
+    wrong states (every sampled state after the first bypass row shifts).
+    """
+    adapter = _make_adapter(
+        vocab_size=logits.shape[1],
+        entropy_source_type="const_bytes_test",
+        apply_parallel_rows=parallel_rows,
+    )
+    try:
+        added = [
+            (
+                i,
+                MockSamplingParams(extra_args={"qr_bypass": True} if i in bypass_rows else None),
+                None,
+                None,
+            )
+            for i in range(logits.shape[0])
+        ]
+        adapter.update_state(MockBatchUpdate(added=added))
+        out = logits.copy()
+        adapter.apply(out)
+        for i in range(logits.shape[0]):
+            assert adapter._request_states[i].tokens_generated == 1
+        return out
+    finally:
+        adapter.close()
+
+
+class TestParallelMixedBypass:
+    """Mixed bypass batches keep original row indices through the pool."""
+
+    def test_parallel_mixed_bypass_matches_serial(self) -> None:
+        """Sampled rows carry their ORIGINAL batch indices into the worker
+        pool: serial and parallel mixed batches agree byte-for-byte, and
+        bypass rows pass through bit-identically in both."""
+        logits = _batch_logits(rows=6, vocab=64)
+        bypass_rows = {1, 4}
+        serial = _apply_mixed_bypass_batch("1", logits, bypass_rows)
+        parallel = _apply_mixed_bypass_batch("4", logits, bypass_rows)
+        assert np.array_equal(serial, parallel)
+        for i in range(6):
+            if i in bypass_rows:
+                assert np.array_equal(serial[i], logits[i])
+            else:
+                assert np.count_nonzero(serial[i] == 0.0) == 1
+                assert np.all(np.isneginf(serial[i][serial[i] != 0.0]))
+
+
 class TestBatchedOnehot:
     """_force_onehot_batch equals the per-row one-hot loop."""
 

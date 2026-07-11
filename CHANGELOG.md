@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — per-request sampling bypass ("qr_bypass")
+
+- **New per-request config field `bypass`** (extra-args key `qr_bypass`, env
+  `QR_BYPASS`; default `false` — bare requests never bypass): the request's
+  logits rows pass through the vLLM adapter untouched, so the engine's
+  native sampler applies the standard `temperature`/`top_p`/`top_k`/`seed`
+  params. Zero entropy is drawn (no prefetch, no records, no perf
+  telemetry); mixed batches gather and one-hot only the sampled rows
+  (subset-sized D2H copy). Enables batch-eval workloads on a shared QR
+  serving engine — bypass rows never interleave entropy draws with a
+  concurrent QR lane. `QR_BYPASS=true` makes the whole server a vanilla
+  vLLM passthrough with `qr_bypass: false` as the per-request opt-back-in.
+
 ### Changed — qthought presets draw 100 KiB per token (BREAKING: CONTRACT_VERSION 3)
 
 - **`draw_block_bytes` in all four qthought presets dropped 1 MiB →

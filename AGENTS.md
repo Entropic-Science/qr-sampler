@@ -178,6 +178,12 @@ deployments/                   # Per-host compose profiles (generic, non-Modal)
    fallback mode, quotas, `oe_conditioning`, ...) are rejected per-request
    with `ConfigValidationError`.
 8. **Engine adapters force one-hot logits** (selected token 0.0, rest -inf).
+   One explicit, test-pinned exception: a request carrying `qr_bypass: true`
+   (config `bypass`, default `false` = strict no-op) passes through the
+   adapter untouched — zero entropy drawn, no `TokenSamplingRecord`, no perf
+   telemetry — so the engine's native sampler applies the standard request
+   params. Bare requests never bypass. Pinned by
+   `tests/test_engines/test_bypass.py`.
 9. **Logging uses `logging.getLogger("qr_sampler")`**; no `print()` in
    production code.
 10. **Just-in-time entropy.** Bytes are fetched only when
@@ -319,6 +325,20 @@ edges and parallelises the per-row middle without reordering it;
 threads: anything new on the per-token hot path that mutates shared state
 must be thread-safe (see the `EntropySource` ABC's thread-safety note;
 `QR_APPLY_PARALLEL_ROWS=1` restores the serial loop).
+
+Per-request bypass (`qr_bypass: true`, invariant 8's exception): `apply()`
+partitions bypass rows out FIRST — this is a correctness requirement, not
+just perf, because the batched one-hot force fills the whole tensor with
+-inf. An all-bypass step returns the logits with zero GPU->CPU sync; a
+mixed batch gathers only the sampled rows (on-GPU `index_select`,
+subset-sized D2H copy). In `update_state`, bypass short-circuits before
+pipeline routing, so "bypass + anything is bypass" — an un-preinit'd source
+name alongside `qr_bypass` cannot raise in the engine worker (an uncaught
+raise there kills the shared engine). Operator note: `QR_BYPASS=true`
+turns the whole server into a vanilla vLLM passthrough (`qr_bypass: false`
+opts back in per-request) — useful for batch-eval windows with raised
+`--max-num-seqs`, since bypass rows draw no entropy and therefore never
+interleave draws with a concurrent QR lane.
 
 ### Config resolution
 

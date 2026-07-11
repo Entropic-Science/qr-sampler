@@ -621,6 +621,21 @@ class QRSamplerConfig(BaseSettings):
         json_schema_extra=_PER_REQUEST,
     )
 
+    # --- Pipeline bypass (per-request overridable) ---
+
+    bypass: bool = Field(
+        default=False,
+        description=(
+            "Skip qr-sampler's sampling pipeline for this request entirely: "
+            "its logits rows pass through the engine adapter untouched, so "
+            "the engine's native sampler (temperature/top_p/top_k/seed from "
+            "the standard request params) applies. Zero entropy is drawn and "
+            "no sampling records or perf telemetry are produced. Default "
+            "False — bare requests never bypass."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
     # --- Engine adapter (infrastructure; NOT per-request overridable) ---
 
     apply_parallel_rows: int = Field(
