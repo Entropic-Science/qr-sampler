@@ -584,12 +584,12 @@ def test_bind_int_rejects_bad_spec(mock_config: QRSamplerConfig) -> None:
 
 
 def test_qthought_presets_registered() -> None:
-    """The three qthought lanes pin server-integrated draws (1 MiB blocks); the
+    """The three qthought lanes pin server-integrated draws (100 KiB blocks); the
     byte-fetch fields (sample_count / calibration) survive as degrade-fallback."""
     assert BUILTIN_PRESETS["qthought"] == {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
@@ -604,7 +604,7 @@ def test_qthought_presets_registered() -> None:
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 6000,
         "zscore_calibration_samples": 200,
     }
@@ -619,7 +619,7 @@ def test_qthought_presets_registered() -> None:
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
@@ -630,7 +630,7 @@ def test_default_construction_resolves_qthought_preset() -> None:
     roller = QthoughtRoller()
     try:
         assert roller.config.signal_amplifier_type == "server"
-        assert roller.config.draw_block_bytes == 1048576
+        assert roller.config.draw_block_bytes == 102400
         assert roller.config.entropy_source_type == "quantum_grpc"
     finally:
         roller.close()
@@ -709,14 +709,14 @@ def _server_config(**over: object) -> QRSamplerConfig:
     return QRSamplerConfig(
         entropy_source_type="mock_uniform",
         signal_amplifier_type="server",
-        draw_block_bytes=1048576,
+        draw_block_bytes=102400,
         sample_count=256,
         **over,  # type: ignore[arg-type]
     )
 
 
 def test_server_draw_mode_uses_get_draw_per_decision() -> None:
-    """With the server amplifier, each decision is one ``get_draw`` (1 MiB block),
+    """With the server amplifier, each decision is one ``get_draw`` (100 KiB block),
     no byte fetch, provenance from ``DrawMeta`` (z from the server, bias 0)."""
     src = _FakeDrawSource(u=0.734, z=1.5)
     roller = QthoughtRoller(_server_config(), entropy_source=src)
@@ -729,7 +729,7 @@ def test_server_draw_mode_uses_get_draw_per_decision() -> None:
         assert len(prov) == 7
         assert len(src.draw_calls) == 7  # exactly one server draw per decision
         assert src.byte_calls == 0  # the happy path never fetches bytes
-        assert all(block == 1048576 for block, _ in src.draw_calls)  # 1 MiB
+        assert all(block == 102400 for block, _ in src.draw_calls)  # 100 KiB
         for p in prov:
             assert p.is_fallback is False
             assert p.z_score == 1.5

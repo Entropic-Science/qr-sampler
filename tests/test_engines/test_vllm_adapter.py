@@ -261,7 +261,7 @@ class TestPipelineDelegation:
             adapter = VLLMAdapter(vllm_config=None)
             cfg = adapter.default_config
             assert cfg.signal_amplifier_type == "server"
-            assert cfg.draw_block_bytes == 1048576
+            assert cfg.draw_block_bytes == 102400
             assert cfg.temperature_strategy == "coherence_gate"
             # The preset field is cleared so per-request resolve does not re-expand.
             assert cfg.preset == ""

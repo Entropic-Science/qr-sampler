@@ -94,7 +94,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # amplifier (zscore_thought) so a per-thought aggregate bias rides alongside
     # the unchanged per-decision draws; the lineage is explicit in config_hash.
     # Qthought decode lane (the QthoughtRoller). Every grammar decision is now
-    # ONE server-integrated draw (qr_purity GetDraw) — a 1 MiB baseline-
+    # ONE server-integrated draw (qr_purity GetDraw) — a 100 KiB baseline-
     # referenced block the server integrates against the device fingerprint —
     # not a local byte fetch + amplify. The baseline correction happens at the
     # source, so the "acorn" static-bias pinning cannot occur.
@@ -104,12 +104,12 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     PRESET_QTHOUGHT: {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     },
     # Qthought REFLECT lane — the private inner-voice / propose-speech completion.
-    # Every token rides a server-integrated 1 MiB draw (qr_purity GetDraw) under
+    # Every token rides a server-integrated 100 KiB draw (qr_purity GetDraw) under
     # the coherence-gated EDT temperature. This lane must emit a PARSEABLE
     # ``propose_speech`` tool call, and that constrains BOTH knobs:
     #   * top_k=50 / top_p=0.9 truncation removes the low-probability tail, and
@@ -130,13 +130,13 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 6000,
         "zscore_calibration_samples": 200,
     },
     # Qthought SPEAK lane — the user-visible voice, deliberately UNtruncated
     # (top_k=0 / top_p=1.0): the spoken turn is free text with no structure to
-    # protect, so it samples the FULL distribution over server-integrated 1 MiB
+    # protect, so it samples the FULL distribution over server-integrated 100 KiB
     # draws under the coherence-gated EDT temperature — all the quantum
     # randomness and weirdness the entropy affords. Truncation stays on the
     # REFLECT lane only.
@@ -152,12 +152,12 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     },
     # Qthought purity reference lane — the neutral fixed-inner-temperature
-    # profile under the same coherence gate and server-integrated 1 MiB draws.
+    # profile under the same coherence gate and server-integrated 100 KiB draws.
     # The three lanes above are all server-draw now; this remains the plain
     # fixed-temp reference. A draw failure degrades to fallback bytes + a local
     # zscore_mean amplifier (labelled, never silent).
@@ -170,7 +170,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "coherence_threshold": 3.5,
         "coherence_t_boost_max": 0.5,
         "coherence_ema_alpha": 0.3,
-        "draw_block_bytes": 1048576,  # 1 MiB (was 0 = server default 2 MiB)
+        "draw_block_bytes": 102400,  # 100 KiB (2026-07: was 1 MiB; latency tranche)
         "top_k": 0,
         "top_p": 1.0,
     },

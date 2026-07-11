@@ -26,6 +26,6 @@ overrides:
   coherence_threshold: 3.5
   coherence_t_boost_max: 0.5
   coherence_ema_alpha: 0.3
-  draw_block_bytes: 1048576  # 1 MiB (was 0 = server default 2 MiB)
+  draw_block_bytes: 102400  # 100 KiB (2026-07: was 1 MiB; latency tranche)
   top_k: 0
   top_p: 1.0

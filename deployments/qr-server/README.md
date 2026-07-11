@@ -150,8 +150,10 @@ the two PRNG study keys are bound to the seeded control sources. All created
 with `qbert0g keys create`:
 
 ```bash
-# 1) The shared vLLM (PurityService draws account the whole 2 MiB integration
-#    block against the key, so max-bytes must be >= integration.block_bytes).
+# 1) The shared vLLM (PurityService draws account their whole integration
+#    block against the key: the presets request 100 KiB per token since the
+#    2026-07 tranche, deferred draws use integration.block_bytes — the 2 MiB
+#    max-bytes covers both).
 qbert0g keys create --name qr-sampler --device dragonfly-0 --max-bytes 2097152
 
 # 2) qthought's broker (grammar-decode / dispose-gate / persona-seed draws).

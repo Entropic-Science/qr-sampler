@@ -52,7 +52,12 @@ from qr_sampler.qthought import BindSpec, ChoiceProvenance, IntRange, QthoughtRo
 #: (``signal_amplifier_type="server"`` + 1 MiB ``draw_block_bytes``) — the
 #: preset dicts changed and ``QthoughtRoller`` gained a ``get_draw`` decode
 #: path. The byte-fetch amplifiers survive only as the labelled degrade path.
-CONTRACT_VERSION = 2
+#: v3 (2026-07): ``draw_block_bytes`` in all four qthought presets dropped
+#: 1 MiB -> 100 KiB (throughput tranche: 10x less raw data integrated per
+#: token server-side; the z statistic stays baseline-referenced, only the
+#: per-draw sample size changes). Preset dict values changed, so consumers
+#: pinning them must update in lockstep.
+CONTRACT_VERSION = 3
 
 __all__ = [  # noqa: RUF022 -- grouped by concern (roller/config/entropy/exceptions), not alphabetized
     "CONTRACT_VERSION",

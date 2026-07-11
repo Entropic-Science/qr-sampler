@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — qthought presets draw 100 KiB per token (BREAKING: CONTRACT_VERSION 3)
+
+- **`draw_block_bytes` in all four qthought presets dropped 1 MiB →
+  100 KiB (102400)** — 10× less raw data integrated per server draw, cutting
+  the QRNG lane's per-token server-side integration cost to match the
+  sampler-side throughput tranche below. The z statistic stays
+  baseline-referenced; only the per-draw sample size changes.
+- **`CONTRACT_VERSION` 2 → 3**: the preset dicts are contract-pinned
+  scientific lineage, so consumers asserting them (qr-llm-qthought) must
+  update in lockstep. Deployment examples note that draw keys' byte quotas
+  (sized for 2 MiB deferred draws) already cover the smaller blocks.
+
 ### Changed — sampling hot-path performance tranche (2026-07)
 
 Standard optimizations only; the sampled distribution, selector order

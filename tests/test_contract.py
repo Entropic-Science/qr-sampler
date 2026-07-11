@@ -59,7 +59,7 @@ def test_contract_all_is_frozen() -> None:
 def test_contract_version_is_two() -> None:
     """v2 (2026-07): qthought lanes moved to server-integrated draws. Bump both
     this pin and qthought's import-time assert together on a break."""
-    assert contract.CONTRACT_VERSION == 2
+    assert contract.CONTRACT_VERSION == 3
 
 
 def test_per_request_fields_is_the_derived_frozenset() -> None:
@@ -96,7 +96,7 @@ def test_preset_qthought_dict_pinned() -> None:
     assert BUILTIN_PRESETS[contract.PRESET_QTHOUGHT] == {
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
@@ -114,7 +114,7 @@ def test_preset_qthought_think_dict_pinned() -> None:
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 6000,
         "zscore_calibration_samples": 200,
     }
@@ -132,7 +132,7 @@ def test_preset_qthought_voice_dict_pinned() -> None:
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "sample_count": 10000,
         "zscore_calibration_samples": 200,
     }
@@ -148,7 +148,7 @@ def test_preset_qthought_purity_dict_pinned() -> None:
         "coherence_threshold": 3.5,
         "coherence_t_boost_max": 0.5,
         "coherence_ema_alpha": 0.3,
-        "draw_block_bytes": 1048576,
+        "draw_block_bytes": 102400,
         "top_k": 0,
         "top_p": 1.0,
     }
