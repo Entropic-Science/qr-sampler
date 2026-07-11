@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — sampling hot-path performance tranche (2026-07)
+
+Standard optimizations only; the sampled distribution, selector order
+(AGENTS.md invariant 15), just-in-time entropy contract, and all
+diagnostics are unchanged (equivalence is test-pinned in
+`tests/test_selection/test_compact_topk.py` and
+`tests/test_temperature/test_entropy_fastpath.py`). Measured at a 152k
+vocabulary against the PRNG/system entropy lane, the sampler-side ceiling
+on concurrent throughput rose from ~39–127 tok/s to ~400–530 tok/s:
+
+- **Shannon entropy via one BLAS dot** (`temperature/base.py`):
+  `H = ln Z - dot(exp(s), s) / Z` replaces the full-vocab `log` pass plus
+  two boolean fancy-index copies (~42% of the per-token budget). New shared
+  `compute_entropy_varentropy` gives the drift strategies (`hvh_drift`,
+  `evdt_tt`) the same treatment via a centered second moment;
+  `tt_exchange`'s kept-support measurement now works on the exp values
+  directly. Degenerate (-inf/NaN) inputs keep their historical outputs.
+- **Compacted top-k selection** (`selection/selector.py`): a truncating
+  `top_k` now gathers the k surviving logits once (O(vocab) argpartition)
+  and runs softmax/min-p/top-p/CDF on the k-element support — the
+  historical flow ran every stage (including a full-vocab argsort in
+  top-p) over the whole vocabulary. 13x on the `top_k=50, top_p=0.9`
+  shape the qthought presets use. The full-vocab path skips the
+  temperature divide when `T == 1.0`, counts `probs > 0` once when min-p
+  and top-p are disabled, and softmax runs in place on its own scratch
+  array.
+- **Batched engine-tensor edges** (`engines/vllm/adapter.py`): apply()
+  now converts the whole logits batch GPU→CPU with ONE device sync
+  (staged through a lazily-grown pinned buffer when vLLM enables
+  `is_pin_memory`), and forces all one-hot rows with one `fill_` + one
+  `scatter_` instead of a template copy + scalar host→device write per
+  row.
+- **Parallel per-row sampling** (`engines/vllm/adapter.py` + new
+  infrastructure config `apply_parallel_rows` / `QR_APPLY_PARALLEL_ROWS`):
+  concurrent requests in a batch no longer serialize behind one another —
+  rows are sampled on a worker pool (default cap: CPU count; `1` restores
+  the historical serial loop). Thread-safety hardening for the shared hot
+  path: per-thread `last_source_used` on `FallbackEntropySource`, a lock
+  inside `AdaptiveCircuitBreaker`, locked prefetch counters on
+  `QuantumGrpcSource`, a locked RNG in `MockUniformSource`, and a lock on
+  the pipeline's gate-status publisher. The `EntropySource` ABC documents
+  the concurrency expectations for third-party sources.
+
 ### Added — named entropy-source instances (qr-llm-research enabler)
 
 - **`entropy_source_instances` infrastructure config field**

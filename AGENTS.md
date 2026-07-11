@@ -304,13 +304,21 @@ temperature strategy -> entropy fetch (just-in-time or prefetch-ticket)
 
 ```
 vLLM calls VLLMAdapter.apply(logits)
-  -> per batch row: torch -> numpy -> pipeline.sample_token(...)
-  -> next-token prefetch ticket handoff -> write one-hot into the torch tensor
+  -> ONE batched torch -> numpy conversion (single device sync; pinned
+     staging buffer when is_pin_memory)
+  -> per batch row (parallel on a worker pool, config apply_parallel_rows):
+     pipeline.sample_token(...) -> next-token prefetch ticket handoff
+  -> ONE batched one-hot force (fill_ + scatter_) into the torch tensor
 ```
 
 The `apply()` sequence (to_numpy -> `sample_token` -> next-ticket handoff ->
-one-hot force) is invariant; `tests/test_engines/test_vllm_lp_abi.py` pins
-the entry-point string `qr_sampler.engines.vllm:VLLMAdapter`.
+one-hot force) is invariant — the 2026-07 perf tranche batches the tensor
+edges and parallelises the per-row middle without reordering it;
+`tests/test_engines/test_vllm_lp_abi.py` pins the entry-point string
+`qr_sampler.engines.vllm:VLLMAdapter`. Row sampling may run on worker
+threads: anything new on the per-token hot path that mutates shared state
+must be thread-safe (see the `EntropySource` ABC's thread-safety note;
+`QR_APPLY_PARALLEL_ROWS=1` restores the serial loop).
 
 ### Config resolution
 

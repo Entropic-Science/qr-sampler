@@ -35,6 +35,7 @@ import numpy as np
 from qr_sampler.temperature.base import (
     TemperatureResult,
     TemperatureStrategy,
+    compute_entropy_varentropy,
 )
 
 if TYPE_CHECKING:
@@ -78,16 +79,9 @@ class EVDTTTStrategy(TemperatureStrategy):
             TemperatureResult with temperature, Shannon entropy, and
             diagnostics containing ``min_p`` and ``varentropy``.
         """
-        # Stable softmax with a single exp pass (same shape as hvh_drift).
-        shifted = logits - np.max(logits)
-        exp_shifted = np.exp(shifted)
-        sum_exp = float(np.sum(exp_shifted))
-        log_probs = shifted - np.log(sum_exp)
-        probs = exp_shifted / sum_exp
-
-        # H = -sum(p * log p); VH = sum(p * (-log p - H)^2).
-        h = max(0.0, float(-np.sum(probs * log_probs)))
-        vh = max(0.0, float(np.sum(probs * (-log_probs - h) ** 2)))
+        # H = -sum(p * log p); VH = sum(p * (-log p - H)^2). Fused
+        # dot-product formulation — see ``compute_entropy_varentropy``.
+        h, vh = compute_entropy_varentropy(logits)
 
         raw_min_p = config.evdt_min_p_base + config.evdt_min_p_scale * h + config.evdt_min_p_vh * vh
         raw_temp = config.evdt_t_base + config.evdt_alpha * h + config.evdt_beta * vh

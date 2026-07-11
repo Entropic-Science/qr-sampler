@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -286,11 +287,25 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
 
         # --- Pre-allocate tensors ---
         self._onehot_template = self._create_onehot_template()
-        self._cpu_buffer = self._create_cpu_buffer()
+        # Pinned staging buffer for the batched GPU->CPU logits copy.
+        # Allocated lazily on the first GPU batch (rows x vocab, grown as
+        # the batch grows) — only when vLLM passed is_pin_memory=True.
+        self._cpu_buffer: Any = None
 
         # --- Per-request state ---
         # Maps request index (batch position) to its state.
         self._request_states: dict[int, _RequestState] = {}
+
+        # --- Per-row sampling worker pool (perf tranche 2026-07) ---
+        # The apply() loop samples each batch row independently (per-request
+        # state is row-exclusive; the heavy numpy stages release the GIL),
+        # so concurrent requests no longer serialize behind one another.
+        # ``apply_parallel_rows`` = 0 resolves to the machine's CPU count;
+        # 1 restores the historical single-threaded loop. The executor is
+        # created lazily on the first multi-row batch.
+        cap = self._default_config.apply_parallel_rows
+        self._row_worker_cap = cap if cap > 0 else (os.cpu_count() or 1)
+        self._row_executor: ThreadPoolExecutor | None = None
 
         # --- iter-55: rolling per-stage perf telemetry ---
         self._perf = _PerfAggregator()
@@ -407,21 +422,41 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         except ImportError:
             return np.full(self._vocab_size, float("-inf"), dtype=np.float32)
 
-    def _create_cpu_buffer(self) -> Any:
-        """Create a pinned-memory CPU buffer for transfers.
+    def _pinned_slice(self, shape: tuple[int, ...], dtype: Any) -> Any:
+        """Return a pinned staging view of ``shape`` for a GPU->CPU copy.
+
+        Lazily allocates (and grows) the 2-D pinned buffer. Returns ``None``
+        when pinned staging is unavailable or not applicable (no
+        ``is_pin_memory``, torch missing, or a 1-D tensor — the 1-D shape
+        only occurs in tests, where a plain ``.cpu()`` is fine).
+
+        Args:
+            shape: Shape of the incoming logits tensor.
+            dtype: torch dtype of the incoming logits tensor.
 
         Returns:
-            A pinned tensor if ``is_pin_memory`` is True and torch is available,
-            otherwise ``None``.
+            A pinned ``(rows, vocab)`` tensor view matching ``shape``, or
+            ``None`` when the plain ``.cpu()`` path should be used.
         """
-        if not self._is_pin_memory:
+        if not self._is_pin_memory or len(shape) < 2:
             return None
         try:
             import torch
-
-            return torch.empty(self._vocab_size, dtype=torch.float32, pin_memory=True)
         except ImportError:
             return None
+        rows, cols = int(shape[0]), int(shape[-1])
+        buf = self._cpu_buffer
+        if buf is None or buf.shape[0] < rows or buf.shape[1] != cols or buf.dtype != dtype:
+            try:
+                buf = torch.empty((rows, cols), dtype=dtype, pin_memory=True)
+            except RuntimeError:
+                # No pinned allocator on this host (CPU-only torch build).
+                # Disable staging so the plain .cpu() path runs without
+                # re-attempting the allocation every step.
+                self._is_pin_memory = False
+                return None
+            self._cpu_buffer = buf
+        return buf[:rows]
 
     def is_argmax_invariant(self) -> bool:
         """Return ``False`` -- this processor fundamentally changes token selection.
@@ -689,70 +724,147 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         is_numpy = isinstance(logits, np.ndarray)
         is_1d = len(logits.shape) == 1
 
-        for i in range(num_requests):
-            # Get per-request state or fall back to defaults.
-            state = self._request_states.get(i)
-            prefetch_ctx: PrefetchContext | None = None
-            if state is not None:
-                pipeline = state.pipeline
-                req_config: QRSamplerConfig | None = state.config
-                amplifier: SignalAmplifier | None = state.amplifier
-                strategy: TemperatureStrategy | None = state.strategy
-                hash_str: str | None = state.config_hash_str
-                # Step index BEFORE increment: 0-based token index, the
-                # same convention derive_commit_nonce documents.
-                prefetch_ctx = PrefetchContext(
-                    salt=state.prefetch_salt,
-                    step=state.tokens_generated,
-                    ticket=state.entropy_ticket,
-                )
-                state.entropy_ticket = None  # consumed below, one way or another
-                state.tokens_generated += 1
-            else:
-                pipeline = self._pipeline
-                req_config = None
-                amplifier = None
-                strategy = None
-                hash_str = None
+        # --- Extract the WHOLE batch as numpy in one transfer ---
+        # Perf tranche 2026-07: the historical per-row ``logits[i].cpu()``
+        # issued one device sync + copy per request per step; one batched
+        # copy (into a pinned staging buffer when available) costs a single
+        # sync regardless of batch size.
+        t_stage = time.perf_counter_ns()
+        cpu_logits = logits if is_numpy else self._to_numpy_batched(logits)
+        to_numpy_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0 / num_requests
 
-            # --- Extract row as numpy ---
-            t_stage = time.perf_counter_ns()
-            if is_1d:
-                row = logits if is_numpy else self._to_numpy(logits)
-            else:
-                row = logits[i] if is_numpy else self._to_numpy(logits[i])
-            to_numpy_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
+        rows = [cpu_logits] if is_1d else [cpu_logits[i] for i in range(num_requests)]
 
-            # --- Delegate to pipeline (routed by entropy source) ---
-            # build_onehot=False: the one-hot is forced directly on the
-            # engine tensor below, so the pipeline's vocab-size numpy
-            # allocation + fill per token would be pure dead weight.
-            result = pipeline.sample_token(
-                row,
-                config=req_config,
-                amplifier=amplifier,
-                strategy=strategy,
-                config_hash_str=hash_str,
-                prefetch_ctx=prefetch_ctx,
-                build_onehot=False,
-            )
+        # --- Per-row sampling (parallel across rows when configured) ---
+        results = self._sample_rows(rows)
 
-            # Store the in-flight ticket for this request's NEXT token
-            # (fired inside sample_token immediately after selection).
-            if state is not None:
-                state.entropy_ticket = result.next_ticket
+        # --- Force one-hot logits using engine tensor ---
+        # Batched: one fill + one scatter for the whole step instead of a
+        # template copy + scalar host->device write per row.
+        t_stage = time.perf_counter_ns()
+        if is_1d:
+            self._force_onehot(logits, results[0].token_id, is_numpy)
+        else:
+            self._force_onehot_batch(logits, [r.token_id for r in results], is_numpy)
+        onehot_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0 / num_requests
 
-            # --- Force one-hot logits using engine tensor ---
-            t_stage = time.perf_counter_ns()
-            if is_1d:
-                self._force_onehot(logits, result.token_id, is_numpy)
-            else:
-                self._force_onehot_row(logits, i, result.token_id, is_numpy)
-            onehot_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
-
+        # --- Telemetry (main thread only; _PerfAggregator is not locked) ---
+        # to_numpy/onehot are batch-wide costs attributed evenly per row.
+        for result in results:
             self._perf.note(result.record, to_numpy_ms, onehot_ms)
 
         return logits
+
+    def _sample_rows(self, rows: list[np.ndarray]) -> list[Any]:
+        """Sample every batch row, in parallel when the pool allows it.
+
+        Rows are independent: each has its own ``_RequestState`` (strategy
+        EMA state, prefetch ticket, token counter), and the shared objects
+        on the hot path (entropy sources, amplifiers, the sampling logger)
+        are thread-safe — see the ``EntropySource`` ABC's thread-safety
+        note. Results are returned in row order.
+
+        Args:
+            rows: One 1-D numpy logit row per request, in batch order.
+
+        Returns:
+            One ``SamplingResult`` per row, in the same order.
+        """
+        if len(rows) == 1 or self._row_worker_cap <= 1:
+            return [self._sample_row(i, row) for i, row in enumerate(rows)]
+        executor = self._row_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=self._row_worker_cap,
+                thread_name_prefix="qr-sampler-row",
+            )
+            self._row_executor = executor
+        return list(executor.map(self._sample_row, range(len(rows)), rows))
+
+    def _sample_row(self, i: int, row: np.ndarray) -> Any:
+        """Run the sampling pipeline for one batch row.
+
+        Args:
+            i: Batch row index (keys ``_request_states``).
+            row: 1-D numpy logit row for this request.
+
+        Returns:
+            The pipeline's ``SamplingResult`` for this row.
+        """
+        # Get per-request state or fall back to defaults.
+        state = self._request_states.get(i)
+        prefetch_ctx: PrefetchContext | None = None
+        if state is not None:
+            pipeline = state.pipeline
+            req_config: QRSamplerConfig | None = state.config
+            amplifier: SignalAmplifier | None = state.amplifier
+            strategy: TemperatureStrategy | None = state.strategy
+            hash_str: str | None = state.config_hash_str
+            # Step index BEFORE increment: 0-based token index, the
+            # same convention derive_commit_nonce documents.
+            prefetch_ctx = PrefetchContext(
+                salt=state.prefetch_salt,
+                step=state.tokens_generated,
+                ticket=state.entropy_ticket,
+            )
+            state.entropy_ticket = None  # consumed below, one way or another
+            state.tokens_generated += 1
+        else:
+            pipeline = self._pipeline
+            req_config = None
+            amplifier = None
+            strategy = None
+            hash_str = None
+
+        # --- Delegate to pipeline (routed by entropy source) ---
+        # build_onehot=False: the one-hot is forced directly on the
+        # engine tensor by the caller, so the pipeline's vocab-size numpy
+        # allocation + fill per token would be pure dead weight.
+        result = pipeline.sample_token(
+            row,
+            config=req_config,
+            amplifier=amplifier,
+            strategy=strategy,
+            config_hash_str=hash_str,
+            prefetch_ctx=prefetch_ctx,
+            build_onehot=False,
+        )
+
+        # Store the in-flight ticket for this request's NEXT token
+        # (fired inside sample_token immediately after selection).
+        if state is not None:
+            state.entropy_ticket = result.next_ticket
+
+        return result
+
+    def _to_numpy_batched(self, tensor: Any) -> np.ndarray:
+        """Convert the whole logits tensor to numpy with ONE device copy.
+
+        CPU tensors convert zero-copy. GPU tensors pay a single batched
+        device->host transfer (staged through the pinned buffer when vLLM
+        constructed the adapter with ``is_pin_memory=True``), replacing the
+        historical one-sync-per-row pattern.
+
+        Args:
+            tensor: A torch.Tensor (any device) or array-like.
+
+        Returns:
+            A 1-D or 2-D numpy array of the same shape.
+        """
+        try:
+            is_cpu = tensor.is_cpu
+        except AttributeError:
+            return np.asarray(tensor)
+        if is_cpu:
+            result: np.ndarray = tensor.detach().numpy()
+            return result
+        staging = self._pinned_slice(tuple(tensor.shape), tensor.dtype)
+        if staging is not None:
+            staging.copy_(tensor, non_blocking=False)
+            result = staging.numpy()
+            return result
+        result = tensor.detach().cpu().numpy()
+        return result
 
     @staticmethod
     def _to_numpy(tensor: Any) -> np.ndarray:
@@ -790,6 +902,29 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         else:
             logits.copy_(self._onehot_template, non_blocking=True)
             logits[token_id] = 0.0
+
+    def _force_onehot_batch(self, logits: Any, token_ids: list[int], is_numpy: bool) -> None:
+        """Force every batch row to one-hot with two vectorised operations.
+
+        Equivalent to calling ``_force_onehot_row`` for each row, but costs
+        one fill + one scatter for the whole step — the historical per-row
+        template copy plus scalar ``tensor[i, tok] = 0.0`` write issued two
+        kernel launches (and one host->device transfer) per request.
+
+        Args:
+            logits: 2-D logit array or tensor ``(num_requests, vocab)``.
+            token_ids: Selected token per row, in batch order.
+            is_numpy: Whether logits is a numpy array.
+        """
+        if is_numpy:
+            logits[:] = float("-inf")
+            logits[np.arange(len(token_ids)), token_ids] = 0.0
+        else:
+            import torch
+
+            logits.fill_(float("-inf"))
+            idx = torch.as_tensor(token_ids, dtype=torch.long, device=logits.device)
+            logits.scatter_(1, idx.unsqueeze(1), 0.0)
 
     def _force_onehot_row(
         self,
@@ -831,8 +966,12 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
     def close(self) -> None:
         """Release all resources held by the adapter.
 
-        Closes every pre-initialised pipeline. Safe to call multiple times.
+        Shuts down the row worker pool and closes every pre-initialised
+        pipeline. Safe to call multiple times.
         """
+        if self._row_executor is not None:
+            self._row_executor.shutdown(wait=False)
+            self._row_executor = None
         seen: set[int] = set()
         for pipeline in self._pipelines.values():
             if id(pipeline) in seen:

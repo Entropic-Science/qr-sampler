@@ -4,10 +4,17 @@ Tracks a rolling latency window, computes an adaptive per-call timeout from
 its P99, counts consecutive failures, and manages the open/half-open cycle
 with exponential backoff on the recovery window. The gRPC entropy source
 composes this class and does all the logging/channel work itself.
+
+Thread safety: the engine adapter samples batch rows on concurrent worker
+threads (perf tranche 2026-07), so entropy fetches — and therefore the
+breaker's bookkeeping — run concurrently. Compound state transitions are
+guarded by an internal lock; the simple attribute reads used for health
+reporting stay lock-free (single-word reads are atomic under the GIL).
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 
@@ -48,6 +55,7 @@ class AdaptiveCircuitBreaker:
         self.recovery_window_max_s = recovery_window_max_s
         self.max_consecutive_failures = max_consecutive_failures
 
+        self._lock = threading.Lock()
         self._latency_window: deque[float] = deque(maxlen=window_size)
         self.p99_ms: float = max_timeout_ms
         self.consecutive_failures: int = 0
@@ -75,12 +83,13 @@ class AdaptiveCircuitBreaker:
         Args:
             elapsed_ms: Time taken for the last fetch in milliseconds.
         """
-        self._latency_window.append(elapsed_ms)
-        if len(self._latency_window) >= 10:
-            sorted_latencies = sorted(self._latency_window)
-            idx = int(len(sorted_latencies) * 0.99)
-            idx = min(idx, len(sorted_latencies) - 1)
-            self.p99_ms = sorted_latencies[idx]
+        with self._lock:
+            self._latency_window.append(elapsed_ms)
+            if len(self._latency_window) >= 10:
+                sorted_latencies = sorted(self._latency_window)
+                idx = int(len(sorted_latencies) * 0.99)
+                idx = min(idx, len(sorted_latencies) - 1)
+                self.p99_ms = sorted_latencies[idx]
 
     def record_censored_latency(self, elapsed_s: float, timeout_s: float) -> None:
         """Feed timeout-shaped failures into the adaptive-latency window.
@@ -118,8 +127,9 @@ class AdaptiveCircuitBreaker:
     def note_success(self, elapsed_ms: float) -> None:
         """Record one successful fetch: latency sample + failure-state reset."""
         self.record_latency(elapsed_ms)
-        self.consecutive_failures = 0
-        self.circuit_open_count = 0
+        with self._lock:
+            self.consecutive_failures = 0
+            self.circuit_open_count = 0
 
     def try_half_open(self) -> bool:
         """Attempt the half-open transition on an open circuit.
@@ -129,10 +139,11 @@ class AdaptiveCircuitBreaker:
             closed for one trial request. False while still inside the
             window (the caller must keep failing fast).
         """
-        if time.monotonic() >= self.circuit_open_until:
-            self.circuit_open = False
-            return True
-        return False
+        with self._lock:
+            if time.monotonic() >= self.circuit_open_until:
+                self.circuit_open = False
+                return True
+            return False
 
     def note_failure(self) -> float | None:
         """Record one retry-exhausted failure; open the circuit at the threshold.
@@ -150,14 +161,15 @@ class AdaptiveCircuitBreaker:
             The recovery window (seconds) when this failure opened the
             circuit, else ``None``.
         """
-        self.consecutive_failures += 1
-        if self.consecutive_failures >= self.max_consecutive_failures:
-            window: float = min(
-                self._recovery_window_s * float(2**self.circuit_open_count),
-                self.recovery_window_max_s,
-            )
-            self.circuit_open = True
-            self.circuit_open_until = time.monotonic() + window
-            self.circuit_open_count += 1
-            return window
-        return None
+        with self._lock:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                window: float = min(
+                    self._recovery_window_s * float(2**self.circuit_open_count),
+                    self.recovery_window_max_s,
+                )
+                self.circuit_open = True
+                self.circuit_open_until = time.monotonic() + window
+                self.circuit_open_count += 1
+                return window
+            return None

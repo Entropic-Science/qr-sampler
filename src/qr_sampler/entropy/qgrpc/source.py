@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
@@ -219,7 +220,10 @@ class QuantumGrpcSource(EntropySource):
                 },
             )
 
-        # Pipelined-fetch telemetry (exposed via health_check()).
+        # Pipelined-fetch telemetry (exposed via health_check()). Guarded
+        # by a lock: the engine adapter samples batch rows on concurrent
+        # worker threads, so redemptions/fires overlap.
+        self._stats_lock = threading.Lock()
         self._prefetch_fired: int = 0
         self._prefetch_hits: int = 0
         self._prefetch_misses: int = 0
@@ -439,7 +443,8 @@ class QuantumGrpcSource(EntropySource):
         except Exception as exc:
             logger.debug("prefetch dispatch failed: %s", exc)
             return None
-        self._prefetch_fired += 1
+        with self._stats_lock:
+            self._prefetch_fired += 1
         return PrefetchTicket(future=future, nonce=nonce or 0, n=n)
 
     def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
@@ -467,7 +472,8 @@ class QuantumGrpcSource(EntropySource):
         except Exception as exc:
             ticket.cancel()
             ticket.hit = False
-            self._prefetch_misses += 1
+            with self._stats_lock:
+                self._prefetch_misses += 1
             logger.debug("prefetch redeem failed (%s); falling back to serial fetch", exc)
             return self.get_random_bytes(n)
 
@@ -476,7 +482,8 @@ class QuantumGrpcSource(EntropySource):
         ticket.wait_ms = 0.0 if already_done else (time.perf_counter() - t0) * 1000.0
         ticket.echo_verified = bool(ticket.nonce) and reply.sequence_id == ticket.nonce
         ticket.server_timestamp_ns = reply.generation_timestamp_ns or None
-        self._prefetch_hits += 1
+        with self._stats_lock:
+            self._prefetch_hits += 1
         self._breaker.note_success(reply.elapsed_ms)
         self._preprobe.note_fetch_success()
         return reply.payload
@@ -532,7 +539,8 @@ class QuantumGrpcSource(EntropySource):
         except Exception as exc:
             logger.debug("draw prefetch dispatch failed: %s", exc)
             return None
-        self._prefetch_fired += 1
+        with self._stats_lock:
+            self._prefetch_fired += 1
         return PrefetchTicket(future=future, nonce=nonce or 0, n=block_bytes)
 
     def _redeem_draw_ticket(self, ticket: Any) -> tuple[float, DrawMeta] | None:
@@ -556,7 +564,8 @@ class QuantumGrpcSource(EntropySource):
         except Exception as exc:
             ticket.cancel()
             ticket.hit = False
-            self._prefetch_misses += 1
+            with self._stats_lock:
+                self._prefetch_misses += 1
             logger.debug("draw prefetch redeem failed (%s); falling back to serial draw", exc)
             return None
 
@@ -565,7 +574,8 @@ class QuantumGrpcSource(EntropySource):
         ticket.wait_ms = 0.0 if already_done else (time.perf_counter() - t0) * 1000.0
         ticket.echo_verified = bool(ticket.nonce) and response.sequence_id == ticket.nonce
         ticket.server_timestamp_ns = response.generation_timestamp_ns or None
-        self._prefetch_hits += 1
+        with self._stats_lock:
+            self._prefetch_hits += 1
         self._breaker.note_success(reply.elapsed_ms)
         self._preprobe.note_fetch_success()
         return self._draw_result(response, echo_verified=ticket.echo_verified)

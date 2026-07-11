@@ -117,6 +117,39 @@ argv anywhere, validate flags against
 `vllm.entrypoints.openai.cli_args:make_arg_parser` at startup rather
 than discovering renames in production tracebacks.
 
+### Sampling hot-path perf tranche (2026-07)
+
+The per-token sampler cost — not the QRNG round trip — was the concurrent
+throughput ceiling on the PRNG lanes: at a 152k vocabulary the serial
+apply() loop cost 7.9 ms/token on the default path and 25 ms/token on the
+`top_k=50, top_p=0.9` shape every qthought preset uses (≈ 39 tok/s
+aggregate ceiling regardless of batch size). Three lessons that constrain
+future hot-path work:
+
+- **Count full-vocab passes, not big-O.** Every stage was already O(V) or
+  better; the cost was ~20 memory-bound 152k-element passes per token.
+  The two biggest single wins were removing the full-vocab `log` pass in
+  `compute_shannon_entropy` (H = ln Z − dot(exp s, s)/Z; 42% of the
+  budget) and compacting a truncating top-k to its k survivors before
+  softmax/min-p/top-p/CDF (13× on the deployed preset shape).
+- **Equivalence class is "last-ulp summation order", not byte-identical.**
+  The compacted top-k sums Z over the same k exponentials in a different
+  pairwise order than the historical zeros-padded full-vocab sum; ties at
+  CDF boundaries were already unspecified (same class as the iter-55
+  `_CDF_FAST_HEAD` path). Equivalence is pinned by reference
+  implementations in `tests/test_selection/test_compact_topk.py` and
+  `tests/test_temperature/test_entropy_fastpath.py` — keep those green
+  rather than re-deriving.
+- **Per-row parallelism needs the shared hot path audited, not assumed.**
+  numpy ufuncs release the GIL, so a row worker pool
+  (`apply_parallel_rows`) roughly doubles aggregate throughput on top of
+  the math wins — but only after making `FallbackEntropySource`'s
+  `last_source_used` thread-local (per-token labels would otherwise
+  cross-contaminate between rows), locking the circuit breaker's compound
+  transitions, and locking `MockUniformSource`'s numpy Generator (it can
+  be the production fallback leg). Per-request state was already
+  row-exclusive by design (invariant 14 pays off here).
+
 ### V6 temperature-strategy tranche parity check (2026-07)
 
 Recorded while porting the V6 families `tt_exchange` / `evdt_tt` from

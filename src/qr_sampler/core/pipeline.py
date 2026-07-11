@@ -18,6 +18,7 @@ import hashlib
 import inspect
 import logging
 import math
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -275,8 +276,11 @@ class SamplingPipeline:
         # cross-process status file — writes happen only on change (plus a
         # slow heartbeat so readers can apply a staleness bound) so the
         # hot path never pays a file write per token in steady state.
+        # Guarded by a lock: the engine adapter samples batch rows on
+        # concurrent worker threads that share this pipeline.
         self._last_gate_status: tuple[bool, float, bool] | None = None
         self._last_gate_write_monotonic: float = 0.0
+        self._gate_status_lock = threading.Lock()
 
     def sample_token(
         self,
@@ -546,19 +550,20 @@ class SamplingPipeline:
             float(record.gate_boost or 0.0),
             bool(record.draw_coherence_valid or False),
         )
-        now = time.monotonic()
-        heartbeat_due = now - self._last_gate_write_monotonic >= _GATE_STATUS_HEARTBEAT_S
-        if current == self._last_gate_status and not heartbeat_due:
-            return
-        from qr_sampler.telemetry.status_file import write_gate_status
+        with self._gate_status_lock:
+            now = time.monotonic()
+            heartbeat_due = now - self._last_gate_write_monotonic >= _GATE_STATUS_HEARTBEAT_S
+            if current == self._last_gate_status and not heartbeat_due:
+                return
+            from qr_sampler.telemetry.status_file import write_gate_status
 
-        write_gate_status(
-            gate_open=current[0],
-            gate_boost=current[1],
-            coherence_valid=current[2],
-        )
-        self._last_gate_status = current
-        self._last_gate_write_monotonic = now
+            write_gate_status(
+                gate_open=current[0],
+                gate_boost=current[1],
+                coherence_valid=current[2],
+            )
+            self._last_gate_status = current
+            self._last_gate_write_monotonic = now
 
     def _draw_fallback_amplifier(self, config: QRSamplerConfig) -> SignalAmplifier:
         """The lazily-built local amplifier for the degraded draw path.

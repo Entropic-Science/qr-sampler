@@ -68,6 +68,17 @@ class EntropySource(ABC):
     The ``get_random_bytes()`` call must satisfy the just-in-time constraint:
     physical entropy generation occurs only when this method is called.
 
+    Thread safety
+    -------------
+    The vLLM engine adapter samples concurrent batch rows on worker
+    threads (config ``apply_parallel_rows``), so ``get_random_bytes()``,
+    ``get_random_bytes_with_ticket()``, ``prefetch()`` and the draw twins
+    may be called concurrently on one source instance. Every builtin
+    source is safe for that (``os.urandom``, locked mock RNG, the gRPC
+    source's thread-safe channel dispatch + locked breaker). Third-party
+    sources that cannot guarantee concurrent fetches should be deployed
+    with ``QR_APPLY_PARALLEL_ROWS=1`` (single-threaded apply loop).
+
     Pipelined (commit-then-fetch) extension
     ---------------------------------------
     ``prefetch()`` / ``get_random_bytes_with_ticket()`` let a caller *fire*

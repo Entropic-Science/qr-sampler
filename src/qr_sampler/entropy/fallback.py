@@ -46,6 +46,7 @@ Conclusion: the iter-49 banner only ever needs to surface a soft warning
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -85,6 +86,14 @@ class FallbackEntropySource(EntropySource):
         self._primary = primary
         self._fallback = fallback
         self._last_source_used: str = primary.name
+        # Per-thread view of "who served MY last fetch". The engine
+        # adapter samples batch rows on concurrent worker threads (perf
+        # tranche 2026-07); the pipeline reads ``last_source_used``
+        # immediately after its own fetch to label the token record, so a
+        # process-global field would let thread A's fallback mislabel
+        # thread B's healthy primary fetch. The global field above remains
+        # the health-check / status-file view.
+        self._tls_last_source = threading.local()
         # Degradation telemetry. Lazily initialised so a process that never
         # falls back keeps the deque-free fast path.
         self._fallback_count: int = 0
@@ -117,8 +126,16 @@ class FallbackEntropySource(EntropySource):
 
     @property
     def last_source_used(self) -> str:
-        """Name of the source that provided bytes on the last call."""
-        return self._last_source_used
+        """Name of the source that provided bytes on the last call.
+
+        Thread-aware: a thread that has fetched through this wrapper sees
+        the source that served ITS most recent fetch (correct per-token
+        labelling under the adapter's parallel row sampling); threads that
+        never fetched (health checks, status readers) see the most recent
+        process-wide value.
+        """
+        last: str | None = getattr(self._tls_last_source, "name", None)
+        return last if last is not None else self._last_source_used
 
     @property
     def fallback_count(self) -> int:
@@ -221,6 +238,7 @@ class FallbackEntropySource(EntropySource):
                 )
                 self._currently_degraded = False
             self._last_source_used = self._primary.name
+            self._tls_last_source.name = self._primary.name
             if recovered:
                 self._write_status(force=True)
             return data
@@ -230,6 +248,7 @@ class FallbackEntropySource(EntropySource):
             self._log_degraded(exc, n)
             data = self._fallback.get_random_bytes(n)
             self._last_source_used = self._fallback.name
+            self._tls_last_source.name = self._fallback.name
             self._write_status(force=first_fallback)
             return data
 

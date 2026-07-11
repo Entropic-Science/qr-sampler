@@ -29,6 +29,7 @@ import numpy as np
 from qr_sampler.temperature.base import (
     TemperatureResult,
     TemperatureStrategy,
+    compute_entropy_varentropy,
 )
 
 if TYPE_CHECKING:
@@ -76,23 +77,11 @@ class HVHDriftStrategy(TemperatureStrategy):
             diagnostics containing ``min_p``, ``varentropy``, ``h_ema``,
             ``vh_ema``, ``d_h``, ``d_vh``.
         """
-        # Stable softmax: shift by max, then log-normalize. iter-55: one
-        # exp pass over the vocab instead of two — ``probs`` is derived
-        # from the already-computed ``exp_shifted`` rather than
-        # re-exponentiating ``log_probs`` (~0.7 ms/token saved at 152k
-        # vocab). ``log_probs`` keeps the exact prior formula; ``probs``
-        # is mathematically identical (may differ in the last ulp).
-        shifted = logits - np.max(logits)
-        exp_shifted = np.exp(shifted)
-        sum_exp = float(np.sum(exp_shifted))
-        log_probs = shifted - np.log(sum_exp)
-        probs = exp_shifted / sum_exp
-
-        # H = -sum(p * log p); VH = sum(p * (-log p - H)^2).
-        h = float(-np.sum(probs * log_probs))
-        h = max(0.0, h)  # guard tiny negative float artifacts
-        vh = float(np.sum(probs * (-log_probs - h) ** 2))
-        vh = max(0.0, vh)
+        # H = -sum(p * log p); VH = sum(p * (-log p - H)^2). Fused
+        # dot-product formulation (perf tranche 2026-07): no full-vocab
+        # ``probs``/``log_probs`` materialisation — see
+        # ``compute_entropy_varentropy`` for the equivalence argument.
+        h, vh = compute_entropy_varentropy(logits)
 
         # Compute drifts BEFORE EMA update (matches V6 reference order at
         # hvh_drift.py:127-137). On the first call, seed EMAs with current

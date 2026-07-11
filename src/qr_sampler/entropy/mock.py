@@ -6,6 +6,8 @@ deterministic tests (via seed) and controlled bias experiments.
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from qr_sampler.entropy.base import EntropySource
@@ -34,6 +36,10 @@ class MockUniformSource(EntropySource):
         self._mean = mean
         self._seed = seed
         self._rng = np.random.default_rng(seed)
+        # numpy Generators are not thread-safe, and this source can serve
+        # as the production fallback leg (fallback_mode="mock_uniform")
+        # under the adapter's concurrent per-row sampling.
+        self._rng_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -57,7 +63,8 @@ class MockUniformSource(EntropySource):
         Returns:
             Exactly *n* bytes.
         """
-        samples = self._rng.normal(loc=self._mean, scale=self._MOCK_BYTE_STD, size=n)
+        with self._rng_lock:
+            samples = self._rng.normal(loc=self._mean, scale=self._MOCK_BYTE_STD, size=n)
         clamped = np.clip(samples, 0, 255).astype(np.uint8)
         return bytes(clamped)
 

@@ -94,13 +94,9 @@ class TokenSelector:
         if truncate_first:
             return self._select_truncate_first(logits, temperature, top_k, top_p, u, min_p)
 
-        # 1. Temperature scaling.
-        if temperature > 0:
-            scaled = logits / temperature
-        else:
+        if temperature <= 0:
             # Zero temperature -> greedy (pick max logit).
-            scaled = logits.copy()
-            max_idx = int(np.argmax(scaled))
+            max_idx = int(np.argmax(logits))
             return SelectionResult(
                 token_id=max_idx,
                 token_rank=0,
@@ -109,23 +105,54 @@ class TokenSelector:
                 diagnostics={"greedy": True},
             )
 
-        # 2. Top-k filtering.
-        scaled, effective_k = self._apply_top_k(scaled, top_k)
+        vocab_size = logits.size
+
+        # Compaction fast path (perf tranche 2026-07): when top-k actually
+        # truncates, every token outside the top-k support ends up with
+        # probability exactly 0 (``exp(-inf)``), yet the historical flow
+        # still ran softmax / min-p / top-p / CDF over the full vocabulary
+        # — including a full-vocab argsort in ``_apply_top_p``. Gathering
+        # the k surviving logits first (temperature scaling is monotone
+        # for T > 0, so the support set is identical) turns all of those
+        # stages into O(k) work, then the selected sub-index maps back to
+        # vocabulary space. Probabilities on the support match the full
+        # computation exactly up to summation-order rounding (last ulp) —
+        # the same equivalence class as the ``_CDF_FAST_HEAD`` path.
+        if 0 < top_k < vocab_size:
+            return self._select_compact_top_k(logits, temperature, top_k, top_p, u, min_p)
+
+        # 1. Temperature scaling. T == 1.0 is an exact no-op — skip the
+        # full-vocab divide (softmax never mutates its input).
+        scaled = logits if temperature == 1.0 else logits / temperature
+
+        # 2. Top-k filtering (disabled here: handled by the compaction
+        # path above whenever it would truncate).
+        effective_k = vocab_size
 
         # 3. Softmax.
         probs = self._stable_softmax(scaled)
 
-        # 4. Min-p mask.
-        probs, effective_min_p_candidates = self._apply_min_p(probs, min_p)
-
-        # 5. Top-p (nucleus) filtering.
-        probs, effective_n = self._apply_top_p(probs, top_p)
+        # 4-5. Min-p mask and top-p (nucleus) filtering. When both are
+        # disabled each helper would independently scan for ``probs > 0``;
+        # count once instead (identical value, two fewer full-vocab passes).
+        num_candidates: int | None
+        if min_p <= 0.0 and top_p >= 1.0:
+            nonzero = int(np.count_nonzero(probs > 0))
+            effective_min_p_candidates = nonzero
+            effective_n = nonzero
+            num_candidates = nonzero
+        else:
+            probs, effective_min_p_candidates = self._apply_min_p(probs, min_p)
+            probs, effective_n = self._apply_top_p(probs, top_p)
+            num_candidates = None
 
         if effective_n == 0:
             raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
 
         # 6-8. CDF selection.
-        vocab_idx, rank, prob, num_candidates = self._cdf_select(probs, u)
+        vocab_idx, rank, prob, num_candidates = self._cdf_select(
+            probs, u, num_candidates=num_candidates
+        )
 
         return SelectionResult(
             token_id=vocab_idx,
@@ -134,6 +161,84 @@ class TokenSelector:
             num_candidates=num_candidates,
             diagnostics={
                 "effective_top_k": effective_k,
+                "effective_top_p_candidates": effective_n,
+                "effective_min_p_candidates": effective_min_p_candidates,
+                "min_p_used": min_p,
+                "u": u,
+            },
+        )
+
+    def _select_compact_top_k(
+        self,
+        logits: np.ndarray,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        u: float,
+        min_p: float,
+    ) -> SelectionResult:
+        """Default-order selection compacted onto the top-k support.
+
+        Semantically identical to the full-vocabulary flow (invariant 15
+        order: top-k -> softmax -> min-p -> top-p -> CDF): tokens outside
+        the top-k support carry probability exactly 0 in the historical
+        computation, so removing them before softmax leaves every surviving
+        probability, count, and diagnostic unchanged (up to last-ulp
+        summation-order rounding). One O(vocab) argpartition + gather
+        replaces the historical full-vocab softmax, mask, sort and CDF
+        passes with O(top_k) work.
+
+        Args:
+            logits: 1-D logit array (vocab_size,).
+            temperature: Sampling temperature (> 0; greedy handled by caller).
+            top_k: Number of top tokens to keep (0 < top_k < vocab_size).
+            top_p: Nucleus sampling threshold in (0, 1] (1.0 disables).
+            u: Uniform random value from signal amplification, in (0, 1).
+            min_p: Dynamic floor relative to peak probability (0.0 disables).
+
+        Returns:
+            SelectionResult with the selected token and diagnostics.
+
+        Raises:
+            TokenSelectionError: If no candidate tokens survive filtering.
+        """
+        vocab_size = logits.size
+
+        # O(vocab) top-k support selection on the raw logits: dividing by a
+        # positive temperature is strictly monotone, so the support set is
+        # the same one `_apply_top_k` derives from the scaled logits (tie
+        # order at the k-th place is unspecified in both, as documented).
+        top_idx = np.argpartition(logits, vocab_size - top_k)[vocab_size - top_k :]
+        sub_logits = logits[top_idx]
+
+        scaled = sub_logits if temperature == 1.0 else sub_logits / temperature
+        probs = self._stable_softmax(scaled)
+
+        num_candidates: int | None
+        if min_p <= 0.0 and top_p >= 1.0:
+            nonzero = int(np.count_nonzero(probs > 0))
+            effective_min_p_candidates = nonzero
+            effective_n = nonzero
+            num_candidates = nonzero
+        else:
+            probs, effective_min_p_candidates = self._apply_min_p(probs, min_p)
+            probs, effective_n = self._apply_top_p(probs, top_p)
+            num_candidates = None
+
+        if effective_n == 0:
+            raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
+
+        sub_idx, rank, prob, num_candidates = self._cdf_select(
+            probs, u, num_candidates=num_candidates
+        )
+
+        return SelectionResult(
+            token_id=int(top_idx[sub_idx]),
+            token_rank=rank,
+            token_prob=prob,
+            num_candidates=num_candidates,
+            diagnostics={
+                "effective_top_k": top_k,
                 "effective_top_p_candidates": effective_n,
                 "effective_min_p_candidates": effective_min_p_candidates,
                 "min_p_used": min_p,
@@ -320,8 +425,11 @@ class TokenSelector:
             max_logit = np.max(logits[finite_mask])
 
         shifted = logits - max_logit
-        # -inf - max_logit is still -inf, exp(-inf) = 0.
-        exp_shifted = np.exp(shifted)
+        # -inf - max_logit is still -inf, exp(-inf) = 0. The subtraction
+        # above allocated a fresh float array we own, so exp (and the
+        # final normalisation below) run in place — one allocation per
+        # softmax instead of three (perf tranche 2026-07).
+        exp_shifted = np.exp(shifted, out=shifted) if shifted.dtype.kind == "f" else np.exp(shifted)
         total = np.sum(exp_shifted)
 
         if total == 0.0:
@@ -335,7 +443,7 @@ class TokenSelector:
             probs[backstop_mask] = 1.0 / max(n, 1)
             return probs
 
-        result: np.ndarray = exp_shifted / total
+        result: np.ndarray = np.divide(exp_shifted, total, out=exp_shifted)
         return result
 
     @staticmethod
@@ -378,7 +486,9 @@ class TokenSelector:
         return result, num_surviving
 
     @staticmethod
-    def _cdf_select(probs: np.ndarray, u: float) -> tuple[int, int, float, int]:
+    def _cdf_select(
+        probs: np.ndarray, u: float, num_candidates: int | None = None
+    ) -> tuple[int, int, float, int]:
         """Select a token via CDF binary search.
 
         Sorts tokens by descending probability, builds a CDF, and uses
@@ -387,6 +497,9 @@ class TokenSelector:
         Args:
             probs: Probability array (vocab_size,). Must sum to ~1.0.
             u: Uniform random value in (0, 1).
+            num_candidates: Pre-computed count of ``probs > 0`` entries, when
+                the caller already scanned for it (avoids a redundant
+                full-vocab pass). ``None`` computes it here.
 
         Returns:
             Tuple of (vocabulary index, rank, probability, num_candidates).
@@ -395,7 +508,8 @@ class TokenSelector:
             TokenSelectionError: If no tokens have non-zero probability.
         """
         # Get non-zero probability tokens.
-        num_candidates = int(np.count_nonzero(probs > 0))
+        if num_candidates is None:
+            num_candidates = int(np.count_nonzero(probs > 0))
         if num_candidates == 0:
             raise TokenSelectionError("No tokens with non-zero probability for CDF selection")
 

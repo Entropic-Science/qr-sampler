@@ -621,6 +621,21 @@ class QRSamplerConfig(BaseSettings):
         json_schema_extra=_PER_REQUEST,
     )
 
+    # --- Engine adapter (infrastructure; NOT per-request overridable) ---
+
+    apply_parallel_rows: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Worker-thread cap for the engine adapter's per-row sampling "
+            "loop (vLLM apply()). 0 (default) resolves to the machine's CPU "
+            "count; 1 restores the historical single-threaded loop; N > 1 "
+            "caps the pool at N. Single-row batches never use the pool. Set "
+            "to 1 if a third-party entropy source plugin is not safe for "
+            "concurrent get_random_bytes() calls (all builtin sources are)."
+        ),
+    )
+
     # --- Logging (per-request overridable) ---
 
     log_level: str = Field(

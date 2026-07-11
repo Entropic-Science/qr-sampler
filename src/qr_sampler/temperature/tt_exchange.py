@@ -27,6 +27,7 @@ min_p_base=0.005, min_p_scale=0.025``.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -79,14 +80,27 @@ class TTExchangeStrategy(TemperatureStrategy):
             diagnostics containing ``min_p``, ``h_kept``,
             ``entropy_removed``, ``n_kept``.
         """
-        # Stable softmax with a single exp pass (same shape as hvh_drift).
-        shifted = logits - np.max(logits)
-        exp_shifted = np.exp(shifted)
-        sum_exp = float(np.sum(exp_shifted))
-        log_probs = shifted - np.log(sum_exp)
-        probs = exp_shifted / sum_exp
-
-        h = max(0.0, float(-np.sum(probs * log_probs)))
+        # Entropy via the shared dot-product formulation (perf tranche
+        # 2026-07): with s = logits - max and Z = sum(exp(s)),
+        # H = ln Z - dot(exp(s), s) / Z — no full-vocab log pass and no
+        # ``probs``/``log_probs`` materialisation. Degenerate inputs
+        # (non-finite max, NaN dot from a -inf logit) reproduce the
+        # historical outputs: h = 0.0 and an empty kept set.
+        max_logit = float(np.max(logits))
+        degenerate = not math.isfinite(max_logit)
+        if degenerate:
+            h = 0.0
+            exp_shifted = shifted = None
+            sum_exp = 0.0
+        else:
+            shifted = logits - max_logit
+            exp_shifted = np.exp(shifted)
+            sum_exp = float(np.sum(exp_shifted))
+            # NaN (exp(-inf) * -inf from a masked logit) is the deliberate
+            # degenerate probe; suppress the numpy warning it triggers.
+            with np.errstate(invalid="ignore"):
+                m1 = float(np.dot(exp_shifted, shifted)) / sum_exp
+            h = 0.0 if math.isnan(m1) else max(0.0, math.log(sum_exp) - m1)
 
         # 1. Classic entropy-linear min-p, clamped to the guardrail box.
         raw_min_p = config.tt_min_p_base + config.tt_min_p_scale * h
@@ -94,19 +108,28 @@ class TTExchangeStrategy(TemperatureStrategy):
 
         # 2. Measure the entropy of the kept (renormalised) distribution.
         #    This is a measurement only — logits are never modified here;
-        #    the selector applies the published min_p downstream.
-        if min_p > 0.0:
-            mask = probs >= min_p * float(probs.max())
-            kept = probs[mask]
-            kept_sum = float(kept.sum())
-            # mask always retains the argmax (probs.max() >= min_p * max
-            # for min_p <= 1), so kept_sum > 0 by construction.
-            kept = kept / kept_sum
-            h_kept = max(0.0, float(-np.sum(kept * np.log(kept))))
-            n_kept = int(mask.sum())
+        #    the selector applies the published min_p downstream. The mask
+        #    ``p >= min_p * max(p)`` is evaluated on the exp values
+        #    directly: max(exp(s)) == 1.0 exactly (the max logit shifts to
+        #    0), so the condition is ``exp(s) >= min_p`` — the same set up
+        #    to division-rounding at the exact threshold boundary.
+        if degenerate or exp_shifted is None or shifted is None:
+            h_kept = 0.0
+            n_kept = 0
+        elif min_p > 0.0:
+            mask = exp_shifted >= min_p
+            kept_e = exp_shifted[mask]
+            kept_s = shifted[mask]
+            kept_sum = float(kept_e.sum())
+            # mask always retains the argmax (exp == 1.0 >= min_p for
+            # min_p <= 1), so kept_sum > 0 by construction. H of the
+            # renormalised kept distribution q = e / K is
+            # ln K - dot(e, s) / K (same identity as above).
+            h_kept = max(0.0, math.log(kept_sum) - float(np.dot(kept_e, kept_s)) / kept_sum)
+            n_kept = int(np.count_nonzero(mask))
         else:
             h_kept = h
-            n_kept = int(np.sum(probs > 0))
+            n_kept = int(np.count_nonzero(exp_shifted))
 
         # 3. Redeploy the removed entropy as temperature.
         entropy_removed = max(0.0, h - h_kept)
