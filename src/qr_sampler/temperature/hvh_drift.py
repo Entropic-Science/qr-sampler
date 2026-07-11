@@ -3,7 +3,17 @@
 Stateful, per-request strategy ported from createmp-evalsuite V6 (research
 spec §8). Two scalar EMAs track recent entropy ``H`` and varentropy ``VH``;
 the instantaneous-vs-smoothed gap (``dH``, ``dVH``) feeds the temperature
-and min-p formulas:
+and min-p formulas.
+
+v7 semantics alignment (v4v6 competitiveness assessment §7.4): drift is
+computed against the *previous* EMA (``dH = H_t - ema_{t-1}``), and the
+EMA updates afterwards. The V6 reference updated first, making
+``dH = (1 - lambda) * (H_t - ema_{t-1})`` — coupling ``hvh_lambda_ema`` to
+the drift gains and degenerating smoothly to zero drift as lambda -> 1.
+The decoupled form searches cleanly down to ``lambda_ema ~ 0.01`` (the V6
+champion sat at 0.02, outside the old GP bounds).
+
+Formulas:
 
     T_t     = T_base + alpha_H*H + alpha_VH*VH + gamma_dH*dH + delta_dVH*dVH
     min_p_t = min_p_base + kappa_H*H + nu_dH*dH
@@ -83,9 +93,16 @@ class HVHDriftStrategy(TemperatureStrategy):
         # ``compute_entropy_varentropy`` for the equivalence argument.
         h, vh = compute_entropy_varentropy(logits)
 
-        # Compute drifts BEFORE EMA update (matches V6 reference order at
-        # hvh_drift.py:127-137). On the first call, seed EMAs with current
-        # values so dH = dVH = 0 (no cold-start branch).
+        # Drift vs the PREVIOUS EMA, then update (v7 alignment; v4v6
+        # competitiveness assessment §7.4). The V6 reference updated the
+        # EMA first and measured drift against the post-update value,
+        # which scales the drift signal by (1 - lambda) and couples
+        # ``hvh_lambda_ema`` to ``hvh_gamma_dh``/``hvh_nu_dh`` — warping
+        # the BO space (lambda -> 1 shrinks drift to 0 smoothly).
+        # Measuring against the previous EMA decouples them:
+        # dH = H_t - ema_{t-1}, independent of lambda at fixed history.
+        # On the first call, seed EMAs with current values so
+        # dH = dVH = 0 (no cold-start branch).
         if self._first_call:
             self.H_ema = h
             self.VH_ema = vh
@@ -93,11 +110,11 @@ class HVHDriftStrategy(TemperatureStrategy):
             d_h = 0.0
             d_vh = 0.0
         else:
+            d_h = h - self.H_ema
+            d_vh = vh - self.VH_ema
             lam = config.hvh_lambda_ema
             self.H_ema = (1.0 - lam) * self.H_ema + lam * h
             self.VH_ema = (1.0 - lam) * self.VH_ema + lam * vh
-            d_h = h - self.H_ema
-            d_vh = vh - self.VH_ema
 
         raw_temp = (
             config.hvh_t_base

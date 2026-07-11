@@ -36,6 +36,11 @@ class TemperatureStrategyRegistry:
         "coherence_gate": "qr_sampler.temperature.coherence_gate:CoherenceGateStrategy",
         "tt_exchange": "qr_sampler.temperature.tt_exchange:TTExchangeStrategy",
         "evdt_tt": "qr_sampler.temperature.evdt_tt:EVDTTTStrategy",
+        "gdt": "qr_sampler.temperature.gdt:GDTStrategy",
+        "dynatemp": "qr_sampler.temperature.dynatemp:DynaTempStrategy",
+        "belltemp": "qr_sampler.temperature.belltemp:BellTempStrategy",
+        "mix_temperatures": "qr_sampler.temperature.mix_temperatures:MixTemperaturesStrategy",
+        "ring_buffer_ar": "qr_sampler.temperature.ring_buffer_ar:RingBufferARStrategy",
     }
 
     _registry: ClassVar[dict[str, type[TemperatureStrategy]]] = {}

@@ -1,0 +1,38 @@
+id: ring_buffer_ar
+name: "Ring-Buffer Anti-Repetition"
+description: |
+  Anti-repetition gate over a ring buffer of the last N emitted tokens,
+  plus a static (T, min_p). Ported from createmp-evalsuite V6 (research
+  spec §7.6), replication-first.
+
+  Formula:
+    penalty_v = lam * max(0, sim_v - threshold)
+    logits'   = logits - penalty          (transformed-logits seam)
+    T_t       = clip(t, 0.3, 2.2); min_p_t = clip(min_p, 0, 0.15)
+
+  Similarity modes:
+    - embedding mode: cos(E_v, centroid of buffered-token embeddings)
+      after attach_embeddings() injection (V6-faithful);
+    - exact-id fallback (default): sim_v = 1 for buffered ids, else 0 —
+      a plain repetition penalty of lam * (1 - threshold) logits on the
+      recently emitted ids.
+
+  Emitted-token history arrives via the pipeline's
+  observe_selected_token hook (one-token structural lag). Per-request
+  stateful: engine adapters build a fresh instance per request.
+
+  Static clone (plumbing checks): qr_rba_lam=0 disables the gate — fixed
+  T = rba_t with constant min_p = rba_min_p on the identical selector
+  path as a fixed-strategy run.
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "ring_buffer_ar",
+      "qr_rba_buffer_n": 64,
+      "qr_rba_lam": 3.0
+    }
+
+sampler_class: "qr_sampler.temperature.ring_buffer_ar:RingBufferARStrategy"
+performance_impact: low
+build_time_locked: false
+requires_vocab_size: true

@@ -1,0 +1,35 @@
+id: belltemp
+name: "BellTemp"
+description: |
+  Non-monotonic bell-curve temperature on normalized entropy: sharpen
+  when confident, explore in the mid-entropy sweet spot, stabilize when
+  the model is lost. Ported from createmp-evalsuite V5 (v4v6 assessment
+  §3.5).
+
+  Formula:
+    H_norm  = clip(H / ln(V), 0, 1)
+    VH_norm = 1 - exp(-VH / lambda_vh)
+    bell    = t_peak * exp(-(H_norm - mu)^2 / (2 * sigma^2))
+    T_t     = clip(t_base + bell + vh_weight * VH_norm, 0.3, 2.2)
+    t_frac  = clip((T_t - 0.3) / 1.9, 0, 1)
+    min_p_t = clip(min_p_base + min_p_scale * t_frac, 0, 0.15)
+
+  t_peak is hard-capped at 1.5 (shares GDT's coherence cliff). Port
+  note: the adaptive min-p fraction is normalized over the repo-wide
+  temperature guardrail box [0.3, 2.2] (legacy used configurable
+  T_min/T_max knobs).
+
+  Static clone (plumbing checks): qr_belltemp_t_peak=0 +
+  qr_belltemp_vh_weight=0 + qr_belltemp_min_p_scale=0 reduces exactly to
+  fixed T = t_base with constant min_p = min_p_base.
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "belltemp",
+      "qr_belltemp_t_peak": 0.8
+    }
+
+sampler_class: "qr_sampler.temperature.belltemp:BellTempStrategy"
+performance_impact: none
+build_time_locked: false
+requires_vocab_size: true

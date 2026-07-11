@@ -1,0 +1,32 @@
+id: dynatemp
+name: "DynaTemp"
+description: |
+  Entropy-linear dynamic temperature (llama.cpp lineage; standard
+  direction only). Ported from createmp-evalsuite V5 (v4v6 assessment
+  §3.3).
+
+  Formula:
+    H_norm  = clip(H / ln(V), 0, 1)
+    T_t     = clip(t_center - t_range + 2 * t_range * H_norm^exponent,
+                   0.3, 2.2)
+    min_p_t = min_p                        (constant per token)
+
+  Defaults are the balanced V5_DYNATEMP_R00_09 member. The hot +
+  hard-truncation ABL_DYN_08 recipe (t_center=1.875, t_range=0.80,
+  min_p=0.12) is reachable in-bounds by design.
+
+  Static clone (plumbing checks): qr_dynatemp_t_range=0 reduces exactly
+  to fixed T = t_center with constant min_p.
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "dynatemp",
+      "qr_dynatemp_t_center": 1.875,
+      "qr_dynatemp_t_range": 0.8,
+      "qr_dynatemp_min_p": 0.12
+    }
+
+sampler_class: "qr_sampler.temperature.dynatemp:DynaTempStrategy"
+performance_impact: none
+build_time_locked: false
+requires_vocab_size: true

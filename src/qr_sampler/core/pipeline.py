@@ -410,9 +410,22 @@ class SamplingPipeline:
         amplify_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 
         # --- 4. Select token via CDF ---
+        # Duck-typed distribution seam (precedent: the per-token ``min_p``
+        # diagnostic): a strategy whose output distribution is not
+        # ``softmax(logits / T)`` for any scalar T (e.g. the
+        # mixture-of-temperatures family) publishes fully transformed
+        # logits under ``diagnostics["transformed_logits"]``; the selector
+        # then operates on those (with the strategy-returned temperature —
+        # 1.0 for a pre-mixed distribution) instead of the raw logits.
+        # Absent the key, behavior is byte-identical to the pre-seam
+        # pipeline. Shannon entropy in the record always describes the RAW
+        # distribution — the strategy contract is unchanged.
+        transformed = temp_result.diagnostics.get("transformed_logits")
+        selector_logits: np.ndarray = transformed if transformed is not None else logits
+
         t_stage = time.perf_counter_ns()
         selection = self._selector.select(
-            logits,
+            selector_logits,
             temp_result.temperature,
             active_config.top_k,
             active_config.top_p,
@@ -421,6 +434,15 @@ class SamplingPipeline:
             truncate_first=active_config.truncate_first,
         )
         select_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
+
+        # Duck-typed selection-feedback hook (precedent:
+        # ``observe_draw_meta``): per-request stateful strategies that
+        # condition on the emitted-token history (e.g. ring_buffer_ar)
+        # receive the token id selected for THIS step, so history observed
+        # at token t first affects token t+1 — a structural one-token lag,
+        # mirroring the draw-meta hook.
+        if hasattr(active_strategy, "observe_selected_token"):
+            active_strategy.observe_selected_token(selection.token_id)
 
         # --- 5. Commit-then-fetch: fire the NEXT token's entropy NOW ---
         # The selection event for this token just happened, so a request

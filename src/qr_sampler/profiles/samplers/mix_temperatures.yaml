@@ -1,0 +1,36 @@
+id: mix_temperatures
+name: "Mixture-of-Temperatures"
+description: |
+  Convex mix of two temperature-sampled distributions with an
+  (H, VH)-gated weight. Ported from createmp-evalsuite V6 (research
+  spec §7.4).
+
+  Formula:
+    p_cool = softmax(l / t_cool)
+    p_hot  = softmax(l / t_hot)
+    alpha  = sigmoid(a * (H - b) + c * (VH - d))
+    p_mix  = alpha * p_hot + (1 - alpha) * p_cool
+    min_p on the mixed distribution.
+
+  A convex mixture of two softmax powers is not a power, so the strategy
+  publishes transformed logits ln(p_mix) through the pipeline's
+  distribution seam and returns temperature 1.0 for the selector. t_hot
+  reaches the guardrail ceiling 2.2 (re-widened bounds, assessment §8.2
+  item 6); pair hot arms with a hard truncation floor (sharp-gate hot
+  variant).
+
+  Static clone (plumbing checks): qr_mix_t_cool = qr_mix_t_hot = T makes
+  p_mix = softmax(l / T) exactly for every gate value — fixed T with
+  constant min_p, still exercising the mixture plumbing end-to-end.
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "mix_temperatures",
+      "qr_mix_t_hot": 1.7,
+      "qr_mix_gate_a": 4.0
+    }
+
+sampler_class: "qr_sampler.temperature.mix_temperatures:MixTemperaturesStrategy"
+performance_impact: low
+build_time_locked: false
+requires_vocab_size: true

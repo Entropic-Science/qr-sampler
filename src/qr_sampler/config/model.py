@@ -545,6 +545,251 @@ class QRSamplerConfig(BaseSettings):
         json_schema_extra=_PER_REQUEST,
     )
 
+    # --- GDT Temperature Strategy (per-request overridable) ---
+    # Gaussian Dynamic Temperature (V5 lineage). Defaults pinned to the
+    # V5_GDT_R00_00 winning configuration from createmp-evalsuite
+    # (v4v6 competitiveness assessment §3.2). Dormant unless
+    # temperature_strategy = "gdt" is explicitly set.
+
+    gdt_t_base: float = Field(
+        default=0.582,
+        description="GDT base temperature (V5_GDT_R00_00 winner)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_t_peak: float = Field(
+        default=1.402,
+        ge=0.0,
+        le=1.5,
+        description=(
+            "GDT bell-curve peak height (V5_GDT_R00_00 winner). Hard-capped "
+            "at 1.5 — the family's ablation-located coherence cliff "
+            "(assessment §3.2: T_peak 1.50 -> 1.80 costs -0.065 DivJ, "
+            "-0.217 ConvJ)."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_mu: float = Field(
+        default=0.397,
+        description="GDT bell-curve center on normalized entropy (V5_GDT_R00_00 winner)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_sigma: float = Field(
+        default=0.283,
+        gt=0.0,
+        description="GDT bell-curve width on normalized entropy (V5_GDT_R00_00 winner)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_alpha: float = Field(
+        default=0.952,
+        description="GDT entropy-tapered varentropy boost gain (V5_GDT_R00_00 winner)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_lambda_vh: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="GDT varentropy soft-saturation scale: VH_norm = 1 - exp(-VH/lambda)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_min_p_base: float = Field(
+        default=0.01,
+        description="GDT min-p base term (applied at T = T_base, no boost)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    gdt_min_p_scale: float = Field(
+        default=0.081,
+        description=(
+            "GDT min-p coupling to excess temperature: "
+            "min_p = base + scale * max(0, T - T_base) / T_peak (V5_GDT_R00_00 winner)"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- DynaTemp Temperature Strategy (per-request overridable) ---
+    # llama.cpp-style entropy-linear dynamic temperature (V5 lineage).
+    # Defaults pinned to the balanced V5_DYNATEMP_R00_09 member
+    # (assessment §3.3). Dormant unless temperature_strategy = "dynatemp"
+    # is explicitly set. The hot + hard-truncation ABL_DYN_08 recipe
+    # (T_center=1.875, T_range=0.80, min_p=0.12) is in-bounds by design.
+
+    dynatemp_t_center: float = Field(
+        default=1.31,
+        description="DynaTemp center temperature at H_norm^exponent = 0.5 (V5_DYNATEMP_R00_09)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    dynatemp_t_range: float = Field(
+        default=0.38,
+        ge=0.0,
+        description=(
+            "DynaTemp half-range: T spans [center - range, center + range] "
+            "as H_norm^exponent goes 0 -> 1 (V5_DYNATEMP_R00_09)"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    dynatemp_exponent: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="DynaTemp entropy exponent (1.0 = linear mapping)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    dynatemp_min_p: float = Field(
+        default=0.026,
+        ge=0.0,
+        le=0.15,
+        description="DynaTemp constant min-p truncation threshold (V5_DYNATEMP_R00_09)",
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- BellTemp Temperature Strategy (per-request overridable) ---
+    # Bell-curve temperature on normalized entropy (V5 lineage; legacy
+    # BellTempProcessor defaults). Dormant unless temperature_strategy =
+    # "belltemp" is explicitly set.
+
+    belltemp_t_base: float = Field(
+        default=0.7,
+        description="BellTemp base temperature (legacy V5 default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_t_peak: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.5,
+        description=(
+            "BellTemp bell-curve peak height (legacy V5 default). Hard-capped "
+            "at 1.5 — shares GDT's ablation-located T_peak coherence cliff "
+            "(assessment §3.5)."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_mu: float = Field(
+        default=0.35,
+        description="BellTemp bell-curve center on normalized entropy",
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_sigma: float = Field(
+        default=0.15,
+        gt=0.0,
+        description="BellTemp bell-curve width on normalized entropy",
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_vh_weight: float = Field(
+        default=0.0,
+        description="BellTemp additive varentropy boost weight (0.0 disables)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_lambda_vh: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="BellTemp varentropy soft-saturation scale: VH_norm = 1 - exp(-VH/lambda)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_min_p_base: float = Field(
+        default=0.0,
+        description="BellTemp min-p base term (legacy V5 default: disabled)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    belltemp_min_p_scale: float = Field(
+        default=0.0,
+        description=(
+            "BellTemp adaptive min-p coupling to temperature: "
+            "min_p = base + scale * (T - 0.3) / (2.2 - 0.3), with the "
+            "fraction clipped to [0, 1] over the repo-wide temperature "
+            "guardrail box (legacy normalized over configurable T_min/T_max "
+            "knobs; this port pins the box). 0.0 disables the coupling."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- Mixture-of-Temperatures Strategy (per-request overridable) ---
+    # Convex mix of two temperature-sampled distributions with an
+    # (H, VH)-gated weight (V6 research spec §7.4 lineage; re-widened
+    # bounds per assessment §8.2 item 6 — T_hot may reach the guardrail
+    # ceiling jointly with a truncation floor). Dormant unless
+    # temperature_strategy = "mix_temperatures" is explicitly set.
+
+    mix_t_cool: float = Field(
+        default=0.7,
+        ge=0.3,
+        le=2.2,
+        description="Mixture cool-arm temperature (V6 §7.4 default)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    mix_t_hot: float = Field(
+        default=1.3,
+        ge=0.3,
+        le=2.2,
+        description=(
+            "Mixture hot-arm temperature (V6 §7.4 default). Re-widened to the "
+            "repo guardrail ceiling: pair values above ~1.7 with a hard "
+            "truncation floor (sharp-gate hot variant, assessment §9)"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    mix_gate_a: float = Field(
+        default=1.5,
+        description="Mixture gate entropy gain: alpha = sigmoid(a*(H-b) + c*(VH-d))",
+        json_schema_extra=_PER_REQUEST,
+    )
+    mix_gate_b: float = Field(
+        default=1.3,
+        description="Mixture gate entropy threshold (nats)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    mix_gate_c: float = Field(
+        default=0.8,
+        description="Mixture gate varentropy gain",
+        json_schema_extra=_PER_REQUEST,
+    )
+    mix_gate_d: float = Field(
+        default=1.2,
+        description="Mixture gate varentropy threshold (nats^2)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    mix_min_p: float = Field(
+        default=0.005,
+        ge=0.0,
+        le=0.15,
+        description="Mixture min-p truncation threshold applied to the mixed distribution",
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- Ring-Buffer-AR Temperature Strategy (per-request overridable) ---
+    # Anti-repetition gate over a ring buffer of recently emitted tokens
+    # (V6 research spec §7.6 lineage, replication-first port). Dormant
+    # unless temperature_strategy = "ring_buffer_ar" is explicitly set.
+
+    rba_buffer_n: int = Field(
+        default=32,
+        ge=1,
+        description="Ring-Buffer-AR buffer length (last N emitted tokens)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    rba_lam: float = Field(
+        default=2.5,
+        ge=0.0,
+        description="Ring-Buffer-AR penalty strength (logit units); 0.0 disables the gate",
+        json_schema_extra=_PER_REQUEST,
+    )
+    rba_threshold: float = Field(
+        default=0.65,
+        description=(
+            "Ring-Buffer-AR similarity threshold: penalty = "
+            "lam * max(0, sim - threshold) per candidate"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    rba_t: float = Field(
+        default=1.0,
+        description="Ring-Buffer-AR static sampling temperature",
+        json_schema_extra=_PER_REQUEST,
+    )
+    rba_min_p: float = Field(
+        default=0.005,
+        ge=0.0,
+        le=0.15,
+        description="Ring-Buffer-AR min-p truncation threshold",
+        json_schema_extra=_PER_REQUEST,
+    )
+
     # --- Coherence-Gate Temperature Strategy (per-request overridable) ---
     # Dormant unless temperature_strategy = "coherence_gate" is explicitly
     # set. The gate reads the coherence triple from the PREVIOUS
@@ -604,7 +849,14 @@ class QRSamplerConfig(BaseSettings):
         description=(
             "Default min-p truncation threshold used by the selector when the "
             "active temperature strategy does not emit a per-token min_p. "
-            "Default 0.0 disables min-p (preserves prior behavior; NFR-7)."
+            "Default 0.0 disables min-p (preserves prior behavior; NFR-7). "
+            "Interplay (documented for the v7 research program): a "
+            "strategy-emitted per-token min_p always wins — min_p_base is "
+            "then ignored entirely, never combined. Under qr_truncate_first "
+            "the winning threshold (emitted or this fallback) is applied to "
+            "the RAW (temperature-free) distribution, so min_p_base values "
+            "tuned for the default scale-then-truncate order are on a "
+            "different (raw) probability scale there."
         ),
         json_schema_extra=_PER_REQUEST,
     )

@@ -235,7 +235,15 @@ class TestResolveConfig:
             elif isinstance(default_val, int):
                 override_val = default_val + 1
             elif isinstance(default_val, float):
+                # +0.1 can cross a field's declared upper bound (e.g. the
+                # gdt_t_peak <= 1.5 coherence-cliff cap); fall back to -0.1.
                 override_val = default_val + 0.1
+                try:
+                    QRSamplerConfig.model_validate(
+                        {**default_config.model_dump(), field_name: override_val}
+                    )
+                except Exception:
+                    override_val = default_val - 0.1
             elif isinstance(default_val, str):
                 override_val = default_val + "_test"
             else:
@@ -467,6 +475,38 @@ class TestFieldSets:
                 "evdt_min_p_base",
                 "evdt_min_p_scale",
                 "evdt_min_p_vh",
+                "gdt_t_base",
+                "gdt_t_peak",
+                "gdt_mu",
+                "gdt_sigma",
+                "gdt_alpha",
+                "gdt_lambda_vh",
+                "gdt_min_p_base",
+                "gdt_min_p_scale",
+                "dynatemp_t_center",
+                "dynatemp_t_range",
+                "dynatemp_exponent",
+                "dynatemp_min_p",
+                "belltemp_t_base",
+                "belltemp_t_peak",
+                "belltemp_mu",
+                "belltemp_sigma",
+                "belltemp_vh_weight",
+                "belltemp_lambda_vh",
+                "belltemp_min_p_base",
+                "belltemp_min_p_scale",
+                "mix_t_cool",
+                "mix_t_hot",
+                "mix_gate_a",
+                "mix_gate_b",
+                "mix_gate_c",
+                "mix_gate_d",
+                "mix_min_p",
+                "rba_buffer_n",
+                "rba_lam",
+                "rba_threshold",
+                "rba_t",
+                "rba_min_p",
                 "truncate_first",
                 "bypass",
             }

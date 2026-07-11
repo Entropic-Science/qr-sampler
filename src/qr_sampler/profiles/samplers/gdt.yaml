@@ -1,0 +1,32 @@
+id: gdt
+name: "Gaussian Dynamic Temperature"
+description: |
+  Bell-curve temperature on normalized entropy with an entropy-tapered
+  varentropy boost. Ported from createmp-evalsuite V5 (v4v6 assessment
+  §3.2).
+
+  Formula:
+    H_norm   = clip(H / ln(V), 0, 1)
+    VH_norm  = 1 - exp(-VH / lambda_vh)
+    bell     = t_peak * exp(-(H_norm - mu)^2 / (2 * sigma^2))
+    vh_boost = alpha * VH_norm * (1 - H_norm)
+    T_t      = clip(t_base + bell + vh_boost, 0.3, 2.2)
+    min_p_t  = clip(min_p_base + min_p_scale * max(0, T - t_base) / t_peak,
+                    0, 0.15)
+
+  t_peak is hard-capped at 1.5 (the ablation-located family coherence
+  cliff). Defaults are the V5_GDT_R00_00 winning configuration.
+
+  Static clone (plumbing checks): qr_gdt_t_peak=0 + qr_gdt_alpha=0
+  reduces exactly to fixed T = t_base with constant min_p = min_p_base.
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "gdt",
+      "qr_gdt_t_peak": 1.2
+    }
+
+sampler_class: "qr_sampler.temperature.gdt:GDTStrategy"
+performance_impact: none
+build_time_locked: false
+requires_vocab_size: true

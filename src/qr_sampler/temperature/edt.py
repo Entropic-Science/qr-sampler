@@ -3,6 +3,16 @@
 Dynamically adjusts sampling temperature based on the Shannon entropy
 of the logit distribution. Low-entropy (peaked) distributions get lower
 temperature, while high-entropy (flat) distributions get higher temperature.
+
+min-p pairing (verified for the v7 research program): EDT emits **no**
+per-token ``min_p`` diagnostic, so the pipeline falls back to the
+selector-level ``min_p_base`` (``qr_min_p_base`` per request, default 0.0
+= no truncation). The EDT+min_p family from createmp-evalsuite V5 is
+therefore expressed as ``qr_temperature_strategy: edt`` paired with an
+explicit ``qr_min_p_base`` — a *constant* nominal min-p applied after the
+per-token temperature, which on the default selector order means the
+effective raw-probability threshold varies with T_t (see the raw-scale
+truncation notes in the v7 program).
 """
 
 from __future__ import annotations

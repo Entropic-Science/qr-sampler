@@ -114,13 +114,12 @@ class TestHVHDriftFormulas:
 
         strategy.compute_temperature(logits_a, config)
         h_b, vh_b = _entropy_varentropy(logits_b)
-        # After step a, EMAs hold h_a / vh_a.
-        lam = config.hvh_lambda_ema
+        # v7 semantics (assessment §7.4): drift is measured against the
+        # PREVIOUS EMA — which after step a holds exactly h_a / vh_a — so
+        # dH is independent of hvh_lambda_ema at fixed history.
         h_a, vh_a = _entropy_varentropy(logits_a)
-        h_ema_post = (1.0 - lam) * h_a + lam * h_b
-        vh_ema_post = (1.0 - lam) * vh_a + lam * vh_b
-        d_h = h_b - h_ema_post
-        d_vh = vh_b - vh_ema_post
+        d_h = h_b - h_a
+        d_vh = vh_b - vh_a
 
         expected_raw = (
             config.hvh_t_base
@@ -132,6 +131,24 @@ class TestHVHDriftFormulas:
         expected_temp = float(np.clip(expected_raw, *_TEMP_CLAMP))
         result = strategy.compute_temperature(logits_b, config)
         assert abs(result.temperature - expected_temp) < 1e-8
+
+    def test_drift_is_independent_of_lambda_at_fixed_history(self) -> None:
+        """v7 decoupling pin (assessment §7.4).
+
+        With drift measured against the previous EMA, the second-token
+        drift equals ``h_b - h_a`` regardless of ``hvh_lambda_ema`` —
+        the knob no longer scales the drift signal by ``(1 - lambda)``.
+        """
+        logits_a = np.array([5.0, 0.0, 0.0, 0.0, 0.0])
+        logits_b = np.zeros(5)
+        drifts = []
+        for lam in (0.01, 0.02, 0.5, 0.99):
+            config = QRSamplerConfig(hvh_lambda_ema=lam, _env_file=None)  # type: ignore[call-arg]
+            strategy = HVHDriftStrategy(vocab_size=10)
+            strategy.compute_temperature(logits_a, config)
+            result = strategy.compute_temperature(logits_b, config)
+            drifts.append(result.diagnostics["d_h"])
+        assert all(d == pytest.approx(drifts[0]) for d in drifts)
 
 
 class TestHVHDriftClamping:
