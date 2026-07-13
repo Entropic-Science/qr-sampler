@@ -93,20 +93,31 @@ device.)
 `dragonfly-1` never serves a byte: it appears only in `coherence.pair` and is read
 solely by the background coherence monitor.
 
-## Serialized generation & fairness — `--max-num-seqs 1`
+## Running-batch size — `--max-num-seqs` (`$SHARED_MAX_NUM_SEQS`, default 4)
 
-`qr-sampler-vllm.service` sets **`--max-num-seqs 1`**, making vLLM's running batch
-exactly one sequence. Concurrent requests wait in vLLM's FCFS (arrival-order)
-queue and are admitted one at a time:
+`qr-sampler-vllm.service` sizes vLLM's running batch from `$SHARED_MAX_NUM_SEQS`
+(profile `.env`, **default 4** for quantum serving). Concurrency here is bounded
+by the *entropy*, not the GPUs: every generated token draws once from the single
+quantum draw card (`dragonfly-0`), so a handful of concurrent sequences is the
+sweet spot — they overlap prefill/compute while their per-token device reads
+serialize on the card's lock.
 
-- **Serialization:** one output sequence completes before the next begins, so
-  token entropy draws never interleave across sequences (on top of the
-  device-level guarantee above).
-- **Fairness / no starvation:** qthought's always-on loop awaits each of its own
-  turns before issuing the next, so it never holds more than one queued request.
-  An owui or external request therefore waits at most one in-flight sequence
-  before it runs. Neither side can lock the other out. The throughput cost is
-  explicitly accepted for this low-concurrency box.
+- **Correctness at >1:** the per-draw freshness flush is preserved and
+  independent draws never corrupt across sequences (on top of the device-level
+  guarantee above). Daemon-side draw failover is **disabled**
+  (`server.failover_enabled=false`), so a momentarily busy `dragonfly-0` makes a
+  draw *wait* for the card rather than mis-route to the coherence-only
+  `dragonfly-1` (which has no draw fingerprint). This is why >1 became safe — a
+  hard-pinned `1` was previously used to sidestep that mis-routing.
+- **Fairness:** qthought's always-on loop awaits each of its own turns before
+  issuing the next, so an owui or external request waits at most a few in-flight
+  sequences before it runs. Neither side locks the other out.
+- **PRNG "bypass" mode:** raise `SHARED_MAX_NUM_SEQS` to a large value (e.g. 16)
+  **only** when running this engine on a system/PRNG entropy source (no quantum
+  draws) — e.g. for PRNG LLM research alongside the quantum services. With no
+  draw card to contend for, a big running batch is pure throughput. Do **not**
+  run 16 against the quantum draw card: the extra sequences just queue on the
+  card lock and add latency.
 
 ## `QR_PREINIT_ENTROPY_SOURCES`
 

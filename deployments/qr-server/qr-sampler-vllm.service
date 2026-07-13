@@ -23,7 +23,7 @@
 #   sudo nano /etc/qr-server/qr-server.env   # fill CHANGEME_ values
 #   sudo systemctl daemon-reload && sudo systemctl enable --now qr-sampler-vllm
 [Unit]
-Description=qr-sampler shared vLLM (OpenAI API @127.0.0.1:8000, PP=4, serialized)
+Description=qr-sampler shared vLLM (OpenAI API @127.0.0.1:8000, PP=4)
 Documentation=https://github.com/Entropic-Science/qr-sampler
 After=network-online.target
 Wants=network-online.target
@@ -44,13 +44,23 @@ EnvironmentFile=/etc/qr-server/qr-server.env
 # would all-reduce across PCIe every layer and choke; PP crosses the bus only a
 # handful of times per forward pass.
 #
-# --max-num-seqs 1 is LOAD-BEARING (spec §3.2 / AC-7): the running batch is
-# exactly one sequence, so concurrent requests wait in vLLM's FCFS (arrival-order)
-# queue and are admitted one at a time. This gives (a) serialization — one output
-# sequence completes before the next begins, so token entropy draws never
-# interleave across sequences; and (b) fairness — an interactive owui/API request
-# waits at most one in-flight sequence behind qthought's always-on loop. The
-# throughput cost is explicitly accepted for this low-concurrency box.
+# --max-num-seqs is env-driven via ${SHARED_MAX_NUM_SEQS} (set in the profile
+# .env; default 4). For QUANTUM serving keep it SMALL: every generated token
+# draws once from the SINGLE quantum draw card (dragonfly-0) over the co-located
+# qbert0g daemon, so useful concurrency is bounded by that one card. A few
+# concurrent sequences (4) overlap prefill/compute while their per-token device
+# reads still serialize on the card's lock — the per-draw freshness flush is
+# preserved and independent draws never corrupt across sequences (on top of the
+# device-level guarantee). Since draw failover is disabled at the daemon
+# (server.failover_enabled=false — dragonfly-1 is coherence-only), a momentarily
+# busy card makes a draw WAIT for the card, never mis-route; so >1 is safe.
+#
+# The large setting (e.g. 16) is the PRNG-research "bypass" value: when this
+# engine is run with a system/PRNG entropy source instead of quantum draws there
+# is no draw card to contend for, so a big running batch is pure throughput. Do
+# NOT run 16 against the quantum draw card — the extra sequences just queue on
+# the card lock and add latency. (Was a hard-pinned 1 pre-2026-07; relaxed once
+# daemon-side draw failover was disabled.)
 #
 # --enable-auto-tool-choice + qwen3_xml parser back qthought's propose_speech
 # REFLECT tool call. They are HARMLESS to owui's plain-text lane, so the single
@@ -71,7 +81,7 @@ ExecStart=/usr/bin/env vllm serve ${SHARED_MODEL_PATH} \
     --pipeline-parallel-size 4 --tensor-parallel-size 1 \
     --served-model-name ${SHARED_MODEL_NAME} \
     --host 127.0.0.1 --port 8000 \
-    --max-num-seqs 1 \
+    --max-num-seqs ${SHARED_MAX_NUM_SEQS} \
     --middleware qr_sampler.engines.vllm.health.entropy_health_middleware \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --max-model-len 8192 --gpu-memory-utilization 0.85

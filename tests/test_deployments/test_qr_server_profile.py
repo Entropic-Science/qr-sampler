@@ -58,10 +58,18 @@ class TestSystemdUnitsParse:
             )
             assert "ExecStart=" in text, f"{unit} has no ExecStart"
 
-    def test_vllm_unit_serializes_generation(self) -> None:
-        """--max-num-seqs 1 is the fairness/serialization guarantee (AC-7)."""
+    def test_vllm_unit_running_batch_is_env_driven(self) -> None:
+        """--max-num-seqs is env-driven via $SHARED_MAX_NUM_SEQS (2026-07).
+
+        Was a hard-pinned ``--max-num-seqs 1`` for the fairness/serialization
+        guarantee (AC-7); relaxed once daemon-side draw failover was disabled
+        so a busy draw card waits instead of mis-routing. The value comes
+        from the profile ``.env`` (default 4 for quantum serving; 16 is the
+        PRNG-research bypass setting) so it must NOT be a hard-coded literal.
+        """
         text = (_PROFILE / "qr-sampler-vllm.service").read_text(encoding="utf-8")
-        assert "--max-num-seqs 1" in text
+        assert "--max-num-seqs ${SHARED_MAX_NUM_SEQS}" in text
+        assert "--max-num-seqs 1" not in text, "must not hard-pin the running batch"
         # Loopback-only OpenAI endpoint on the shared port.
         assert "--host 127.0.0.1 --port 8000" in text
         # qthought's propose_speech tool call needs the xml parser; harmless to owui.
@@ -115,6 +123,18 @@ class TestSharedEntropyConfig:
         pair = cfg["coherence"]["pair"]
         assert "dragonfly-1" in pair
         assert "dragonfly-1" not in cfg["integration"]["sources"]
+
+    def test_draw_failover_disabled(self) -> None:
+        # Single drawable card: daemon-side device failover must be OFF so a
+        # busy dragonfly-0 makes a draw WAIT for the card rather than
+        # mis-routing it to the coherence-only dragonfly-1 (which has no draw
+        # fingerprint → the FAILED_PRECONDITION storm / silent PRNG degrade
+        # that slowed the box to a crawl, 2026-07). Pairs with the env-driven
+        # --max-num-seqs relaxation in qr-sampler-vllm.service.
+        cfg = self._config()
+        assert cfg["server"]["failover_enabled"] is False, (
+            "draws must never fail over to the coherence-only card"
+        )
 
     def test_freshness_and_non_reuse_pins(self) -> None:
         cfg = self._config()
