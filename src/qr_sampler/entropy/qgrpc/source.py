@@ -81,6 +81,50 @@ def _is_quota_exhausted(exc: BaseException | None) -> bool:
     return False
 
 
+# gRPC status codes that mean the SERVER received the request and refused it
+# (so the channel/transport is healthy) — as opposed to transport failures
+# (UNAVAILABLE / DEADLINE_EXCEEDED / …) where the channel may be stale.
+_SERVER_SIDE_REJECTION_CODES: frozenset[str] = frozenset(
+    {
+        "FAILED_PRECONDITION",
+        "INVALID_ARGUMENT",
+        "NOT_FOUND",
+        "PERMISSION_DENIED",
+        "UNAUTHENTICATED",
+        "OUT_OF_RANGE",
+        "ALREADY_EXISTS",
+    }
+)
+
+
+def _status_code_name(exc: BaseException | None) -> str | None:
+    """Return the gRPC status-code name from *exc* or its cause chain, if any.
+
+    Same string-compare-not-import discipline as :func:`_is_quota_exhausted`
+    (the module must import without grpcio). Walks ``__cause__`` so a wrapped
+    ``AioRpcError`` still classifies.
+    """
+    seen = 0
+    while exc is not None and seen < 8:  # bounded vs cause cycles
+        code = getattr(exc, "code", None)
+        if callable(code):
+            try:
+                name = getattr(code(), "name", "")
+                if name:
+                    return str(name)
+            except Exception:  # classification is best-effort
+                pass
+        exc = exc.__cause__
+        seen += 1
+    return None
+
+
+def _is_server_side_rejection(exc: BaseException | None) -> bool:
+    """True when *exc* is a gRPC status the SERVER raised to refuse a valid
+    request (channel healthy) — never a transport/stale-channel failure."""
+    return _status_code_name(exc) in _SERVER_SIDE_REJECTION_CODES
+
+
 class PrefetchTicket:
     """Handle for an in-flight pipelined entropy fetch.
 
@@ -400,10 +444,26 @@ class QuantumGrpcSource(EntropySource):
         # commonly because the tunnel/backend restarted underneath us.
         # Reset the channel so the next call re-initialises cleanly.
         # Best-effort: errors during teardown are swallowed.
-        try:
-            self._reset_channel()
-        except Exception as reset_exc:
-            logger.warning("channel reset after retry-exhaust failed: %s", reset_exc)
+        #
+        # 2026-07: EXCEPT when the failure is a server-side rejection
+        # (FAILED_PRECONDITION / INVALID_ARGUMENT / …). Those mean the
+        # request reached the server and was refused, so the channel is
+        # healthy — tearing it down and rebuilding it (a fresh thread +
+        # loop + connect on the NEXT call) is pure per-token latency that
+        # fixes nothing. A mis-routed draw to a non-drawable source,
+        # rejected FAILED_PRECONDITION on every token, paid exactly this
+        # rebuild tax; classify it and skip the reset.
+        if _is_server_side_rejection(last_error):
+            logger.debug(
+                "gRPC %s refused server-side (%s); channel healthy, not resetting",
+                what,
+                _status_code_name(last_error),
+            )
+        else:
+            try:
+                self._reset_channel()
+            except Exception as reset_exc:
+                logger.warning("channel reset after retry-exhaust failed: %s", reset_exc)
 
         raise EntropyUnavailableError(
             f"gRPC {what} failed after {1 + self._retry_count} attempts: {last_error}"

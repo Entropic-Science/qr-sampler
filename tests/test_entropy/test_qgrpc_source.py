@@ -667,3 +667,61 @@ class TestQuotaExhaustedClassification:
         source.close()
         events = [r.__dict__.get("event") for r in caplog.records]
         assert "qrng.sample_count_exceeds_request_cap" not in events
+
+
+class TestServerRejectionChannelReset:
+    """2026-07: a server-side rejection (FAILED_PRECONDITION etc.) leaves the
+    channel healthy, so the per-token teardown/rebuild is skipped; a transport
+    failure still resets the (likely stale) channel."""
+
+    def test_classifier_direct_and_cause_chain(self) -> None:
+        from qr_sampler.entropy.qgrpc.source import _is_server_side_rejection
+
+        assert _is_server_side_rejection(FakeRpcError("FAILED_PRECONDITION")) is True
+        assert _is_server_side_rejection(FakeRpcError("INVALID_ARGUMENT")) is True
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = FakeRpcError("FAILED_PRECONDITION")
+        assert _is_server_side_rejection(wrapper) is True
+        # transport-level + non-gRPC errors are NOT server rejections
+        assert _is_server_side_rejection(FakeRpcError("UNAVAILABLE")) is False
+        assert _is_server_side_rejection(FakeRpcError("DEADLINE_EXCEEDED")) is False
+        assert _is_server_side_rejection(RuntimeError("no code attr")) is False
+        assert _is_server_side_rejection(None) is False
+
+    def _source_failing_with(self, exc: Exception) -> Any:
+        handle = AsyncMock(side_effect=exc)
+        return make_mocked_source(unary_handle=handle, grpc_mode="unary", grpc_retry_count=0)[0]
+
+    def test_server_rejection_does_not_reset_channel(self) -> None:
+        exc = FakeRpcError("FAILED_PRECONDITION")
+        source = self._source_failing_with(exc)
+        resets: list[int] = []
+        source._reset_channel = lambda: resets.append(1)
+
+        def _raise(n: int) -> bytes:
+            raise exc
+
+        source._fetch_sync = _raise
+        try:
+            with pytest.raises(EntropyUnavailableError):
+                source.get_random_bytes(10)
+            assert resets == [], "a healthy-channel server rejection must not rebuild the channel"
+        finally:
+            source.close()
+
+    def test_transport_failure_still_resets_channel(self) -> None:
+        exc = FakeRpcError("UNAVAILABLE")
+        source = self._source_failing_with(exc)
+        resets: list[int] = []
+        source._reset_channel = lambda: resets.append(1)
+
+        def _raise(n: int) -> bytes:
+            raise exc
+
+        source._fetch_sync = _raise
+        try:
+            with pytest.raises(EntropyUnavailableError):
+                source.get_random_bytes(10)
+            assert resets == [1], "a transport failure should still reset the likely-stale channel"
+        finally:
+            source.close()
