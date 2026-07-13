@@ -4,8 +4,9 @@ Covers the four layers the draw branch spans:
 
 - ``EntropySource`` base defaults (``supports_server_draw`` /
   ``get_draw`` raises / ``prefetch_draw`` returns ``None``).
-- ``FallbackEntropySource``: draws delegate to the PRIMARY only and
-  failures raise upward (no byte-failover bookkeeping).
+- ``FallbackEntropySource``: draws delegate to the PRIMARY only; a
+  failure records draw-path degradation (visible to /health/entropy)
+  then raises upward for the pipeline to serve a labelled PRNG token.
 - ``ServerDrawAmplifier``: registry name ``"server"``, marker flag, and
   the deliberately dead local ``amplify()``.
 - ``SamplingPipeline.sample_token``: server ``u`` consumed verbatim
@@ -187,12 +188,55 @@ class TestFallbackDrawDelegation:
         assert meta is primary.meta
         assert primary.draw_calls == [(1024, "qrng-a", None)]
 
-    def test_draw_failure_raises_upward_without_failover_bookkeeping(self) -> None:
+    def test_draw_failure_records_degradation_and_reraises(self) -> None:
         wrapper = FallbackEntropySource(DrawlessSource(), SystemEntropySource())
         with pytest.raises(EntropyUnavailableError):
             wrapper.get_draw(0, "")
-        # Failover bookkeeping means "who provided BYTES" — untouched.
-        assert wrapper.fallback_count == 0
+        # 2026-07: a failed server-integrated draw is no longer invisible.
+        # It records draw-path degradation — so /health/entropy, owui's
+        # no-silent-PRNG banner, and qthought's entropy badge reflect the
+        # PRNG fallback — while still raising for the pipeline to serve a
+        # labelled PRNG token.
+        assert wrapper.fallback_count == 1
+        assert wrapper.currently_degraded is True
+
+    def test_raw_byte_success_does_not_mask_draw_degradation(self) -> None:
+        # The exact 2026-07 bug: a failed draw fell back to a raw-byte
+        # fetch that SUCCEEDED (raw bytes need no draw fingerprint), and
+        # that success marked the source "recovered", hiding a multi-day
+        # draw outage from /health/entropy. The draw-degraded state must
+        # survive a healthy raw-byte fetch on the same source.
+        primary = DrawlessSource()  # draw raises; get_random_bytes succeeds
+        wrapper = FallbackEntropySource(primary, SystemEntropySource())
+        with pytest.raises(EntropyUnavailableError):
+            wrapper.get_draw(0, "")
+        assert wrapper.currently_degraded is True
+        # Pipeline's degradation path fetches raw bytes for the PRNG token.
+        wrapper.get_random_bytes(16)
+        assert primary.byte_calls == [16], "raw fetch should hit the healthy primary"
+        assert wrapper.currently_degraded is True, "raw success must not mask draw outage"
+
+    def test_successful_draw_clears_draw_degradation(self) -> None:
+        class _FlakyDraw(FakeDrawSource):
+            def __init__(self) -> None:
+                super().__init__(u=0.42)
+                self._fail_next = True
+
+            def get_draw(
+                self, block_bytes: int, source_id: str, ticket: Any | None = None
+            ) -> tuple[float, DrawMeta]:
+                if self._fail_next:
+                    self._fail_next = False
+                    raise EntropyUnavailableError("transient")
+                return super().get_draw(block_bytes, source_id, ticket)
+
+        wrapper = FallbackEntropySource(_FlakyDraw(), SystemEntropySource())
+        with pytest.raises(EntropyUnavailableError):
+            wrapper.get_draw(1024, "qrng-a")
+        assert wrapper.currently_degraded is True
+        # A subsequent successful draw flips the draw path healthy again.
+        u, _meta = wrapper.get_draw(1024, "qrng-a")
+        assert u == 0.42
         assert wrapper.currently_degraded is False
 
     def test_prefetch_draw_delegates_and_never_raises(self) -> None:

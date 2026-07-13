@@ -99,6 +99,16 @@ class FallbackEntropySource(EntropySource):
         self._fallback_count: int = 0
         self._last_alert_monotonic: float = 0.0
         self._currently_degraded: bool = False
+        # Draw-path degradation, tracked SEPARATELY from the raw-byte
+        # ``_currently_degraded`` above. A failed server-integrated draw
+        # (``get_draw``) becomes a labelled PRNG token in the sampling
+        # pipeline via a ``get_random_bytes`` fallback — and on the common
+        # case where raw bytes still succeed, that fallback would otherwise
+        # mark the source "recovered" and HIDE the draw outage from
+        # /health/entropy (the multi-day-invisible-degrade bug, 2026-07).
+        # A distinct flag, cleared only by a SUCCESSFUL draw, keeps a
+        # degraded draw path visible to the status file's readers.
+        self._draw_degraded: bool = False
         # iter-53: cross-process status channel for /health/entropy (see
         # ``status_file`` module docstring). OPT-IN via
         # ``enable_status_publishing()`` because the vLLM adapter builds
@@ -144,12 +154,13 @@ class FallbackEntropySource(EntropySource):
 
     @property
     def currently_degraded(self) -> bool:
-        """True while the most recent fetch came from the fallback source.
+        """True while EITHER the raw-byte path or the server-integrated
+        draw path is currently falling back off the quantum primary.
 
-        Flips back to False on the first successful primary fetch (the
-        ``entropy.recovered`` transition).
+        Each path flips back to False on its own first successful primary
+        fetch (the ``entropy.recovered`` transition).
         """
-        return self._currently_degraded
+        return self._currently_degraded or self._draw_degraded
 
     def get_random_bytes(self, n: int) -> bytes:
         """Fetch bytes from the primary source, falling back if unavailable.
@@ -196,17 +207,64 @@ class FallbackEntropySource(EntropySource):
     def get_draw(
         self, block_bytes: int, source_id: str, ticket: Any | None = None
     ) -> tuple[float, DrawMeta]:
-        """Delegate a server-integrated draw to the PRIMARY only.
+        """Delegate a server-integrated draw to the PRIMARY, recording
+        draw-path degradation for the cross-process status file.
 
         Local fallback sources cannot draw — there is no server to
-        integrate for them — so a primary draw failure raises
-        ``EntropyUnavailableError`` upward instead of engaging the
-        fallback. Degradation (fallback bytes + a local amplifier) is the
-        sampling pipeline's job; keeping it there leaves this wrapper's
-        failover bookkeeping (``fallback_count``, ``last_source_used``)
-        meaning exactly "who provided BYTES".
+        integrate for them — so a primary draw failure still raises
+        ``EntropyUnavailableError`` upward; the sampling pipeline turns
+        that into a labelled PRNG token via ``get_random_bytes``. But we
+        FIRST record the outage here: bump ``fallback_count`` and set the
+        draw-degraded flag, then publish, so /health/entropy (hence owui's
+        no-silent-PRNG banner and qthought's entropy badge) reflect that
+        draws fell back. The pipeline's subsequent raw-byte fetch no longer
+        masks it — that clears only the raw ``_currently_degraded``, never
+        ``_draw_degraded``, which is cleared solely by a successful draw.
         """
-        return self._primary.get_draw(block_bytes, source_id, ticket)
+        try:
+            result = self._primary.get_draw(block_bytes, source_id, ticket)
+        except EntropyUnavailableError as exc:
+            self._fallback_count += 1
+            first_fallback = not self._draw_degraded
+            self._draw_degraded = True
+            # Emit ONE degraded warning at the onset of a draw outage (not
+            # per-token — a sustained outage fires one fallback per token).
+            # We deliberately do NOT call ``_log_degraded`` here: that helper
+            # owns the RAW-byte ``_currently_degraded`` flag, which the draw
+            # path must not touch (they recover independently).
+            if first_fallback:
+                logger.warning(
+                    "entropy.degraded: server-integrated draws from %r are "
+                    "unavailable (err=%r); token sampling falls back to a "
+                    "labelled PRNG draw until quantum draws recover",
+                    self._primary.name,
+                    str(exc),
+                    extra={
+                        "event": "entropy.degraded",
+                        "primary": self._primary.name,
+                        "fallback": self._fallback.name,
+                        "total_fallbacks": self._fallback_count,
+                        "path": "draw",
+                    },
+                )
+            self._write_status(force=first_fallback)
+            raise
+        if self._draw_degraded:
+            logger.warning(
+                "entropy.recovered: server-integrated draws from %r are "
+                "healthy again after %d fallback(s); resuming quantum draws",
+                self._primary.name,
+                self._fallback_count,
+                extra={
+                    "event": "entropy.recovered",
+                    "primary": self._primary.name,
+                    "fallback": self._fallback.name,
+                    "total_fallbacks": self._fallback_count,
+                },
+            )
+            self._draw_degraded = False
+            self._write_status(force=True)
+        return result
 
     def prefetch_draw(
         self, block_bytes: int, source_id: str, nonce: int | None = None
@@ -352,7 +410,7 @@ class FallbackEntropySource(EntropySource):
                 "fallback_name": self._fallback.name,
                 "last_source_used": self._last_source_used,
                 "fallback_count": self._fallback_count,
-                "currently_degraded": self._currently_degraded,
+                "currently_degraded": self._currently_degraded or self._draw_degraded,
             }
         )
 

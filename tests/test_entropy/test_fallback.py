@@ -269,6 +269,40 @@ class TestStatusPublishing:
         assert data["fallback_count"] == 1
         assert data["last_source_used"] == primary.name
 
+    def test_draw_failure_writes_degraded_state(self, status_path) -> None:
+        # 2026-07 blind-spot fix: a failed server-integrated draw must
+        # publish degraded state to the status file /health/entropy reads,
+        # even though the primary's RAW bytes still work (get_draw raises
+        # via the base default; get_random_bytes succeeds).
+        primary = _FixedBytesSource(0xAA)
+        source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
+        source.enable_status_publishing()
+
+        with pytest.raises(EntropyUnavailableError):
+            source.get_draw(1024, "qrng-a")
+
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["currently_degraded"] is True
+        assert data["fallback_count"] == 1
+
+    def test_raw_success_after_draw_failure_keeps_status_degraded(self, status_path) -> None:
+        # Regression for the exact multi-day-invisible-degrade bug: the raw
+        # byte fetch that serves the pipeline's PRNG token succeeds on the
+        # same primary and must NOT flip the status file back to healthy
+        # while draws are still failing.
+        primary = _FixedBytesSource(0xAA)
+        source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
+        source.enable_status_publishing()
+
+        with pytest.raises(EntropyUnavailableError):
+            source.get_draw(1024, "qrng-a")
+        source.get_random_bytes(4)  # pipeline's PRNG-token byte fetch (succeeds)
+
+        data = status_file.read_entropy_status()
+        assert data is not None
+        assert data["currently_degraded"] is True
+
     def test_mid_outage_refresh_is_throttled(self, status_path) -> None:
         primary = _AlwaysFailSource()
         source = FallbackEntropySource(primary, _FixedBytesSource(0xBB))
