@@ -56,6 +56,10 @@ dev = [
     "types-PyYAML>=6.0",
     "click>=8.0",
     "jinja2>=3.1",
+    # Not a runtime dependency (the vLLM host provides it — see
+    # engines/vllm/health.py's deferred import), but needed here so mypy can
+    # resolve it under --strict and the middleware tests can exercise it.
+    "starlette>=0.37",
 ]
 cli = [
     "click>=8.0",
