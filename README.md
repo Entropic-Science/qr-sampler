@@ -37,28 +37,28 @@ This is a research tool. It makes no claims beyond statistics — it provides th
   ┌──────────────────────────────────────────────────────┐
   │                                                      │
   │  ┌─────────────────────────────────────────────┐     │
-  │  │           core/ (engine-agnostic)            │     │
+  │  │           core/ (engine-agnostic)           │     │
   │  │  SamplingPipeline: numpy-only, no torch     │     │
-  │  │                                              │     │
-  │  │  entropy/ ──► amplification/ ──► selection/  │     │
-  │  │      │            │                  │       │     │
+  │  │                                             │     │
+  │  │  entropy/ ──► amplification/ ──► selection/ │     │
+  │  │      │            │                  │      │     │
   │  │  get_random   amplify(bytes)    CDF search  │     │
-  │  │  _bytes(n)    → u ∈ (0,1)      → token_id  │     │
-  │  │                                              │     │
-  │  │  temperature/ ─── compute_temperature()      │     │
-  │  │  logging/ ─────── per-token diagnostics      │     │
+  │  │  _bytes(n)    → u ∈ (0,1)      → token_id   │     │
+  │  │                                             │     │
+  │  │  temperature/ ─── compute_temperature()     │     │
+  │  │  logging/ ─────── per-token diagnostics     │     │
   │  └──────────────────────┬──────────────────────┘     │
   │                         │                            │
   │  ┌──────────────────────┴──────────────────────┐     │
-  │  │         engines/ (thin adapters)             │     │
+  │  │         engines/ (thin adapters)            │     │
   │  │  VLLMAdapter: torch ↔ numpy, one-hot force  │     │
   │  └──────────────────────┬──────────────────────┘     │
   │                         │                            │
   │  qthought.py ── QthoughtRoller: the same entropy     │
-  │                 stack driving discrete choices        │
-  │                 (consumed by qr-llm-qthought)         │
-  │  contract.py ── the only import surface for           │
-  │                 downstream repos                      │
+  │                 stack driving discrete choices       │
+  │                 (consumed by qr-llm-qthought)        │
+  │  contract.py ── the only import surface for          │
+  │                 downstream repos                     │
   │                                                      │
   │  profiles/ ─── declarative YAML metadata             │
   │  cli/ ──────── validate, build, list, info           │
