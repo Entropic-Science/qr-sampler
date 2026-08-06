@@ -1,0 +1,30 @@
+id: edt_paper
+name: "EDT (paper form, arXiv:2403.14541)"
+description: |
+  Faithful port of the published EDT formula (Zhang et al. 2024):
+
+    T = t0 * n ^ (theta / H)        # H = raw Shannon entropy (nats)
+
+  Temperature rises with entropy toward the t0 ceiling; confident
+  (low-entropy) tokens sample near-greedy. Defaults are the paper's
+  recommended starting hyperparameters (T0=0.6, theta=0.1, N=0.8).
+
+  Port notes: T is hard-clamped AFTER the formula to the repo guardrail
+  box [0.3, 2.2] (the paper lets T -> 0); no per-token min_p is emitted —
+  the selector-level min_p_base applies (default 0.0 = none, the
+  paper-faithful pairing).
+
+  Static clone (plumbing checks): qr_edtp_theta=0 reduces exactly to
+  fixed T = t0 on every token (N^0 = 1).
+
+  Per-request override:
+    "extra_args": {
+      "qr_temperature_strategy": "edt_paper",
+      "qr_edtp_t0": 0.6,
+      "qr_edtp_theta": 0.1
+    }
+
+sampler_class: "qr_sampler.temperature.edt_paper:EDTPaperStrategy"
+performance_impact: none
+build_time_locked: false
+requires_vocab_size: false

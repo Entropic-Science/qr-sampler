@@ -429,6 +429,40 @@ class QRSamplerConfig(BaseSettings):
         json_schema_extra=_PER_REQUEST,
     )
 
+    # --- EDT paper form (per-request overridable) ---
+    # Faithful arXiv:2403.14541 formula T = T0 * N^(theta/H) — a different
+    # function family from the createmp-lineage `edt` above (normalized-
+    # entropy power law); the two are not inter-expressible. Defaults are
+    # the paper's recommended starting set (T0=0.6, theta=0.1, N=0.8).
+    # Dormant unless temperature_strategy = "edt_paper" is explicitly set.
+
+    edtp_t0: float = Field(
+        default=0.6,
+        gt=0.0,
+        le=2.2,
+        description=(
+            "EDT-paper T0: the temperature ceiling approached as entropy "
+            "rises (paper baseline 0.6; capped at the repo guardrail box)"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    edtp_theta: float = Field(
+        default=0.1,
+        ge=0.0,
+        description=(
+            "EDT-paper theta: variation scale in the exponent theta/H "
+            "(paper baseline 0.1; 0 = static clone at T0 exactly)"
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    edtp_n: float = Field(
+        default=0.8,
+        gt=0.0,
+        lt=1.0,
+        description="EDT-paper N: base of the exponential, 0 < N < 1 (paper fixes 0.8)",
+        json_schema_extra=_PER_REQUEST,
+    )
+
     # --- HVH-Drift Temperature Strategy (per-request overridable) ---
     # Defaults pinned to V6_HVD_R01_01 winning configuration from
     # createmp-evalsuite (results/v6/round_final). Dormant unless

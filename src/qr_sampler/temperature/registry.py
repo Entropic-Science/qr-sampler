@@ -32,6 +32,7 @@ class TemperatureStrategyRegistry:
     _BUILTINS: ClassVar[dict[str, str]] = {
         "fixed": "qr_sampler.temperature.fixed:FixedTemperatureStrategy",
         "edt": "qr_sampler.temperature.edt:EDTTemperatureStrategy",
+        "edt_paper": "qr_sampler.temperature.edt_paper:EDTPaperStrategy",
         "hvh_drift": "qr_sampler.temperature.hvh_drift:HVHDriftStrategy",
         "coherence_gate": "qr_sampler.temperature.coherence_gate:CoherenceGateStrategy",
         "tt_exchange": "qr_sampler.temperature.tt_exchange:TTExchangeStrategy",
