@@ -71,6 +71,20 @@ EnvironmentFile=/etc/qr-server/qr-server.env
 # No --quantization flag — the checkpoint ships pre-quantized and vLLM
 # auto-detects the scheme from the config; forcing one is repo-vs-box drift.
 #
+# --scheduling-policy priority (2026-08-08) lets an interactive request jump a
+# batch backlog. The engine is shared by owui's human chat lane and batch
+# research clients; under the default FCFS a research script that parks 9+
+# requests in the queue starves a chat send behind it (observed: prompt admitted
+# at Running=4/Waiting=9, no first token for minutes — the user saw an empty
+# stream). Lower priority value = scheduled earlier, ties broken by arrival.
+#
+# This flag alone changes NOTHING: every request defaults to priority 0, and
+# priority scheduling with a uniform priority IS first-come-first-served. It
+# only takes effect once a client sends a non-zero priority — owui does that
+# when QR_CHAT_PRIORITY is set (see qr-llm-owui infra/secrets.md). Conversely
+# a client sending non-zero priority against an FCFS engine gets an ERROR, so
+# this flag must land BEFORE owui's env var.
+#
 # --middleware restores GET /health/entropy on the stock vLLM API server: a
 # PASSIVE reader of the cross-process entropy-status file (never a live QRNG
 # probe) that feeds the OWUI setup guard, /api/qr-status chip, and the
@@ -82,6 +96,7 @@ ExecStart=/usr/bin/env vllm serve ${SHARED_MODEL_PATH} \
     --served-model-name ${SHARED_MODEL_NAME} \
     --host 127.0.0.1 --port 8000 \
     --max-num-seqs ${SHARED_MAX_NUM_SEQS} \
+    --scheduling-policy priority \
     --middleware qr_sampler.engines.vllm.health.entropy_health_middleware \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --max-model-len 8192 --gpu-memory-utilization 0.85
