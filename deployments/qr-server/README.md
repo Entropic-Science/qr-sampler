@@ -49,6 +49,7 @@ endpoints.
 | File | Role |
 |---|---|
 | `qbert0g.service` | The shared entropy daemon unit (both cards, one socket). |
+| `install-dfqrng-dkms.sh` | DKMS-registers the out-of-tree `dfqrng` kernel driver + boot autoload + qbert0g device guard. Run once per box (and re-run after driver-source changes). |
 | `qbert0g.config.yaml.example` | The shared daemon config. **Byte-identical** to `Qbert0G/deployments/qr-server/qbert0g.config.yaml.example` — edit both together. |
 | `qr-sampler-vllm.service` | The shared vLLM + qr-sampler engine unit. |
 | `qr-server.env.example` | Environment for the shared vLLM (model path + entropy transport + the `qr-sampler` key). |
@@ -57,6 +58,29 @@ endpoints.
 The two apps supply their own `*.service` + `.env` (with their own qbert0g key
 and per-lane `qr_preset` default) from their own repos — they are not part of
 this profile.
+
+## The `dfqrng` kernel driver — kernel upgrades WILL break it unless DKMS'd
+
+Both Dragonfly cards are Xilinx FPGA PCIe endpoints driven by the out-of-tree
+`dfqrng` module (source: `~/src/dragonfly/driver` on the box), which creates
+`/dev/qrngDF0` / `/dev/qrngDF1`. An Ubuntu kernel upgrade boots a kernel the
+module was never built for: the chardevs never appear, and (before the
+2026-08 hardening) qbert0g started device-less and kept serving, so **every
+quantum draw on the box silently fell back to system PRNG** — surfaced only
+as gRPC timeouts in the vLLM journal and OWUI's regenerate banner
+(incident 2026-07-29 → 2026-08-06, kernel 7.0.0-27 → 7.0.0-28).
+
+Defense in depth, all installed by `sudo bash install-dfqrng-dkms.sh`:
+
+1. **DKMS registration** — future kernel upgrades rebuild the module
+   automatically (`dkms status dfqrng` to check).
+2. **`/etc/modules-load.d/dfqrng.conf`** — the module loads at every boot.
+3. **qbert0g device guard** (also in this profile's `qbert0g.service`, and as
+   a drop-in for already-installed units) — the daemon refuses to start until
+   both `/dev/qrngDF*` exist and retries forever, so a missing driver is a
+   loudly cycling unit, not a silent PRNG week.
+4. **Qbert0G fail-fast** (daemon-side, ≥ the 2026-08 build) — zero working
+   devices at startup exits nonzero instead of serving nothing.
 
 ## Install
 

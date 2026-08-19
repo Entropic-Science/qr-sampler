@@ -38,9 +38,25 @@ Description=qbert0g shared QRNG entropy daemon (raw, flushed, JIT; both cards)
 Documentation=https://github.com/Entropic-Science/Qbert0G
 After=network-online.target
 Wants=network-online.target
+# Never give up retrying: with the device guard below, a boot where the dfqrng
+# module is missing keeps the unit cycling (loud in `systemctl status` +
+# journal) and recovers the instant `modprobe dfqrng` succeeds — instead of
+# limping device-less and silently serving PRNG to every caller.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Device guard (2026-08-06): the daemon initialises its devices ONCE at
+# startup and keeps serving even when every device failed to open — observed
+# live after a kernel upgrade left the out-of-tree dfqrng module unbuilt for
+# the new kernel: /dev/qrngDF* never appeared, qbert0g booted device-less,
+# and every quantum draw across every app fell back to system PRNG for DAYS
+# with only per-token gRPC timeouts to show for it. Refuse to start until
+# both chardevs exist (also absorbs the boot race where the unit starts
+# before udev settles), so the failure is a visibly cycling unit, not a
+# silently degraded one. Keep the dfqrng driver registered with DKMS so
+# kernel upgrades rebuild it automatically (see install-dfqrng-dkms.sh).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/qrngDF0 ] && [ -e /dev/qrngDF1 ] && exit 0; sleep 1; done; echo "qbert0g: /dev/qrngDF* missing after 30s — is the dfqrng module built+loaded for $(uname -r)? (dkms status dfqrng)" >&2; exit 1'
 # config.yaml is the single source of truth (auth key, devices, integration,
 # coherence pair, freshness). See qbert0g.config.yaml.example — kept
 # byte-identical to Qbert0G/deployments/qr-server/qbert0g.config.yaml.example.
