@@ -411,11 +411,19 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         except AttributeError:
             pass
 
-        logger.warning(
-            "Could not extract vocab_size from vllm_config, using default %d",
-            _DEFAULT_VOCAB_SIZE,
+        # A REAL vllm_config whose attribute path we cannot read is a hard
+        # error, not a fallback: silently substituting 32000 would rescale
+        # every H/ln(V)-normalised strategy (gdt/dynatemp/belltemp/edt) by
+        # ~15% on a 151k-vocab model — sampling keeps working, results are
+        # quietly wrong, and a server-log warning is the only trace
+        # (2026-08-19 ultrareview). The 32000 default remains only for the
+        # vllm_config=None construction path (tests / bare harnesses).
+        raise ConfigValidationError(
+            "could not extract vocab_size from the provided vllm_config "
+            "(tried model_config.hf_text_config.vocab_size and vocab_size); "
+            "refusing to fall back to a default that would silently rescale "
+            "entropy-normalised temperature strategies"
         )
-        return _DEFAULT_VOCAB_SIZE
 
     def _create_onehot_template(self) -> Any:
         """Create the one-hot template tensor filled with -inf.
@@ -562,7 +570,28 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             return src, dst, getattr(direction, "name", "") == "SWAP"
         return getattr(moved, "src_index", None), getattr(moved, "dst_index", None), False
 
+    def _drop_state_ticket(self, state: Any) -> None:
+        """Cancel a dropped state's in-flight prefetch ticket, best-effort.
+
+        The speculative prefetch for the never-sampled next token is
+        abandoned — cancel so the background loop drops it on arrival.
+        """
+        ticket = getattr(state, "entropy_ticket", None)
+        if ticket is not None:
+            with contextlib.suppress(Exception):
+                ticket.cancel()
+            state.entropy_ticket = None
+
     def _update_state_impl(self, batch_update: Any | None) -> None:
+        # Operation order follows the vLLM V1 LogitsProcessor contract
+        # ("removed, added, moved" — interface.py) and mirrors vLLM's own
+        # process_dict_updates reference: moves are applied LAST, and a
+        # unidirectional move pops the DESTINATION unconditionally. The
+        # pre-2026-08-19 order (removed -> moved -> added) could attach the
+        # wrong per-request state (config, hvh EMA, prefetch salt) — or
+        # leave a row stateless, silently sampling via the process-default
+        # pipeline — whenever one update combined an add with a move
+        # touching the same index.
         if batch_update is None:
             return
 
@@ -572,13 +601,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             if req_idx is not None:
                 state = self._request_states.pop(req_idx, None)
                 if state is not None:
-                    # The speculative prefetch for the never-sampled next
-                    # token is abandoned — cancel best-effort so the
-                    # background loop drops it on arrival.
-                    if state.entropy_ticket is not None:
-                        with contextlib.suppress(Exception):
-                            state.entropy_ticket.cancel()
-                        state.entropy_ticket = None
+                    self._drop_state_ticket(state)
                     # Emit a request-boundary event so an operator can spot
                     # the K-5 failure mode (Modal-reported success with zero
                     # output) directly from the log stream.
@@ -595,26 +618,16 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                         },
                     )
 
-        # 2. Process moves / swaps (index reassignments).
-        for moved in getattr(batch_update, "moved", []):
-            src_idx, dst_idx, is_swap = self._moved_indices(moved)
-            if src_idx is None or dst_idx is None:
-                continue
-            src_state = self._request_states.pop(src_idx, None)
-            if is_swap:
-                dst_state = self._request_states.pop(dst_idx, None)
-                if src_state is not None:
-                    self._request_states[dst_idx] = src_state
-                if dst_state is not None:
-                    self._request_states[src_idx] = dst_state
-            elif src_state is not None:
-                self._request_states[dst_idx] = src_state
-
-        # 3. Process additions.
+        # 2. Process additions (may replace an existing request at the same
+        # index — pop the incumbent so its prefetch ticket is not leaked).
         for added in getattr(batch_update, "added", []):
             req_idx, params = self._added_index_and_params(added)
             if req_idx is None:
                 continue
+
+            incumbent = self._request_states.pop(req_idx, None)
+            if incumbent is not None:
+                self._drop_state_ticket(incumbent)
 
             extra_args = getattr(params, "extra_args", None) or {}
 
@@ -728,6 +741,25 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                     "qr_preset": extra_args.get("qr_preset"),
                 },
             )
+
+        # 3. Process moves / swaps LAST (index reassignments). Both indices
+        # are popped unconditionally, mirroring process_dict_updates: on a
+        # unidirectional move the destination's incumbent state is dropped
+        # (its ticket cancelled), never left behind to serve a future
+        # request at that slot with a stale config + EMA history.
+        for moved in getattr(batch_update, "moved", []):
+            src_idx, dst_idx, is_swap = self._moved_indices(moved)
+            if src_idx is None or dst_idx is None:
+                continue
+            src_state = self._request_states.pop(src_idx, None)
+            dst_state = self._request_states.pop(dst_idx, None)
+            if src_state is not None:
+                self._request_states[dst_idx] = src_state
+            if dst_state is not None:
+                if is_swap:
+                    self._request_states[src_idx] = dst_state
+                else:
+                    self._drop_state_ticket(dst_state)
 
     def apply(self, logits: Any) -> Any:
         """Run the full sampling pipeline on each row of the logit tensor.
@@ -875,6 +907,20 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # pipeline instead of an AttributeError in the engine worker.
         raw_state = self._request_states.get(i)
         state = raw_state if isinstance(raw_state, _RequestState) else None
+        if raw_state is None:
+            # A sampled row with NO state means the request was never added
+            # (or its state was lost to a batch-update bug). Routing it to
+            # the process-default pipeline keeps the engine alive, but the
+            # text would be attributed to the caller's requested config —
+            # a silent-misconfig channel. In healthy operation this fires
+            # zero times, so it is loud on purpose.
+            logger.warning(
+                "row %d sampled with NO per-request state — routing to the "
+                "process-default pipeline; the caller's qr_* args are NOT in "
+                "effect for this token",
+                i,
+                extra={"event": "entropy.request.stateless_row", "req_idx": i},
+            )
         prefetch_ctx: PrefetchContext | None = None
         if state is not None:
             pipeline = state.pipeline

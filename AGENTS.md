@@ -119,7 +119,7 @@ src/qr_sampler/
 |       +-- breaker.py         #   adaptive-P99 circuit breaker (pure class)
 |       +-- preprobe.py        #   TCP pre-probe state machine
 +-- amplification/             # SignalAmplifier ABC + registry; zscore.py, zscore_thought.py, ecdf.py, server_side.py ("server": server-integrated draws)
-+-- temperature/               # TemperatureStrategy ABC + registry; fixed.py, edt.py, hvh_drift.py, coherence_gate.py
++-- temperature/               # TemperatureStrategy ABC + registry; fixed.py, edt.py, edt_paper.py, hvh_drift.py, coherence_gate.py, tt_exchange.py, evdt_tt.py, gdt.py, dynatemp.py, belltemp.py, mix_temperatures.py, ring_buffer_ar.py
 +-- selection/                 # TokenSelector: top-k -> softmax -> min-p -> top-p -> CDF
 +-- logging/                   # TokenSamplingRecord + SamplingLogger (none/summary/full)
 +-- telemetry/

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `edt_paper` temperature strategy
+
+#### 2026-08-06
+
+- **New builtin strategy `edt_paper`**: faithful port of the published EDT
+  form (arXiv:2403.14541, Zhang et al.), `T = edtp_t0 * edtp_n^(edtp_theta / H)`
+  on raw Shannon entropy — a different function family from the existing
+  `edt` (power law of *normalized* entropy), hence a separate strategy id.
+  Emits no per-token min_p (paper-faithful; `min_p_base` applies). New
+  per-request knobs `qr_edtp_t0` / `qr_edtp_theta` / `qr_edtp_n` with the
+  paper-recommended defaults (T0=0.6, theta=0.1, N=0.8); `edtp_theta = 0`
+  is the exact static clone (FR-8.5). Sampler profile
+  `profiles/samplers/edt_paper.yaml`.
+
+### Added — v7 strategy contract (gdt, dynatemp, belltemp, mix_temperatures, ring_buffer_ar)
+
+#### 2026-07-11
+
+- **Five new builtin strategies** (createmp-evalsuite V5/V6 lineage), each
+  with a sampler profile and an exact static-clone parameterisation
+  (FR-8.5): `gdt` (Gaussian bell on normalized entropy + entropy-tapered
+  varentropy boost, coupled min-p), `dynatemp` (entropy-linear llama.cpp-
+  lineage ramp, standard direction only, family-owned constant min-p),
+  `belltemp` (non-monotonic bell + additive varentropy weight,
+  temperature-coupled min-p), `mix_temperatures` (convex cool/hot softmax
+  mixture routed by an (H, VH) sigmoid gate — genuinely leaves the
+  single-temperature family), and `ring_buffer_ar` (anti-repetition
+  penalty over the last N emitted token ids; embedding-cosine similarity
+  or exact-id fallback).
+- **New per-request `qr_*` knobs**, additive only, no `CONTRACT_VERSION`
+  bump: 8 `qr_gdt_*`, 4 `qr_dynatemp_*`, 8 `qr_belltemp_*`, 7 `qr_mix_*`,
+  5 `qr_rba_*` (`gdt_t_peak` / `belltemp_t_peak` hard-capped at 1.5 — the
+  ablation-located family coherence cliff).
+- **Two duck-typed pipeline seams** (no-ops when unused, test-pinned):
+  `diagnostics["transformed_logits"]` (distribution transforms) and
+  `observe_selected_token(token_id)` (post-selection history feed).
+- **`hvh_drift` EMA-drift realignment**: drift is now measured against the
+  *previous* EMA, with the update applied afterwards — decoupling
+  `qr_hvh_lambda_ema` from the drift gains (`gamma_dh` / `nu_dh`).
+  V6-lineage (lambda, gamma) pairs are not value-compatible with v7 runs
+  (see LEARNINGS.md).
+
 ### Added — per-request sampling bypass ("qr_bypass")
 
 - **New per-request config field `bypass`** (extra-args key `qr_bypass`, env
@@ -74,6 +116,28 @@ on concurrent throughput rose from ~39–127 tok/s to ~400–530 tok/s:
   `QuantumGrpcSource`, a locked RNG in `MockUniformSource`, and a lock on
   the pipeline's gate-status publisher. The `EntropySource` ABC documents
   the concurrency expectations for third-party sources.
+
+### Added — V6 strategy tranche (tt_exchange, evdt_tt, qr_truncate_first)
+
+#### 2026-07-10
+
+- **`tt_exchange` builtin strategy** (V6 research spec §7.3): min-p on the
+  raw distribution; temperature scaled by the entropy removed by that
+  truncation (`T = tt_t_base + tt_gamma * max(0, H - H_kept)`). The
+  internal truncation is a measurement only — the strategy never modifies
+  logits. Knobs `qr_tt_t_base` / `qr_tt_gamma` / `qr_tt_min_p_base` /
+  `qr_tt_min_p_scale`, V6 predicted defaults.
+- **`evdt_tt` builtin strategy** (V6 research spec §7.1): (T, min_p) both
+  linear in raw entropy/varentropy. Knobs `qr_evdt_t_base` /
+  `qr_evdt_alpha` / `qr_evdt_beta` / `qr_evdt_min_p_base` /
+  `qr_evdt_min_p_scale` / `qr_evdt_min_p_vh`, V6 predicted defaults.
+- **`qr_truncate_first` per-request selector flag** (`truncate_first`
+  config field, default `false` = strict no-op): apply the min-p mask on
+  the RAW (temperature-free) distribution, then temperature on the kept
+  support — the families' exact V6 order, and the one pinned exception to
+  selector invariant 15 (AGENTS.md updated in the same change). 10 new
+  per-request strategy fields + `truncate_first`, additive only; sampler
+  profiles for both families.
 
 ### Added — named entropy-source instances (qr-llm-research enabler)
 

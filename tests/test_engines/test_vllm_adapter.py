@@ -194,14 +194,23 @@ class TestVLLMAdapterInit:
         vocab = VLLMAdapter._extract_vocab_size(config)
         assert vocab == 256
 
-    def test_extract_vocab_size_fallback(self) -> None:
-        """Falls back to default when config has no vocab_size."""
+    def test_extract_vocab_size_unreadable_config_is_hard_error(self) -> None:
+        """A REAL vllm_config with an unreadable attribute path must raise.
+
+        Silently substituting 32000 would rescale every H/ln(V)-normalised
+        strategy (gdt/dynatemp/belltemp/edt) by ~15% on a 151k-vocab model —
+        sampling keeps working, results are quietly wrong (2026-08-19
+        ultrareview). The 32000 default remains only for vllm_config=None.
+        """
 
         class EmptyConfig:
             pass
 
-        vocab = VLLMAdapter._extract_vocab_size(EmptyConfig())
-        assert vocab == _DEFAULT_VOCAB_SIZE
+        with pytest.raises(ConfigValidationError, match="vocab_size"):
+            VLLMAdapter._extract_vocab_size(EmptyConfig())
+
+    def test_extract_vocab_size_none_config_keeps_default(self) -> None:
+        assert VLLMAdapter._extract_vocab_size(None) == _DEFAULT_VOCAB_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +484,81 @@ class TestUpdateState:
         adapter.update_state(MockBatchUpdate(moved=[(0, 1, _Dir("SWAP"))]))
         assert adapter._request_states[0].config.top_k == 22
         assert adapter._request_states[1].config.top_k == 11
+
+    # ── 2026-08-19 ultrareview: vLLM contract ordering + destination pops ──
+    # The vLLM V1 contract (interface.py) is "removed, added, moved", and the
+    # reference process_dict_updates pops BOTH indices of a move
+    # unconditionally. The pre-fix order (removed -> moved -> added) could
+    # attach the wrong per-request state or leave a stale state behind when
+    # one update combined an add with a move touching the same index — a
+    # silent-misconfig channel under batch churn.
+
+    def test_combined_add_and_move_in_one_update_moves_win_destination(self) -> None:
+        class _Dir:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        adapter = _make_adapter()
+        adapter.update_state(
+            MockBatchUpdate(added=[(0, MockSamplingParams(extra_args={"qr_top_k": 11}), None, [])])
+        )
+        # One update: a new request lands at index 5 AND index 0 moves to 5.
+        # Contract order (adds before moves) means the moved state wins the
+        # destination; the old order processed the move first and the add
+        # then clobbered the moved request's state with the new one.
+        adapter.update_state(
+            MockBatchUpdate(
+                added=[(5, MockSamplingParams(extra_args={"qr_top_k": 99}), None, [])],
+                moved=[(0, 5, _Dir("UNIDIRECTIONAL"))],
+            )
+        )
+        assert 0 not in adapter._request_states
+        assert adapter._request_states[5].config.top_k == 11
+
+    def test_unidirectional_move_clears_stale_destination(self) -> None:
+        class _Dir:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        adapter = _make_adapter()
+        adapter.update_state(
+            MockBatchUpdate(
+                added=[
+                    (0, MockSamplingParams(extra_args={"qr_top_k": 11}), None, []),
+                    (5, MockSamplingParams(extra_args={"qr_top_k": 22}), None, []),
+                ]
+            )
+        )
+        adapter.update_state(MockBatchUpdate(moved=[(0, 5, _Dir("UNIDIRECTIONAL"))]))
+        assert 0 not in adapter._request_states
+        assert adapter._request_states[5].config.top_k == 11
+
+    def test_move_with_missing_source_still_pops_destination(self) -> None:
+        """Mirrors process_dict_updates: both indices pop unconditionally —
+        a stale destination state must never survive to serve a future
+        request at that slot with the wrong config + EMA history."""
+
+        class _Dir:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        adapter = _make_adapter()
+        adapter.update_state(
+            MockBatchUpdate(added=[(5, MockSamplingParams(extra_args={"qr_top_k": 22}), None, [])])
+        )
+        # Source index 0 has no state; the destination must still clear.
+        adapter.update_state(MockBatchUpdate(moved=[(0, 5, _Dir("UNIDIRECTIONAL"))]))
+        assert 5 not in adapter._request_states
+
+    def test_re_add_at_same_index_replaces_incumbent(self) -> None:
+        adapter = _make_adapter()
+        adapter.update_state(
+            MockBatchUpdate(added=[(0, MockSamplingParams(extra_args={"qr_top_k": 11}), None, [])])
+        )
+        adapter.update_state(
+            MockBatchUpdate(added=[(0, MockSamplingParams(extra_args={"qr_top_k": 22}), None, [])])
+        )
+        assert adapter._request_states[0].config.top_k == 22
 
     def test_none_batch_update(self) -> None:
         """None batch_update is a no-op."""

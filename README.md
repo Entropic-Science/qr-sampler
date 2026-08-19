@@ -399,6 +399,40 @@ Key properties:
 - **Labelling**: diagnostics gain `gate_open`, `gate_boost`, `coherence_z`, `coherence_valid`, which flow into the token record (and the cross-process status file) — so every sampled token is labelled with whether the gate was open.
 - Knobs: `qr_coherence_threshold` (default 3.5), `qr_coherence_t_boost_max` (0.5), `qr_coherence_ema_alpha` (0.3), `qr_coherence_inner_strategy` (`fixed`).
 
+The eight strategies below are research-campaign ports (createmp-evalsuite V5/V6 lineage plus the published EDT paper form). All are selectable per request via `qr_temperature_strategy`, expose every hyperparameter as a per-request `qr_*` knob, and operate inside the repo-wide guardrail box (T ∈ [0.3, 2.2], min-p ∈ [0, 0.15]).
+
+### EDT, paper form (`edt_paper`)
+
+Faithful port of the published EDT formula (arXiv:2403.14541): `T = edtp_t0 * edtp_n^(edtp_theta / H)` on raw Shannon entropy — near-greedy when the model is confident, rising toward the `edtp_t0` ceiling as entropy grows. A different function family from `edt` (a power law of *normalized* entropy); the two are not inter-expressible. Emits no per-token min-p, so `qr_min_p_base` applies (default 0.0 = the paper-faithful configuration). Knobs: `qr_edtp_t0`, `qr_edtp_theta`, `qr_edtp_n`; `qr_edtp_theta: 0` reduces exactly to fixed `T = edtp_t0`. (research — v7 explore campaign)
+
+### TT entropy exchange (`tt_exchange`)
+
+Stateless: computes `min_p_t = clip(tt_min_p_base + tt_min_p_scale * H)`, measures the entropy `H - H_kept` removed by truncating the raw distribution at that threshold, and redeploys it as temperature: `T = tt_t_base + tt_gamma * max(0, H - H_kept)`. Knobs: `qr_tt_t_base`, `qr_tt_gamma`, `qr_tt_min_p_base`, `qr_tt_min_p_scale`; the exact V6 min-p-before-temperature order additionally requires `qr_truncate_first: true`. (research — V6 tranche, v7 explore campaign)
+
+### EVDT-TT (`evdt_tt`)
+
+Stateless: temperature and min-p both linear in the raw entropy H and varentropy VH — `T = evdt_t_base + evdt_alpha*H + evdt_beta*VH`, `min_p = evdt_min_p_base + evdt_min_p_scale*H + evdt_min_p_vh*VH`. The family's defining truncate-before-temperature order requires the per-request flag `qr_truncate_first: true`; without it this is a scale-then-truncate EVDT variant. Knobs: `qr_evdt_t_base`, `qr_evdt_alpha`, `qr_evdt_beta`, `qr_evdt_min_p_base`, `qr_evdt_min_p_scale`, `qr_evdt_min_p_vh`. (research — V6 tranche, v7 explore campaign)
+
+### Gaussian dynamic temperature (`gdt`)
+
+Bell-curve temperature on normalized entropy plus an entropy-tapered varentropy boost that is shut off as H_norm → 1: `T = gdt_t_base + gdt_t_peak * exp(-(H_norm - gdt_mu)^2 / (2*gdt_sigma^2)) + gdt_alpha * VH_norm * (1 - H_norm)`; per-token min-p scales with the excess temperature above base. Knobs: `qr_gdt_t_base`, `qr_gdt_t_peak` (hard-capped at 1.5), `qr_gdt_mu`, `qr_gdt_sigma`, `qr_gdt_alpha`, `qr_gdt_lambda_vh`, `qr_gdt_min_p_base`, `qr_gdt_min_p_scale`. Static clone: `qr_gdt_t_peak: 0` + `qr_gdt_alpha: 0`. (research — v7 explore campaign)
+
+### DynaTemp (`dynatemp`)
+
+Entropy-linear dynamic temperature (llama.cpp lineage, standard direction only — low entropy → low T): `T = dynatemp_t_center - dynatemp_t_range + 2 * dynatemp_t_range * H_norm^dynatemp_exponent`, with a constant per-token min-p that the family fully owns (`qr_min_p_base` is not consulted). Knobs: `qr_dynatemp_t_center`, `qr_dynatemp_t_range`, `qr_dynatemp_exponent`, `qr_dynatemp_min_p`. Static clone: `qr_dynatemp_t_range: 0`. (research — v7 explore campaign)
+
+### BellTemp (`belltemp`)
+
+Non-monotonic bell curve on normalized entropy with an additive varentropy term — sharpen when confident, explore in the mid-entropy sweet spot, stabilize when lost: `T = belltemp_t_base + belltemp_t_peak * exp(-(H_norm - belltemp_mu)^2 / (2*belltemp_sigma^2)) + belltemp_vh_weight * VH_norm`; min-p rises linearly with the resulting temperature's position inside the guardrail box. Knobs: `qr_belltemp_t_base`, `qr_belltemp_t_peak` (hard-capped at 1.5), `qr_belltemp_mu`, `qr_belltemp_sigma`, `qr_belltemp_vh_weight`, `qr_belltemp_lambda_vh`, `qr_belltemp_min_p_base`, `qr_belltemp_min_p_scale`. Static clone: `qr_belltemp_t_peak: 0` + `qr_belltemp_vh_weight: 0` + `qr_belltemp_min_p_scale: 0`. (research — v7 explore campaign)
+
+### Mixture of temperatures (`mix_temperatures`)
+
+Convex mix of a cool and a hot softmax, routed per token by a sigmoid gate on (H, VH): `p_mix = alpha * softmax(l/mix_t_hot) + (1 - alpha) * softmax(l/mix_t_cool)` with `alpha = sigmoid(mix_gate_a*(H - mix_gate_b) + mix_gate_c*(VH - mix_gate_d))`. A mixture of softmax powers is not itself a power — the one family that genuinely leaves single-temperature sampling — so the strategy publishes the transformed logits through the pipeline's distribution seam and returns `T = 1` to the selector; `mix_min_p` applies to the mixed distribution. Knobs: `qr_mix_t_cool`, `qr_mix_t_hot`, `qr_mix_gate_a`/`qr_mix_gate_b`/`qr_mix_gate_c`/`qr_mix_gate_d`, `qr_mix_min_p`. Static clone: `qr_mix_t_cool` = `qr_mix_t_hot`. (research — v7 explore campaign)
+
+### Ring-buffer anti-repetition (`ring_buffer_ar`)
+
+Per-request stateful: a ring buffer of the last `rba_buffer_n` emitted token ids (fed post-selection; a structural one-token lag) penalises each candidate by similarity to the recent context — `logits' = logits - rba_lam * max(0, sim_v - rba_threshold)` — at fixed `T = rba_t` and constant `min_p = rba_min_p`. Similarity is embedding-cosine when an embedding table is attached, otherwise an exact-id repetition penalty on buffered tokens (the default under the vLLM adapter; every token record labels which mode ran). Knobs: `qr_rba_buffer_n`, `qr_rba_lam`, `qr_rba_threshold`, `qr_rba_t`, `qr_rba_min_p`. Static clone: `qr_rba_lam: 0`. (research — v7 explore campaign)
+
 ---
 
 ## Presets
@@ -413,6 +447,8 @@ A preset is a named bundle of `qr_*` overrides that callers opt into via `qr_pre
 | `qthought_think` | REFLECT sampling lane for qr-llm-qthought (hotter HVH-drift, 6,000-byte fetch) | Frozen research lineage |
 | `qthought_voice` | SPEAK sampling lane for qr-llm-qthought (EDT + nucleus/top-k, 10,000-byte fetch) | Frozen research lineage |
 | `qthought_purity` | Server-draw mode: `server` amplifier + `coherence_gate` over `fixed` at T=1 (PurityService required; degrades fail-safe) | QPI default composition |
+
+`creative_sampling` reflects the v6-era winner; the v7 campaign (qr-llm-research `research/dynamic-temperature-sampling`) has finalists pending verification — this preset will be revised from the verified tier winners.
 
 The three historical `qthought*` presets are scientific lineage consumed by the sibling [qr-llm-qthought](https://github.com/Entropic-Science/LiveLM-backend) service — their values are pinned by contract tests on both sides. Do not tune them casually.
 
@@ -461,6 +497,11 @@ curl http://localhost:8000/v1/completions \
 ```
 
 Infrastructure fields (gRPC address/mode, fallback mode, quotas, OpenEntropy conditioning, ...) cannot be overridden per-request — they are set at server startup, and attempts are rejected with a clean validation error. The per-request set is derived from field metadata in `config/model.py`, so the tables below are always in sync with the code.
+
+Two per-request knobs change the shape of the pipeline itself:
+
+- **`qr_bypass`** (default `false` — bare requests never bypass): skip qr-sampler's sampling pipeline for this request entirely. Its logits rows pass through the engine adapter untouched, so the engine's native sampler applies (the standard `temperature`/`top_p`/`top_k`/`seed` request params). Zero entropy is drawn, and no sampling records or perf telemetry are produced. This is how all static baselines run in the v7 research campaign — bypass rows never interleave entropy draws with a concurrent QR lane. `QR_BYPASS=true` makes the whole server a vanilla vLLM passthrough, with `qr_bypass: false` as the per-request opt-back-in.
+- **`qr_truncate_first`** (default `false` = strict no-op): apply the min-p mask on the RAW (temperature-free) probability distribution first, then temperature on the kept support — the selector order the truncate-first families require (`evdt_tt`'s defining property; `tt_exchange`'s exact V6 order). Default `false` preserves the pinned selector order (top-k → softmax → min-p → top-p → CDF; AGENTS.md invariant 15). Scale caveat: under `qr_truncate_first` the winning min-p threshold (strategy-emitted, or the `qr_min_p_base` fallback) applies to raw probabilities, so values tuned for the default scale-then-truncate order are on a different probability scale there.
 
 ---
 
@@ -519,7 +560,7 @@ Environment-only settings (read outside the config model):
 | `QR_POPULATION_MEAN` | `qr_population_mean` | `127.5` | Null-hypothesis mean for byte values |
 | `QR_POPULATION_STD` | `qr_population_std` | `73.612...` | Population std for uniform [0, 255] |
 | `QR_UNIFORM_CLAMP_EPSILON` | `qr_uniform_clamp_epsilon` | `1e-10` | Clamp u to avoid degenerate CDF |
-| `QR_TEMPERATURE_STRATEGY` | `qr_temperature_strategy` | `fixed` | Strategy: `fixed`, `edt`, `hvh_drift`, `coherence_gate` |
+| `QR_TEMPERATURE_STRATEGY` | `qr_temperature_strategy` | `fixed` | Strategy: `fixed`, `edt`, `edt_paper`, `hvh_drift`, `coherence_gate`, `tt_exchange`, `evdt_tt`, `gdt`, `dynatemp`, `belltemp`, `mix_temperatures`, `ring_buffer_ar` |
 | `QR_COHERENCE_THRESHOLD` | `qr_coherence_threshold` | `3.5` | Minimum `coherence_z` for the gate to open |
 | `QR_COHERENCE_T_BOOST_MAX` | `qr_coherence_t_boost_max` | `0.5` | Max temperature boost at `coherence_r = 1` |
 | `QR_COHERENCE_EMA_ALPHA` | `qr_coherence_ema_alpha` | `0.3` | EMA smoothing for the gate boost |
@@ -530,9 +571,12 @@ Environment-only settings (read outside the config model):
 | `QR_EDT_MIN_TEMP` | `qr_edt_min_temp` | `0.1` | EDT temperature floor |
 | `QR_EDT_MAX_TEMP` | `qr_edt_max_temp` | `2.0` | EDT temperature ceiling |
 | `QR_HVH_T_BASE` (+ other `QR_HVH_*`) | `qr_hvh_*` | see `qr-sampler info preset creative_sampling` | HVH-drift family knobs |
+| `QR_EDTP_*`, `QR_TT_*`, `QR_EVDT_*`, `QR_GDT_*`, `QR_DYNATEMP_*`, `QR_BELLTEMP_*`, `QR_MIX_*`, `QR_RBA_*` | `qr_edtp_*`, `qr_tt_*`, `qr_evdt_*`, `qr_gdt_*`, `qr_dynatemp_*`, `qr_belltemp_*`, `qr_mix_*`, `qr_rba_*` | V5/V6-lineage defaults in `config/model.py` | Research strategy family knobs (see Temperature strategies above) |
 | `QR_TOP_K` | `qr_top_k` | `0` | Top-k filtering (`<=0` disables) |
 | `QR_TOP_P` | `qr_top_p` | `1.0` | Nucleus sampling threshold (`1.0` disables) |
-| `QR_MIN_P_BASE` | `qr_min_p_base` | `0.0` | Static min-p floor (`0.0` = strict no-op) |
+| `QR_MIN_P_BASE` | `qr_min_p_base` | `0.0` | Static min-p floor (`0.0` = strict no-op; strategy-emitted per-token min-p always wins) |
+| `QR_TRUNCATE_FIRST` | `qr_truncate_first` | `false` | Min-p on the raw distribution before temperature (truncate-first families) |
+| `QR_BYPASS` | `qr_bypass` | `false` | Skip the qr pipeline; engine-native sampling for this request |
 | `QR_LOG_LEVEL` | `qr_log_level` | `summary` | Logging: `none`, `summary`, `full` |
 | `QR_DIAGNOSTIC_MODE` | `qr_diagnostic_mode` | `false` | Store all token records in memory |
 

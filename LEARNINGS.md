@@ -162,6 +162,15 @@ behavior changes:
   box `T ∈ [0.3, 2.2]`, `min_p ∈ [0, 0.15]`. Defaults deliberately pin
   the **V6_HVD_R01_01 BO winner**, not the §8.4 *predicted* defaults —
   that divergence is intentional and documented on the config fields.
+  **[Amended 2026-08-19]** The V6-parity claim above (including the
+  drift-after-update ordering) is scoped to the pre-v7 revision of
+  `hvh_drift`. The shipped v7 semantics (commit 5bb60cd, 2026-07-11)
+  measures drift against the *previous* EMA and applies the update
+  afterwards (`dH = H_t − ema_{t−1}`), deliberately decoupling
+  `hvh_lambda_ema` from the drift gains `gamma_dh`/`nu_dh` — the V6
+  reference's update-first order made `dH = (1−λ)·(H_t − ema_{t−1})`,
+  degenerating smoothly to zero drift as λ → 1. V6-lineage (λ, γ)
+  values are therefore not value-compatible with v7 runs.
 - **`edt` is NOT the createmp/V5 EDT formula.** qr-sampler's `edt`
   computes `T = base · (H/ln V)^exponent` (power-law of normalised
   entropy); createmp's `EDTProcessor` computes `T = T0 · N^(θ/H)`
