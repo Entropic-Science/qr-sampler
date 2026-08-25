@@ -70,6 +70,19 @@ EnvironmentFile=/etc/qr-server/qr-server.env
 #
 # No --quantization flag — the checkpoint ships pre-quantized and vLLM
 # auto-detects the scheme from the config; forcing one is repo-vs-box drift.
+# (The current PrismaAQUA checkpoint is compressed-tensors mixed
+# NVFP4/FP8/BF16; NVFP4 W4A4 needs the Blackwell cards this box has.)
+#
+# NEVER enable speculative decoding on this engine, even though the
+# PrismaAQUA checkpoint ships an MTP head for it. qr-sampler's contract is
+# ONE quantum draw per emitted token through the logits processor; spec
+# decode proposes/verifies several tokens per engine step, which silently
+# breaks the one-draw-per-token accounting and the TokenSamplingRecord
+# lineage. Leave every --speculative-* flag off, here and in any drop-in.
+#
+# --max-model-len 8192 is the box's KV-cache budget, NOT the checkpoint's
+# limit (PrismaAQUA natively supports far longer contexts). Raise it only
+# after checking free VRAM headroom on all four PP ranks at load.
 #
 # --scheduling-policy priority (2026-08-08) lets an interactive request jump a
 # batch backlog. The engine is shared by owui's human chat lane and batch
@@ -99,7 +112,7 @@ ExecStart=/usr/bin/env vllm serve ${SHARED_MODEL_PATH} \
     --scheduling-policy priority \
     --middleware qr_sampler.engines.vllm.health.entropy_health_middleware \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
-    --max-model-len 8192 --gpu-memory-utilization 0.85
+    --max-model-len 8192 --gpu-memory-utilization 0.92
 Restart=on-failure
 RestartSec=5
 # vLLM is slow to load the weights across four cards; give it room before timeout.

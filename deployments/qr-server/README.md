@@ -59,6 +59,54 @@ The two apps supply their own `*.service` + `.env` (with their own qbert0g key
 and per-lane `qr_preset` default) from their own repos — they are not part of
 this profile.
 
+## The shared model — current checkpoint (2026-08)
+
+The shared engine serves **one** checkpoint, injected via `SHARED_MODEL_PATH` /
+`SHARED_MODEL_NAME` in `qr-server.env` — the profile itself is model-agnostic.
+Current checkpoint:
+[`rdtand/Qwen3.8-27B-PrismaAQUA-5.5bit-vllm`](https://huggingface.co/rdtand/Qwen3.8-27B-PrismaAQUA-5.5bit-vllm)
+(replaces the previous `prismaquant-qwen` checkpoint).
+
+| Property | Value | Deployment consequence |
+|---|---|---|
+| Quantization | PrismaQuant AURA+AQUA mixed NVFP4 (W4A4) + FP8 + BF16, `compressed-tensors` | vLLM ≥ 0.26 auto-detects it; **no** `--quantization` flag, **no** `--trust-remote-code` (drop it from any box drop-in) |
+| Size on disk | ~22 GiB (5.5 bpp over 24.35 B body params; lm_head + embeddings BF16) | ≈ 5.5 GiB weights per card under PP=4, plus KV cache at 8192 ctx |
+| Layers | 64 hidden layers | The previous `VLLM_PP_LAYER_PARTITION=17,17,17,13` drop-in carries over as a *starting point* — but this checkpoint has a 27-layer **vision tower that vLLM places on PP rank 0**, so if rank 0 OOMs at load, shift decoder layers off it (e.g. `14,17,17,16`) |
+| Tool calls | Qwen3.8 XML tool-call format | `--tool-call-parser qwen3_xml` stays (qthought's `propose_speech` depends on it) |
+| MTP head | Ships one for speculative decoding | **Never enable it** — spec decode breaks qr-sampler's one-quantum-draw-per-token contract (see the unit file) |
+| Vision inputs | Image/video multimodal | Unused by every lane (all clients are text-only); if VRAM is tight the encoder budget can be reclaimed with `--limit-mm-per-prompt` in a box drop-in |
+| Hardware | NVFP4 needs Blackwell | The box's RTX 5060s qualify |
+
+### Upgrading the shared model (runbook)
+
+```bash
+# 1) Download next to the old checkpoint — do NOT delete the old one yet.
+hf download rdtand/Qwen3.8-27B-PrismaAQUA-5.5bit-vllm \
+    --local-dir /opt/qr-server/models/qwen3.8-27b-prismaaqua
+
+# 2) Point the env at it. SHARED_MODEL_NAME stays `qr-llm` — every client
+#    addresses that name; renaming is a coordinated app change, not a swap.
+sudo nano /etc/qr-server/qr-server.env    # SHARED_MODEL_PATH=...
+
+# 3) Review any ExecStart drop-in for stale per-model flags:
+#    --trust-remote-code (no longer needed), VLLM_PP_LAYER_PARTITION (see
+#    the vision-tower caveat above), any --speculative-* flag (forbidden).
+systemctl cat qr-sampler-vllm
+
+# 4) Restart and verify (expect the benign first-start spawn-race crash;
+#    Restart=on-failure recovers it, NRestarts=1 is normal).
+sudo systemctl restart qr-sampler-vllm
+curl -s http://127.0.0.1:8000/v1/models          # 200 + qr-llm listed
+curl -s http://127.0.0.1:8000/health/entropy     # quantum lane healthy
+```
+
+Then smoke-test the lanes before calling it done: one qthought REFLECT turn
+(the `propose_speech` tool call must parse — this is the `qwen3_xml`
+regression canary), one owui `chat_light` chat, and two identical seeded
+`qr_bypass` requests (byte-identical outputs prove the deterministic lane
+survived the model swap). Rollback is step 2 in reverse: point
+`SHARED_MODEL_PATH` back at the previous checkpoint dir and restart.
+
 ## The `dfqrng` kernel driver — kernel upgrades WILL break it unless DKMS'd
 
 Both Dragonfly cards are Xilinx FPGA PCIe endpoints driven by the out-of-tree
