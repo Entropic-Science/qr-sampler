@@ -10,9 +10,10 @@ explicitly) without touching the adapter itself:
   request's strategy, satisfying the NFR-3 / NFR-8a memory bound.
 * A request body carrying ``qr_preset=creative_sampling`` is resolved
   through ``resolve_config`` / preset expansion so the resulting
-  ``_RequestState.strategy`` matches the preset's strategy (GDT since the
-  2026-08-26 bell-lift retuning; the HVH lifecycle tests below select
-  ``hvh_drift`` via explicit ``qr_temperature_strategy`` args instead).
+  ``_RequestState.strategy`` matches the preset's strategy (hvh_drift —
+  the V7_HVD_R02_00 champion since 2026-08-26; the lifecycle tests below
+  still select ``hvh_drift`` via explicit ``qr_temperature_strategy``
+  args so they stay preset-independent).
 
 Uses ``MockUniformSource`` as the entropy source (no gRPC, no GPU). The
 ``vllm_config=None`` DI escape hatch in ``VLLMAdapter`` is exercised
@@ -29,7 +30,6 @@ from typing import Any
 import numpy as np
 
 from qr_sampler.engines.vllm.adapter import VLLMAdapter, _RequestState
-from qr_sampler.temperature.gdt import GDTStrategy
 from qr_sampler.temperature.hvh_drift import HVHDriftStrategy
 
 # ---------------------------------------------------------------------------
@@ -98,9 +98,10 @@ def _make_adapter(vocab_size: int = 16) -> VLLMAdapter:
 def _add_hvh_request(adapter: VLLMAdapter, req_index: int) -> None:
     """Inject a request selecting hvh_drift via an explicit per-request arg.
 
-    Pre-2026-08 this rode ``qr_preset=creative_sampling``; that preset is
-    now the GDT bell-lift, so the HVH lifecycle vehicle is the explicit
-    strategy key (hvh_* hyperparameters take their config-model defaults).
+    Deliberately NOT ``qr_preset=creative_sampling`` (even though that
+    preset is hvh_drift again since 2026-08-26): the lifecycle tests stay
+    preset-independent so a future preset retuning cannot silently change
+    their vehicle (hvh_* hyperparameters take their config-model defaults).
     """
     params = _MockSamplingParams(extra_args={"qr_temperature_strategy": "hvh_drift"})
     adapter.update_state(
@@ -115,9 +116,9 @@ def _add_hvh_request(adapter: VLLMAdapter, req_index: int) -> None:
 
 def test_preset_resolves_through_resolve_config() -> None:
     """A request body with ``qr_preset=creative_sampling`` produces a
-    ``_RequestState`` whose strategy is a ``GDTStrategy`` (the V7 bell-lift
-    retuning, 2026-08-26), and an explicit ``qr_temperature_strategy``
-    arg produces an ``HVHDriftStrategy``.
+    ``_RequestState`` whose strategy is an ``HVHDriftStrategy`` carrying
+    the V7_HVD_R02_00 champion knobs (2026-08-26 retuning), and an
+    explicit ``qr_temperature_strategy`` arg does the same.
     """
     adapter = _make_adapter()
     try:
@@ -127,11 +128,12 @@ def test_preset_resolves_through_resolve_config() -> None:
         )
         state = adapter._request_states[0]
         assert isinstance(state, _RequestState)
-        assert isinstance(state.strategy, GDTStrategy)
+        assert isinstance(state.strategy, HVHDriftStrategy)
         # Preset expansion must have flipped the strategy field on the
         # resolved per-request config (sanity check on the FR-10 path).
-        assert state.config.temperature_strategy == "gdt"
-        assert state.config.gdt_t_base == 0.9
+        assert state.config.temperature_strategy == "hvh_drift"
+        assert state.config.hvh_t_base == 1.53
+        assert state.config.hvh_min_p_base == 0.039045
 
         _add_hvh_request(adapter, req_index=1)
         hvh_state = adapter._request_states[1]

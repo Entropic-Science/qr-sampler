@@ -47,26 +47,31 @@ PRESET_QTHOUGHT_PURITY: Final[str] = "qthought_purity"
 # Keys are field names (no ``qr_`` prefix); values are the override values.
 # ``resolve_preset`` adds the ``qr_`` prefix when projecting into extra_args.
 BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
-    # V7_GDT_R05_02 "GDT bell-lift" winner from qr-llm-research
-    # dynamic-temperature-sampling (v7 program): pooled r01–r06 composite
-    # leader (+0.90), the only dynamic that twice beat the liminal statics
-    # on their own ground (+0.31 r05 / +0.23 r06) with zero gate failures
-    # and 144/144 toolcalls. The conservative GDT champion's bell lifted
-    # whole: t_base 0.582 -> 0.9 with t_peak at the 1.5 family cliff; the
-    # varentropy taper keeps the answer-token floor while mid-entropy
-    # tokens run liminal-hot, and dynamic min-p rises with the applied
-    # heat. Replaced the V6_HVD_R01_01 HVH-Drift tuning on 2026-08-26.
+    # V7_HVD_R02_00 "HVD champion" from qr-llm-research
+    # dynamic-temperature-sampling (v7 program): the program champion —
+    # mean +1.25 creative margin over THREE independent anchor snapshots
+    # (+1.17 r02 / +1.56 r03 / +1.01 r04), the only config replicated that
+    # many times. hvh_drift under the v7-aligned semantics (drift vs the
+    # PREVIOUS EMA — the engine implements exactly this): sustained heat
+    # self-limits because the EMA absorbs it and dH -> 0, and min-p scales
+    # with live entropy (0.039 + 0.03*H ~= 0.10 in ordinary prose).
+    # Knobs pinned verbatim from finalists_v7.json qr_args, all nine, so
+    # the preset is insulated from config-model default drift.
+    # Replaced the V7_GDT_R05_02 GDT bell-lift on 2026-08-26 after it went
+    # incoherent on Qwen3.8-PrismaAQUA (tuned at the t_peak=1.5 family
+    # coherence cliff on Qwen3.6 — the tuning did not transfer).
     # Experimental — see profiles/presets/creative_sampling.yaml for origin.
     "creative_sampling": {
-        "temperature_strategy": "gdt",
-        "gdt_t_base": 0.9,
-        "gdt_t_peak": 1.5,
-        "gdt_mu": 0.397,
-        "gdt_sigma": 0.283,
-        "gdt_alpha": 0.952,
-        "gdt_lambda_vh": 10.0,
-        "gdt_min_p_base": 0.009635,
-        "gdt_min_p_scale": 0.081,
+        "temperature_strategy": "hvh_drift",
+        "hvh_t_base": 1.53,
+        "hvh_alpha_h": 0.3,
+        "hvh_alpha_vh": -0.2,
+        "hvh_gamma_dh": 1.0,
+        "hvh_delta_dvh": 0.5,
+        "hvh_lambda_ema": 0.02,
+        "hvh_min_p_base": 0.039045,
+        "hvh_kappa_h": 0.03,
+        "hvh_nu_dh": 0.02,
         "top_k": 0,
         "top_p": 1.0,
     },

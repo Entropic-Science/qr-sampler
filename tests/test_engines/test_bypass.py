@@ -116,7 +116,7 @@ class TestBypassUpdateState:
             )
             state = adapter._request_states[0]
             assert isinstance(state, _RequestState)
-            assert state.config.temperature_strategy == "gdt"
+            assert state.config.temperature_strategy == "hvh_drift"
             assert state.config.bypass is False
         finally:
             adapter.close()
