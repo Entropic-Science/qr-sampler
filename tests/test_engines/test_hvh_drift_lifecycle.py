@@ -10,7 +10,9 @@ explicitly) without touching the adapter itself:
   request's strategy, satisfying the NFR-3 / NFR-8a memory bound.
 * A request body carrying ``qr_preset=creative_sampling`` is resolved
   through ``resolve_config`` / preset expansion so the resulting
-  ``_RequestState.strategy`` is an ``HVHDriftStrategy``.
+  ``_RequestState.strategy`` matches the preset's strategy (GDT since the
+  2026-08-26 bell-lift retuning; the HVH lifecycle tests below select
+  ``hvh_drift`` via explicit ``qr_temperature_strategy`` args instead).
 
 Uses ``MockUniformSource`` as the entropy source (no gRPC, no GPU). The
 ``vllm_config=None`` DI escape hatch in ``VLLMAdapter`` is exercised
@@ -27,6 +29,7 @@ from typing import Any
 import numpy as np
 
 from qr_sampler.engines.vllm.adapter import VLLMAdapter, _RequestState
+from qr_sampler.temperature.gdt import GDTStrategy
 from qr_sampler.temperature.hvh_drift import HVHDriftStrategy
 
 # ---------------------------------------------------------------------------
@@ -69,7 +72,7 @@ def _make_adapter(vocab_size: int = 16) -> VLLMAdapter:
     """Build a VLLMAdapter wired to MockUniformSource.
 
     The adapter default uses ``temperature_strategy='fixed'`` (config
-    default), so requests configured with ``qr_preset=creative_sampling``
+    default), so requests carrying ``qr_temperature_strategy=hvh_drift``
     will resolve to a *different* config and thus get a fresh
     HVHDriftStrategy per request -- exactly the cross-leak scenario we
     want to test.
@@ -92,9 +95,14 @@ def _make_adapter(vocab_size: int = 16) -> VLLMAdapter:
                 os.environ[k] = v
 
 
-def _add_creative_request(adapter: VLLMAdapter, req_index: int) -> None:
-    """Inject a request configured with the creative_sampling preset."""
-    params = _MockSamplingParams(extra_args={"qr_preset": "creative_sampling"})
+def _add_hvh_request(adapter: VLLMAdapter, req_index: int) -> None:
+    """Inject a request selecting hvh_drift via an explicit per-request arg.
+
+    Pre-2026-08 this rode ``qr_preset=creative_sampling``; that preset is
+    now the GDT bell-lift, so the HVH lifecycle vehicle is the explicit
+    strategy key (hvh_* hyperparameters take their config-model defaults).
+    """
+    params = _MockSamplingParams(extra_args={"qr_temperature_strategy": "hvh_drift"})
     adapter.update_state(
         _MockBatchUpdate(added=[_MockAddedRequest(req_index=req_index, sampling_params=params)])
     )
@@ -107,18 +115,28 @@ def _add_creative_request(adapter: VLLMAdapter, req_index: int) -> None:
 
 def test_preset_resolves_through_resolve_config() -> None:
     """A request body with ``qr_preset=creative_sampling`` produces a
-    ``_RequestState`` whose strategy is an ``HVHDriftStrategy``.
+    ``_RequestState`` whose strategy is a ``GDTStrategy`` (the V7 bell-lift
+    retuning, 2026-08-26), and an explicit ``qr_temperature_strategy``
+    arg produces an ``HVHDriftStrategy``.
     """
     adapter = _make_adapter()
     try:
-        _add_creative_request(adapter, req_index=0)
-
+        params = _MockSamplingParams(extra_args={"qr_preset": "creative_sampling"})
+        adapter.update_state(
+            _MockBatchUpdate(added=[_MockAddedRequest(req_index=0, sampling_params=params)])
+        )
         state = adapter._request_states[0]
         assert isinstance(state, _RequestState)
-        assert isinstance(state.strategy, HVHDriftStrategy)
+        assert isinstance(state.strategy, GDTStrategy)
         # Preset expansion must have flipped the strategy field on the
         # resolved per-request config (sanity check on the FR-10 path).
-        assert state.config.temperature_strategy == "hvh_drift"
+        assert state.config.temperature_strategy == "gdt"
+        assert state.config.gdt_t_base == 0.9
+
+        _add_hvh_request(adapter, req_index=1)
+        hvh_state = adapter._request_states[1]
+        assert isinstance(hvh_state.strategy, HVHDriftStrategy)
+        assert hvh_state.config.temperature_strategy == "hvh_drift"
     finally:
         adapter.close()
 
@@ -131,8 +149,8 @@ def test_state_is_per_request() -> None:
     """
     adapter = _make_adapter(vocab_size=16)
     try:
-        _add_creative_request(adapter, req_index=0)
-        _add_creative_request(adapter, req_index=1)
+        _add_hvh_request(adapter, req_index=0)
+        _add_hvh_request(adapter, req_index=1)
 
         strat_a = adapter._request_states[0].strategy
         strat_b = adapter._request_states[1].strategy
@@ -253,7 +271,7 @@ def test_state_evicted_on_remove() -> None:
     """
     adapter = _make_adapter()
     try:
-        _add_creative_request(adapter, req_index=0)
+        _add_hvh_request(adapter, req_index=0)
         strategy = adapter._request_states[0].strategy
         # _RequestState has __slots__ without __weakref__, so it cannot
         # be weakref'd directly. HVHDriftStrategy can be, which is the

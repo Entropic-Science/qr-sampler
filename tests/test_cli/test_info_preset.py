@@ -7,16 +7,17 @@ from click.testing import CliRunner
 
 from qr_sampler.cli.main import cli
 
-# V6_HVD_R01_01 hyperparameters that must appear in info output.
-V6_HYPERPARAM_VALUES = [
-    "1.35",  # hvh_t_base
-    "0.3",  # hvh_alpha_h
-    "-0.2",  # hvh_alpha_vh
-    "1.0",  # hvh_gamma_dh
-    "0.5",  # hvh_delta_dvh
-    "0.02",  # hvh_lambda_ema (also hvh_nu_dh)
-    "0.025",  # hvh_min_p_base
-    "0.03",  # hvh_kappa_h
+# V7_GDT_R05_02 "GDT bell-lift" hyperparameters that must appear in info
+# output (replaced the V6_HVD_R01_01 HVH-Drift tuning on 2026-08-26).
+V7_HYPERPARAM_VALUES = [
+    "0.9",  # gdt_t_base
+    "1.5",  # gdt_t_peak
+    "0.397",  # gdt_mu
+    "0.283",  # gdt_sigma
+    "0.952",  # gdt_alpha
+    "10.0",  # gdt_lambda_vh
+    "0.009635",  # gdt_min_p_base
+    "0.081",  # gdt_min_p_scale
 ]
 
 
@@ -29,15 +30,15 @@ def runner() -> CliRunner:
 class TestInfoPreset:
     """Tests for ``qr-sampler info preset``."""
 
-    def test_info_creative_sampling_shows_v6_values(self, runner: CliRunner) -> None:
-        """Info output includes strategy, every V6 hyperparameter, and the experimental label."""
+    def test_info_creative_sampling_shows_v7_values(self, runner: CliRunner) -> None:
+        """Info output includes strategy, every V7 hyperparameter, and the experimental label."""
         result = runner.invoke(cli, ["info", "preset", "creative_sampling"])
         assert result.exit_code == 0, result.output
-        assert "hvh_drift" in result.output
+        assert "gdt" in result.output
         assert "experimental" in result.output.lower()
-        for value in V6_HYPERPARAM_VALUES:
+        for value in V7_HYPERPARAM_VALUES:
             assert value in result.output, (
-                f"V6 hyperparameter value {value!r} not in info output: {result.output!r}"
+                f"V7 hyperparameter value {value!r} not in info output: {result.output!r}"
             )
 
     def test_info_normal_t1_shows_baseline(self, runner: CliRunner) -> None:

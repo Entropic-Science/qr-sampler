@@ -96,9 +96,9 @@ class TestLoadBuiltinProfiles:
         assert preset.id == "creative_sampling"
         assert preset.experimental is True
         assert preset.origin is not None
-        assert "V6_HVD_R01_01" in preset.origin
-        assert preset.overrides["temperature_strategy"] == "hvh_drift"
-        assert preset.overrides["hvh_t_base"] == 1.35
+        assert "V7_GDT_R05_02" in preset.origin
+        assert preset.overrides["temperature_strategy"] == "gdt"
+        assert preset.overrides["gdt_t_base"] == 0.9
 
     def test_load_preset_normal_t1(self, loader: ProfileLoader) -> None:
         preset = loader.load_preset("normal_t1")

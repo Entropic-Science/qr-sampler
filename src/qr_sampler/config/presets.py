@@ -3,8 +3,9 @@
 A preset is a named bundle of per-request overrides. Two built-ins ship
 with qr-sampler:
 
-- ``creative_sampling``: HVH-Drift dynamic temperature + min-p (the
-  V6_HVD_R01_01 winner from createmp-evalsuite). Experimental.
+- ``creative_sampling``: GDT bell-lift dynamic temperature + min-p (the
+  V7_GDT_R05_02 winner from qr-llm-research/dynamic-temperature-sampling).
+  Experimental.
 - ``normal_t1``: vanilla fixed temperature 1.0 baseline.
 
 Resolution flow (engine-agnostic; see CLAUDE.md invariant 15):
@@ -46,19 +47,26 @@ PRESET_QTHOUGHT_PURITY: Final[str] = "qthought_purity"
 # Keys are field names (no ``qr_`` prefix); values are the override values.
 # ``resolve_preset`` adds the ``qr_`` prefix when projecting into extra_args.
 BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
-    # V6_HVD_R01_01 winner from createmp-evalsuite (results/v6/round_final).
+    # V7_GDT_R05_02 "GDT bell-lift" winner from qr-llm-research
+    # dynamic-temperature-sampling (v7 program): pooled r01–r06 composite
+    # leader (+0.90), the only dynamic that twice beat the liminal statics
+    # on their own ground (+0.31 r05 / +0.23 r06) with zero gate failures
+    # and 144/144 toolcalls. The conservative GDT champion's bell lifted
+    # whole: t_base 0.582 -> 0.9 with t_peak at the 1.5 family cliff; the
+    # varentropy taper keeps the answer-token floor while mid-entropy
+    # tokens run liminal-hot, and dynamic min-p rises with the applied
+    # heat. Replaced the V6_HVD_R01_01 HVH-Drift tuning on 2026-08-26.
     # Experimental — see profiles/presets/creative_sampling.yaml for origin.
     "creative_sampling": {
-        "temperature_strategy": "hvh_drift",
-        "hvh_t_base": 1.35,
-        "hvh_alpha_h": 0.3,
-        "hvh_alpha_vh": -0.2,
-        "hvh_gamma_dh": 1.0,
-        "hvh_delta_dvh": 0.5,
-        "hvh_lambda_ema": 0.02,
-        "hvh_min_p_base": 0.025,
-        "hvh_kappa_h": 0.03,
-        "hvh_nu_dh": 0.02,
+        "temperature_strategy": "gdt",
+        "gdt_t_base": 0.9,
+        "gdt_t_peak": 1.5,
+        "gdt_mu": 0.397,
+        "gdt_sigma": 0.283,
+        "gdt_alpha": 0.952,
+        "gdt_lambda_vh": 10.0,
+        "gdt_min_p_base": 0.009635,
+        "gdt_min_p_scale": 0.081,
         "top_k": 0,
         "top_p": 1.0,
     },

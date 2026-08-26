@@ -17,18 +17,19 @@ from qr_sampler.config import (
 )
 from qr_sampler.exceptions import ConfigValidationError
 
-# Expected V6_HVD_R01_01 winner values (spec §2.3).
+# Expected V7_GDT_R05_02 "GDT bell-lift" winner values (replaced the
+# V6_HVD_R01_01 HVH-Drift tuning on 2026-08-26; see
+# profiles/presets/creative_sampling.yaml for origin).
 _CREATIVE_EXPECTED: dict[str, object] = {
-    "qr_temperature_strategy": "hvh_drift",
-    "qr_hvh_t_base": 1.35,
-    "qr_hvh_alpha_h": 0.3,
-    "qr_hvh_alpha_vh": -0.2,
-    "qr_hvh_gamma_dh": 1.0,
-    "qr_hvh_delta_dvh": 0.5,
-    "qr_hvh_lambda_ema": 0.02,
-    "qr_hvh_min_p_base": 0.025,
-    "qr_hvh_kappa_h": 0.03,
-    "qr_hvh_nu_dh": 0.02,
+    "qr_temperature_strategy": "gdt",
+    "qr_gdt_t_base": 0.9,
+    "qr_gdt_t_peak": 1.5,
+    "qr_gdt_mu": 0.397,
+    "qr_gdt_sigma": 0.283,
+    "qr_gdt_alpha": 0.952,
+    "qr_gdt_lambda_vh": 10.0,
+    "qr_gdt_min_p_base": 0.009635,
+    "qr_gdt_min_p_scale": 0.081,
     "qr_top_k": 0,
     "qr_top_p": 1.0,
 }
@@ -44,26 +45,26 @@ _NORMAL_T1_EXPECTED: dict[str, object] = {
 class TestResolvePreset:
     """resolve_preset(): preset -> qr_* dict with caller-wins merge."""
 
-    def test_creative_sampling_expands_to_v6_winner_values(self) -> None:
+    def test_creative_sampling_expands_to_v7_winner_values(self) -> None:
         result = resolve_preset("creative_sampling", {})
         assert result == _CREATIVE_EXPECTED
 
     def test_normal_t1_expands_to_baseline(self) -> None:
         result = resolve_preset("normal_t1", {})
         assert result == _NORMAL_T1_EXPECTED
-        # Exactly 4 keys; no HVH-Drift hyperparameters leak through.
+        # Exactly 4 keys; no GDT hyperparameters leak through.
         assert len(result) == 4
-        assert not any(key.startswith("qr_hvh_") for key in result)
+        assert not any(key.startswith("qr_gdt_") for key in result)
 
     def test_per_request_override_wins_over_preset(self) -> None:
         result = expand_extra_args(
-            {"qr_preset": "creative_sampling", "qr_hvh_t_base": 0.7},
+            {"qr_preset": "creative_sampling", "qr_gdt_t_base": 0.7},
             QRSamplerConfig(_env_file=None),  # type: ignore[call-arg]
         )
-        assert result["qr_hvh_t_base"] == 0.7
+        assert result["qr_gdt_t_base"] == 0.7
         # Other preset keys still applied.
-        assert result["qr_temperature_strategy"] == "hvh_drift"
-        assert result["qr_hvh_alpha_h"] == 0.3
+        assert result["qr_temperature_strategy"] == "gdt"
+        assert result["qr_gdt_mu"] == 0.397
 
     def test_unknown_preset_raises_config_error(self) -> None:
         with pytest.raises(ConfigValidationError) as exc_info:
@@ -79,9 +80,9 @@ class TestResolvePreset:
         assert "qr_preset" not in result
 
     def test_resolve_preset_does_not_mutate_caller_args(self) -> None:
-        caller = {"qr_hvh_t_base": 0.7}
+        caller = {"qr_gdt_t_base": 0.7}
         resolve_preset("creative_sampling", caller)
-        assert caller == {"qr_hvh_t_base": 0.7}
+        assert caller == {"qr_gdt_t_base": 0.7}
 
     def test_non_qr_keys_passed_through(self) -> None:
         result = resolve_preset("creative_sampling", {"other_key": 42})
@@ -146,7 +147,7 @@ class TestExpandExtraArgs:
         result = expand_extra_args({"qr_top_k": 25}, defaults)
         # Preset's top_k (0) overridden by caller's qr_top_k=25 (FR-10).
         assert result["qr_top_k"] == 25
-        assert result["qr_temperature_strategy"] == "hvh_drift"
+        assert result["qr_temperature_strategy"] == "gdt"
 
 
 class TestResolveConfigIntegration:
@@ -155,16 +156,15 @@ class TestResolveConfigIntegration:
     def test_resolve_config_invokes_expand_extra_args(self) -> None:
         defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
         result = resolve_config(defaults, {"qr_preset": "creative_sampling"})
-        assert result.temperature_strategy == "hvh_drift"
-        assert result.hvh_t_base == 1.35
-        assert result.hvh_alpha_h == 0.3
-        assert result.hvh_alpha_vh == -0.2
-        assert result.hvh_gamma_dh == 1.0
-        assert result.hvh_delta_dvh == 0.5
-        assert result.hvh_lambda_ema == 0.02
-        assert result.hvh_min_p_base == 0.025
-        assert result.hvh_kappa_h == 0.03
-        assert result.hvh_nu_dh == 0.02
+        assert result.temperature_strategy == "gdt"
+        assert result.gdt_t_base == 0.9
+        assert result.gdt_t_peak == 1.5
+        assert result.gdt_mu == 0.397
+        assert result.gdt_sigma == 0.283
+        assert result.gdt_alpha == 0.952
+        assert result.gdt_lambda_vh == 10.0
+        assert result.gdt_min_p_base == 0.009635
+        assert result.gdt_min_p_scale == 0.081
         assert result.top_k == 0
         assert result.top_p == 1.0
 
@@ -182,8 +182,8 @@ class TestResolveConfigIntegration:
             preset="creative_sampling",
         )
         result = resolve_config(defaults, None)
-        assert result.temperature_strategy == "hvh_drift"
-        assert result.hvh_t_base == 1.35
+        assert result.temperature_strategy == "gdt"
+        assert result.gdt_t_base == 0.9
 
     def test_resolve_config_per_request_preset_overrides_env_var(self) -> None:
         defaults = QRSamplerConfig(  # type: ignore[call-arg]
@@ -198,10 +198,10 @@ class TestResolveConfigIntegration:
         defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
         result = resolve_config(
             defaults,
-            {"qr_preset": "creative_sampling", "qr_hvh_t_base": 0.7},
+            {"qr_preset": "creative_sampling", "qr_gdt_t_base": 0.7},
         )
-        assert result.temperature_strategy == "hvh_drift"
-        assert result.hvh_t_base == 0.7
+        assert result.temperature_strategy == "gdt"
+        assert result.gdt_t_base == 0.7
 
     def test_resolve_config_unknown_preset_raises(self) -> None:
         defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]

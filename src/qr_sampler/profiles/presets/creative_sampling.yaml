@@ -1,30 +1,35 @@
 id: creative_sampling
 name: "Creative Sampling"
 description: |
-  Experimental dynamic-temperature preset based on the HVH-Drift family.
-  Matches the V6_HVD_R01_01 winning configuration from
-  createmp-evalsuite (results/v6/round_final).
+  Experimental dynamic-temperature preset based on the GDT family — the
+  "GDT bell-lift". Matches the V7_GDT_R05_02 winning configuration from
+  qr-llm-research/dynamic-temperature-sampling (v7 program): pooled
+  r01-r06 composite leader (+0.90), replicated +0.31 r05 / +0.23 r06,
+  both liminal-banded with zero gate failures and 144/144 toolcalls.
 
-  The strategy combines per-sequence EMA tracking of Shannon entropy (H)
-  and varentropy (VH) with drift-driven temperature and min-p scaling.
-  Quantum-entropy still drives final token selection; this preset only
-  shapes the temperature and min-p truncation per token.
+  A bell-shaped temperature curve over normalized entropy: tokens the
+  model is confident about stay near t_base (0.9); mid-entropy tokens
+  ride the bell up toward the t_peak=1.5 family cliff; the varentropy
+  taper keeps the answer-token floor. Dynamic min-p rises with the
+  applied heat, pruning the garbage tail exactly when the distribution
+  runs hot. Quantum entropy still drives final token selection; this
+  preset only shapes the temperature and min-p truncation per token.
 
-  Tuning is held verbatim from the V6 winner; per-request overrides
-  (``qr_hvh_*`` keys) take precedence if a caller supplies them.
+  Replaced the V6_HVD_R01_01 HVH-Drift tuning on 2026-08-26. Tuning is
+  held verbatim from the V7 winner; per-request overrides (``qr_gdt_*``
+  keys) take precedence if a caller supplies them.
 
 experimental: true
-origin: "V6_HVD_R01_01 (createmp-evalsuite/results/v6/round_final)"
+origin: "V7_GDT_R05_02 'GDT bell-lift' (qr-llm-research/dynamic-temperature-sampling, v7 program)"
 overrides:
-  temperature_strategy: hvh_drift
-  hvh_t_base: 1.35
-  hvh_alpha_h: 0.3
-  hvh_alpha_vh: -0.2
-  hvh_gamma_dh: 1.0
-  hvh_delta_dvh: 0.5
-  hvh_lambda_ema: 0.02
-  hvh_min_p_base: 0.025
-  hvh_kappa_h: 0.03
-  hvh_nu_dh: 0.02
+  temperature_strategy: gdt
+  gdt_t_base: 0.9
+  gdt_t_peak: 1.5
+  gdt_mu: 0.397
+  gdt_sigma: 0.283
+  gdt_alpha: 0.952
+  gdt_lambda_vh: 10.0
+  gdt_min_p_base: 0.009635
+  gdt_min_p_scale: 0.081
   top_k: 0
   top_p: 1.0
