@@ -64,6 +64,15 @@ Line numbers reference those working trees.*
 >    bypass-degradation ERROR in the journal means the affected replies
 >    were NATIVE-sampled — never read their variability as an engine
 >    determinism measurement.
+>    **Post-fix measurement (same day, normal serving, prefix caching on):**
+>    seeded `normal_t1` and `chat_light` replayed hash-identical ×3 (and
+>    identical to each other — they are sampling-equivalent configs);
+>    seeded `creative_sampling` replayed identical ×5 on a warm prefix
+>    cache, with only the COLD first run differing — the documented A4
+>    effect (cached-KV vs recomputed-KV differs at the last ulp on
+>    non-invariant kernels), which the hot lane's dense probability tail
+>    amplifies into a token flip while T≈1 lanes absorb it. Consecutive
+>    replays — the compare UI's ↻ use case — are identical on every lane.
 > 5. **Semantic notes for lane users:** (a) `n>1`/`best_of` children share
 >    one `qr_seed` ⇒ n identical completions — use one request per sample;
 >    (b) every conversation TURN restarts the counter at block 0 with the
