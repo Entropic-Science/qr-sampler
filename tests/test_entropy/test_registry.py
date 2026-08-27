@@ -202,6 +202,7 @@ class TestEntropySourceRegistry:
             "timing_noise",
             "openentropy",
             "quantum_grpc",
+            "seeded_prng",
         }
 
     def test_builtin_table_takes_precedence_over_entry_point(self) -> None:

@@ -1,0 +1,52 @@
+# Tier-2 bitwise-replay verification mode for qr-sampler-vllm.service
+# (docs/determinism.md §5.5 — deterministic-by-serialization).
+#
+# TEMPORARY drop-in: install for a replay/verification session, remove and
+# restart afterwards. This fully serializes the shared engine — qthought
+# and every other engine client are effectively paused while it is active.
+#
+# Install:
+#   sudo install -D -m 644 tier2-replay.conf.example \
+#       /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+#   # also set SHARED_MAX_NUM_SEQS=1 in /etc/qr-server/qr-server.env
+#   sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
+#
+# Remove:
+#   sudo rm /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+#   # restore SHARED_MAX_NUM_SEQS, then daemon-reload + restart
+#
+# What each line pins (verdict codes reference docs/determinism.md §3):
+#   OMP/OPENBLAS single-thread — the entropy/varentropy helpers' BLAS dot
+#     products must not vary their reduction blocking with thread count.
+#   QR_APPLY_PARALLEL_ROWS=1 — single-threaded row loop (moot at batch=1,
+#     pinned for provenance).
+#   QR_ENTROPY_PREFETCH=0 — no redeem-miss byte reshuffling (B3).
+#   VLLM_PP_LAYER_PARTITION stays whatever the box drop-in already sets —
+#     changing it between record and replay changes the envelope.
+#
+# NOTE: --no-enable-prefix-caching must ride ExecStart, so this drop-in
+# re-declares it. Keep the flags below in sync with the profile unit's
+# ExecStart (systemd drop-ins replace ExecStart wholesale, hence the
+# empty ExecStart= line first).
+
+[Service]
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=QR_APPLY_PARALLEL_ROWS=1
+Environment=QR_ENTROPY_PREFETCH=0
+# Uniform priority: admission order must not depend on QR_CHAT_PRIORITY.
+Environment=QR_CHAT_PRIORITY=
+
+ExecStart=
+ExecStart=/opt/vllm-venv/bin/vllm serve ${SHARED_MODEL_PATH} \
+    --pipeline-parallel-size 4 --tensor-parallel-size 1 \
+    --served-model-name ${SHARED_MODEL_NAME} \
+    --host 127.0.0.1 --port 8000 \
+    --max-num-seqs ${SHARED_MAX_NUM_SEQS} \
+    --no-enable-prefix-caching \
+    --middleware qr_sampler.engines.vllm.health.entropy_health_middleware \
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+    --max-model-len 32768 --gpu-memory-utilization 0.92 \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode":"PIECEWISE","max_cudagraph_capture_size":64}' \
+    --limit-mm-per-prompt.image=0 --limit-mm-per-prompt.video=0

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from qr_sampler.exceptions import ConfigValidationError
@@ -27,6 +27,27 @@ from qr_sampler.exceptions import ConfigValidationError
 #: Marker for per-request-overridable fields (see module docstring).
 #: ``dict[str, Any]`` keeps it assignable to pydantic's invariant JsonDict.
 _PER_REQUEST: dict[str, Any] = {"per_request": True}
+
+#: Deterministic-lane envelope (docs/determinism.md §5.3): amplifiers whose
+#: ``u`` is a pure stateless function of the byte block. ``ecdf`` (live
+#: calibration array per build) and ``server`` (server-side integration)
+#: cannot reproduce ``u`` from the bytes and are excluded.
+DETERMINISTIC_LANE_AMPLIFIERS: frozenset[str] = frozenset({"zscore_mean", "zscore_thought"})
+
+#: Temperature strategies structurally incompatible with a seeded request:
+#: ``coherence_gate`` boosts on live server-computed cross-device coherence,
+#: which is unreproducible by construction.
+DETERMINISTIC_LANE_FORBIDDEN_STRATEGIES: frozenset[str] = frozenset({"coherence_gate"})
+
+#: Stateful per-request strategies whose internal state does NOT survive an
+#: engine preemption re-add (the EMA restarts mid-generation at a
+#: wall-clock-dependent point). Allowed with a seed — the future lane for
+#: additional sampling methods — but warned on, because replays diverge
+#: under memory pressure. ``ring_buffer_ar`` history is reconstructible in
+#: principle; the reconstruction is not implemented, hence the warning.
+DETERMINISTIC_LANE_STATEFUL_WARN_STRATEGIES: frozenset[str] = frozenset(
+    {"hvh_drift", "ring_buffer_ar"}
+)
 
 #: Infrastructure fields a named entropy-source instance may override.
 #: Deliberately conservative: transport address, credentials, transport
@@ -227,10 +248,38 @@ class QRSamplerConfig(BaseSettings):
             "carries a commitment nonce derived from that token (echoed by "
             "the server via sequence_id) so the ordering is externally "
             "verifiable. Set QR_ENTROPY_PREFETCH=0 to restore the "
-            "strictly-serial fetch-after-logits timing. Timing-only switch "
-            "(does not affect the sampled distribution): per-request "
-            "override lets an operator A/B the pipelined vs serial fetch "
-            "latency on a live deployment."
+            "strictly-serial fetch-after-logits timing. Timing-only for "
+            "STATELESS entropy servers (the sampled distribution is "
+            "unchanged); against a stateful or seeded stream a prefetch "
+            "redeem MISS discards the prefetched block and issues a fresh "
+            "serial fetch, so timing then decides WHICH bytes a token "
+            "receives (docs/determinism.md B3). Per-request override lets "
+            "an operator A/B the pipelined vs serial fetch latency on a "
+            "live deployment."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        lt=2**63,
+        description=(
+            "Deterministic-lane request seed (qr_seed): keys a per-request "
+            "counter-based PRNG source so random bytes become a pure "
+            "function of (seed, token index) — reproducible independent of "
+            "batching, thread scheduling, and concurrent traffic. Requires "
+            "entropy_source_type='seeded_prng' plus the deterministic "
+            "envelope pinned by the 'deterministic_prng' preset (stateless "
+            "zscore amplifier, zero calibration draws, no prefetch); the "
+            "combination is cross-validated at config construction. "
+            "PER-REQUEST ONLY: a process-level QR_SEED is rejected by "
+            "resolve_config — identical concurrent conversations must "
+            "never silently collide on one stream. CAVEAT: same seed "
+            "guarantees an identical entropy stream and identical token "
+            "choice GIVEN the logits; bitwise-identical replies also need "
+            "deterministic logits (batch-invariant engine or the Tier-2 "
+            "serialized replay mode — docs/determinism.md)."
         ),
         json_schema_extra=_PER_REQUEST,
     )
@@ -921,6 +970,87 @@ class QRSamplerConfig(BaseSettings):
         ),
         json_schema_extra=_PER_REQUEST,
     )
+
+    @model_validator(mode="after")
+    def _validate_deterministic_lane(self) -> QRSamplerConfig:
+        """Cross-validate the deterministic-lane envelope (docs/determinism.md §6 T2).
+
+        Runs on EVERY construction path (init kwargs, env, ``model_validate``
+        in ``resolve_config`` and ``build_entropy_source``) — a
+        ``@model_validator`` rather than a rule inside ``resolve_config``
+        because the latter early-returns the defaults instance when a request
+        carries no overrides. Raises
+        :class:`~qr_sampler.exceptions.ConfigValidationError` (NOT a pydantic
+        ``ValidationError``) per the config-surface convention.
+
+        The seed and the ``seeded_prng`` source imply each other: a seed
+        without the keyed source would silently sample QRNG bytes under a
+        determinism label, and the keyed source without a seed has no key.
+        The remaining rules pin every stage that could reintroduce
+        order-dependence or unreproducible state.
+        """
+        if self.seed is None and self.entropy_source_type != "seeded_prng":
+            return self
+        if self.entropy_source_type != "seeded_prng":
+            raise ConfigValidationError(
+                f"seed={self.seed} requires entropy_source_type='seeded_prng' "
+                f"(got {self.entropy_source_type!r}). Use the "
+                f"'deterministic_prng' preset, which pins the whole "
+                f"deterministic envelope."
+            )
+        if self.seed is None:
+            raise ConfigValidationError(
+                "entropy_source_type='seeded_prng' requires a per-request "
+                "seed (qr_seed): the source is keyed per request and has no "
+                "process-default stream by design."
+            )
+        if self.signal_amplifier_type not in DETERMINISTIC_LANE_AMPLIFIERS:
+            raise ConfigValidationError(
+                f"Deterministic lane requires a stateless amplifier "
+                f"{sorted(DETERMINISTIC_LANE_AMPLIFIERS)}; got "
+                f"{self.signal_amplifier_type!r}. 'ecdf' calibrates from the "
+                f"live source per build and 'server' integrates server-side "
+                f"— neither reproduces u from the bytes."
+            )
+        if self.zscore_calibration_samples != 0:
+            raise ConfigValidationError(
+                f"Deterministic lane requires zscore_calibration_samples=0 "
+                f"(got {self.zscore_calibration_samples}): calibration draws "
+                f"consume stream state and are cached first-writer-wins "
+                f"across requests."
+            )
+        if self.entropy_prefetch:
+            raise ConfigValidationError(
+                "Deterministic lane requires entropy_prefetch=False: a "
+                "redeem miss on a stateful stream changes which bytes a "
+                "token receives (moot for the local seeded source, pinned "
+                "for the config-hash provenance)."
+            )
+        if self.bypass:
+            raise ConfigValidationError(
+                "seed and bypass are mutually exclusive: bypass hands the "
+                "row to the engine's native sampler, so the seeded pipeline "
+                "would never run."
+            )
+        if self.temperature_strategy in DETERMINISTIC_LANE_FORBIDDEN_STRATEGIES:
+            raise ConfigValidationError(
+                f"Deterministic lane cannot use temperature_strategy="
+                f"{self.temperature_strategy!r}: the coherence gate boosts "
+                f"on live server-computed coherence, unreproducible by "
+                f"construction."
+            )
+        if self.temperature_strategy in DETERMINISTIC_LANE_STATEFUL_WARN_STRATEGIES:
+            import warnings
+
+            warnings.warn(
+                f"temperature_strategy={self.temperature_strategy!r} carries "
+                f"per-request state that does not survive an engine "
+                f"preemption re-add; seeded replays can diverge under "
+                f"memory pressure. Prefer a stateless strategy ('fixed', "
+                f"'edt') for verified determinism.",
+                stacklevel=2,
+            )
+        return self
 
     # --- Engine adapter (infrastructure; NOT per-request overridable) ---
 

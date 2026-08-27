@@ -83,6 +83,7 @@ quantum_grpc = "qr_sampler.entropy.qgrpc:QuantumGrpcSource"
 timing_noise = "qr_sampler.entropy.timing:TimingNoiseSource"
 mock_uniform = "qr_sampler.entropy.mock:MockUniformSource"
 openentropy = "qr_sampler.entropy.openentropy:OpenEntropySource"
+seeded_prng = "qr_sampler.entropy.seeded:SeededPrngSource"
 
 [tool.setuptools.packages.find]
 where = ["src"]

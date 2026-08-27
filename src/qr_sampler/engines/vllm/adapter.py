@@ -42,6 +42,7 @@ from qr_sampler.core.pipeline import (
 from qr_sampler.core.types import PrefetchContext
 from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.engines.vllm.telemetry import _PerfAggregator
+from qr_sampler.entropy.seeded import SeededPrngSource
 from qr_sampler.exceptions import ConfigValidationError
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
@@ -87,6 +88,14 @@ _DEFAULT_PREINIT = "quantum_grpc,system"
 # lives on ``QRSamplerConfig.entropy_source_instances``.
 _INSTANCES_ENV_VAR = "QR_ENTROPY_SOURCE_INSTANCES"
 
+# Sources constructed PER REQUEST by this adapter rather than pre-initialised
+# as pipelines. Always allowed through ``validate_params`` regardless of the
+# env-derived preinit list — they have no preinit entry by design (a
+# process-level instance would defeat their purpose; see the deterministic
+# lane in docs/determinism.md §6 T3). Requests carrying one are routed to
+# the DEFAULT pipeline with a per-request source override.
+_PER_REQUEST_ONLY_SOURCES = frozenset({"seeded_prng"})
+
 
 @lru_cache(maxsize=8)
 def _allowed_source_names(
@@ -113,7 +122,7 @@ def _allowed_source_names(
             if isinstance(parsed, dict):
                 names.extend(str(key) for key in parsed)
     names.append(default_source)
-    return frozenset(names)
+    return frozenset(names) | _PER_REQUEST_ONLY_SOURCES
 
 
 class _RequestState:
@@ -146,6 +155,11 @@ class _RequestState:
             token, or ``None``. Fired at the previous token's selection
             (or at request-add time for the first token, which overlaps
             the entire prefill) and redeemed on the next ``apply()``.
+        entropy_override: Per-request entropy source override, or ``None``.
+            Carries the deterministic lane's ``SeededPrngSource`` (one per
+            request, keyed by ``config.seed``); passed through to
+            ``sample_token(entropy_source=...)`` so the request rides the
+            default pipeline but fetches from its own keyed source.
     """
 
     __slots__ = (
@@ -153,6 +167,7 @@ class _RequestState:
         "config",
         "config_hash_str",
         "dominant_source_name",
+        "entropy_override",
         "entropy_ticket",
         "pipeline",
         "prefetch_salt",
@@ -168,15 +183,17 @@ class _RequestState:
         amplifier: SignalAmplifier,
         strategy: TemperatureStrategy,
         config_hash_str: str,
+        entropy_override: SeededPrngSource | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.config = config
         self.amplifier = amplifier
         self.strategy = strategy
         self.config_hash_str = config_hash_str
-        self.source = pipeline.entropy_source
+        self.entropy_override = entropy_override
+        self.source = entropy_override if entropy_override is not None else pipeline.entropy_source
         self.tokens_generated = 0
-        self.dominant_source_name = pipeline.entropy_source.name
+        self.dominant_source_name = self.source.name
         self.prefetch_salt = os.urandom(16)
         self.entropy_ticket: Any | None = None
 
@@ -536,8 +553,8 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         self._update_state_impl(batch_update)
 
     @staticmethod
-    def _added_index_and_params(added: Any) -> tuple[int | None, Any]:
-        """Extract ``(batch_index, SamplingParams)`` from one ``BatchUpdate.added`` item.
+    def _added_index_and_params(added: Any) -> tuple[int | None, Any, Any]:
+        """Extract ``(batch_index, SamplingParams, output_tok_ids)`` from an added item.
 
         vLLM V1 passes ``AddedRequest`` as a TUPLE
         ``(index, params, prompt_tok_ids, output_tok_ids)`` (see
@@ -547,12 +564,24 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         silently dropping every per-request override — the failure mode where
         no per-request state is built and every token routes to the process
         default (per-request ``extra_args`` become dead).
+
+        ``output_tok_ids`` matters for one consumer: a PREEMPTION re-add
+        arrives with the tokens already generated, and the deterministic
+        lane's seeded source must resume its counter at exactly that index
+        or replays diverge only under memory pressure (docs/determinism.md
+        §6 footgun #2). ``None`` when the shape does not carry it — treated
+        as an empty history.
         """
         if isinstance(added, (tuple, list)):
             idx = added[0] if len(added) > 0 else None
             params = added[1] if len(added) > 1 else None
-            return idx, params
-        return getattr(added, "req_index", None), getattr(added, "sampling_params", None)
+            output_tok_ids = added[3] if len(added) > 3 else None
+            return idx, params, output_tok_ids
+        return (
+            getattr(added, "req_index", None),
+            getattr(added, "sampling_params", None),
+            getattr(added, "output_tok_ids", None),
+        )
 
     @staticmethod
     def _moved_indices(moved: Any) -> tuple[int | None, int | None, bool]:
@@ -621,7 +650,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # 2. Process additions (may replace an existing request at the same
         # index — pop the incumbent so its prefetch ticket is not leaked).
         for added in getattr(batch_update, "added", []):
-            req_idx, params = self._added_index_and_params(added)
+            req_idx, params, output_tok_ids = self._added_index_and_params(added)
             if req_idx is None:
                 continue
 
@@ -655,16 +684,37 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 )
                 continue
 
-            # Route to the pipeline matching the (possibly-overridden) source.
-            target_source_type = req_config.entropy_source_type
-            target_pipeline = self._pipelines.get(target_source_type)
-            if target_pipeline is None:
-                raise ConfigValidationError(
-                    f"Entropy source {target_source_type!r} is not pre-initialised "
-                    f"for this adapter. Pre-initialised sources: "
-                    f"{sorted(self._pipelines.keys())}. "
-                    f"Set {_PREINIT_ENV_VAR!s} at process startup to include it."
+            # Deterministic lane: a seeded request rides the DEFAULT
+            # pipeline with a per-request source override — seeded_prng is
+            # never pre-initialised (a process-level instance would be a
+            # shared seeded stream, nondeterministic under concurrency), so
+            # the preinit lookup below would raise for it. The counter
+            # resumes from the emitted-token count: a vLLM PREEMPTION
+            # removes and re-adds the request mid-generation, rebuilding
+            # this state — without the resume, replays diverge only under
+            # memory pressure (docs/determinism.md §6 footgun #2).
+            entropy_override: SeededPrngSource | None = None
+            if req_config.seed is not None:
+                # The model validator pinned entropy_source_type to
+                # "seeded_prng" whenever seed is set.
+                entropy_override = SeededPrngSource(
+                    seed=req_config.seed,
+                    initial_step=len(output_tok_ids or []),
                 )
+                target_pipeline = self._pipeline
+            else:
+                # Route to the pipeline matching the (possibly-overridden)
+                # source.
+                target_source_type = req_config.entropy_source_type
+                maybe_pipeline = self._pipelines.get(target_source_type)
+                if maybe_pipeline is None:
+                    raise ConfigValidationError(
+                        f"Entropy source {target_source_type!r} is not pre-initialised "
+                        f"for this adapter. Pre-initialised sources: "
+                        f"{sorted(self._pipelines.keys())}. "
+                        f"Set {_PREINIT_ENV_VAR!s} at process startup to include it."
+                    )
+                target_pipeline = maybe_pipeline
 
             # Always build a fresh strategy. Stateful strategies (e.g.
             # hvh_drift) carry per-request EMA state on the instance, so
@@ -696,6 +746,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 amplifier=amplifier,
                 strategy=strategy,
                 config_hash_str=hash_str,
+                entropy_override=entropy_override,
             )
             self._request_states[req_idx] = state
 
@@ -712,8 +763,12 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             # a byte prefetch here is dead work — and the async byte-prefetch
             # redeem path is where a ``_FetchReply`` shape mismatch surfaced and
             # killed the engine once per-request states began to be built.
+            # Also skipped for a seeded override request: its config pins
+            # entropy_prefetch=False (validated), and a prefetch against the
+            # PIPELINE source here would draw from the QRNG stream a request
+            # that must never touch it.
             draw_mode = bool(getattr(amplifier, "requires_server_draw", False))
-            if req_config.entropy_prefetch and not draw_mode:
+            if req_config.entropy_prefetch and not draw_mode and entropy_override is None:
                 first_nonce = derive_commit_nonce(state.prefetch_salt, 0, -1)
                 state.entropy_ticket = target_pipeline.entropy_source.prefetch(
                     req_config.sample_count, first_nonce
@@ -730,13 +785,13 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 "request %d routed: requested=%s resolved=%s preset=%s",
                 req_idx,
                 extra_args.get("qr_entropy_source_type"),
-                target_pipeline.entropy_source.name,
+                state.dominant_source_name,
                 extra_args.get("qr_preset"),
                 extra={
                     "event": "entropy.request.routed",
                     "req_idx": req_idx,
                     "requested_source_type": extra_args.get("qr_entropy_source_type"),
-                    "resolved_pipeline_source": target_pipeline.entropy_source.name,
+                    "resolved_pipeline_source": state.dominant_source_name,
                     "extra_args_keys": sorted(extra_args.keys()),
                     "qr_preset": extra_args.get("qr_preset"),
                 },
@@ -956,6 +1011,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             config_hash_str=hash_str,
             prefetch_ctx=prefetch_ctx,
             build_onehot=False,
+            entropy_source=state.entropy_override if state is not None else None,
         )
 
         # Store the in-flight ticket for this request's NEXT token

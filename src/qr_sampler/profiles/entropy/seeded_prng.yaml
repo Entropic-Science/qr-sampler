@@ -1,0 +1,43 @@
+id: seeded_prng
+name: "Seeded PRNG (deterministic lane)"
+description: |
+  Counter-based deterministic PRNG: block k of a request is
+  Philox(key=seed, counter=[0, 0, 0, k]) -- a pure function of
+  (request seed, token index), independent of batching, row-thread
+  scheduling, prefetch timing, and concurrent requests. This is the
+  entropy layer of the deterministic lane (docs/determinism.md).
+
+  PER-REQUEST ONLY. This source cannot be selected as a process default
+  (QR_ENTROPY_SOURCE_TYPE) or built by build_entropy_source -- a shared
+  seeded stream would be nondeterministic under concurrency because
+  stream position depends on global consumption order. The engine
+  adapter constructs one instance per request when the request carries
+  qr_seed (which requires qr_entropy_source_type=seeded_prng; use the
+  deterministic_prng preset), resuming the counter from the request's
+  emitted-token count so engine preemption re-adds stay bit-exact.
+
+  Determinism caveats (read docs/determinism.md before relying on this):
+  same seed guarantees an identical entropy stream and identical token
+  choice GIVEN the logits. Bitwise-identical replies additionally
+  require deterministic logits -- either a batch-invariant engine
+  (VLLM_BATCH_INVARIANT=1; unsupported by GDN/linear-attention hybrid
+  checkpoints such as the current deployment model) or the serialized
+  Tier-2 replay mode described in deployments/qr-server/README.md.
+
+  Configuration:
+    qr_preset=deterministic_prng + qr_seed=<int>   (per-request)
+
+source_class: "qr_sampler.entropy.seeded:SeededPrngSource"
+transport: local
+
+dependencies: []
+
+compatible_amplifiers:
+  - zscore_mean
+  - zscore_thought
+
+known_incompatible_amplifiers:
+  - ecdf
+  - server
+
+defaults: {}

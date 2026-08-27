@@ -4,6 +4,22 @@
 qr-server deployment (vLLM 0.24.0, torch 2.11.0+cu130, 4× RTX 5060 Ti, PP=4/TP=1).
 Line numbers reference those working trees.*
 
+> **Status update (2026-08-27).** The §6 spec is IMPLEMENTED: tasks T1–T7 landed
+> in qr-sampler (`seeded_prng` source, `seed` field + cross-field validation,
+> `deterministic_prng` preset, adapter override with preemption-resume, tests)
+> and T5–T6 in qr-llm-owui (Filter preset + compare-mode seeded lane). T8 is
+> reduced to the Tier-2 runbook (`deployments/qr-server/README.md` +
+> `tier2-replay.conf.example`): the checkpoint swapped to
+> `qwen3.8-27b-prismaaqua` (`efae774`), whose live `config.json` was verified
+> to declare 48/64 `linear_attention` (GDN) layers (`full_attention_interval:
+> 4`) — so the A9 blocker CARRIES OVER and `VLLM_BATCH_INVARIANT=1` still
+> refuses to start. References to `prismaquant-qwen` as "current" below are
+> historical; the A9 verdict applies unchanged to the new checkpoint.
+> Implementation deviations from the spec (helper widening for
+> `output_tok_ids`, a code-level `_PER_REQUEST_ONLY_SOURCES` allowlist union,
+> validation as a `@model_validator` rather than in `resolve.py`) are
+> documented in the landing commit.
+
 This document maps every source of nondeterminism in the serving stack **other than
 the intentional one** (physical entropy driving token selection), and lays out the
 most straightforward path to a chatbot lane that is **fully deterministic**: same

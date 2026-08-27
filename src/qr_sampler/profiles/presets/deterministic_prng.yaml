@@ -1,0 +1,48 @@
+id: deterministic_prng
+name: "Deterministic (seeded PRNG)"
+description: |
+  Deterministic control lane: a counter-based per-request PRNG replaces
+  the quantum stream, so random bytes are a pure function of
+  (qr_seed, token index) -- reproducible independent of batching,
+  row-thread scheduling, prefetch timing, and concurrent traffic
+  (docs/determinism.md, the batch-invariance idea applied to the RNG
+  layer). Pins the whole deterministic envelope: seeded_prng source,
+  stateless zscore_mean amplifier with zero calibration draws, STATIC
+  fixed temperature (stateless, so engine preemption re-adds cannot
+  lose strategy state), no entropy prefetch, and the untruncated
+  top_k=0 / top_p=1.0 distribution mirroring normal_t1 -- a
+  like-for-like control arm beside the QRNG lanes.
+
+  The preset carries NO seed: the seed always arrives per request as
+  qr_seed (required -- a request with this preset and no qr_seed fails
+  validation loudly, and a process-level QR_SEED is rejected).
+
+  LIMITATIONS -- read before relying on "deterministic":
+    * Same seed guarantees an identical entropy stream (u sequence) and
+      identical token choice GIVEN the logits.
+    * The logits themselves are only deterministic on a batch-invariant
+      engine. The current deployment checkpoint
+      (qwen3.8-27b-prismaaqua) is a GDN/linear-attention hybrid that
+      CANNOT run VLLM_BATCH_INVARIANT=1, so under concurrent load
+      replies at the same seed may still diverge once floating-point
+      batch effects perturb the logits.
+    * For a fully reproducible BITWISE replay, run the engine in the
+      Tier-2 serialized replay mode (max_num_seqs=1, prefix caching
+      off, other clients quiesced -- recipe in
+      deployments/qr-server/README.md), or serve a full-attention
+      model under VLLM_BATCH_INVARIANT=1.
+    * Replays must also pin the prompt byte stream (no templated
+      system prompt) and the software envelope (model checkpoint,
+      vLLM/torch/numpy versions, GPU layout).
+
+experimental: false
+origin: "docs/determinism.md deterministic-lane design (Tier 1 sampling layer)"
+overrides:
+  entropy_source_type: seeded_prng
+  signal_amplifier_type: zscore_mean
+  zscore_calibration_samples: 0
+  temperature_strategy: fixed
+  fixed_temperature: 1.0
+  entropy_prefetch: false
+  top_k: 0
+  top_p: 1.0

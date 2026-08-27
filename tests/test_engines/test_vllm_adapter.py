@@ -53,10 +53,16 @@ class MockSamplingParams:
 
 @dataclass
 class MockAddedRequest:
-    """Simulates a BatchUpdate added request."""
+    """Simulates a BatchUpdate added request.
+
+    ``output_tok_ids`` mirrors the fourth element of vLLM V1's
+    ``AddedRequest`` tuple — present on a PREEMPTION re-add, where the
+    deterministic lane resumes its counter at ``len(output_tok_ids)``.
+    """
 
     req_index: int
     sampling_params: MockSamplingParams | None = None
+    output_tok_ids: list[int] | None = None
 
 
 @dataclass

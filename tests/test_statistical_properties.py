@@ -78,6 +78,34 @@ class TestUValueUniformity:
             f"mean={u_arr.mean():.4f}"
         )
 
+    def test_ks_test_seeded_prng(self) -> None:
+        """KS-test: 1000 u-values from the deterministic lane's seeded
+        source should be uniform — SeededPrngSource emits UNIFORM bytes
+        precisely so the default z-score population parameters apply, the
+        same gate SystemEntropySource passes above. (Deterministic given
+        the seed, but the KS gate quantifies distribution, not order.)"""
+        from qr_sampler.entropy.seeded import SeededPrngSource
+
+        config = _make_config(sample_count=4096)
+        source = SeededPrngSource(seed=20260827)
+        amplifier = AmplifierRegistry.build(config)
+
+        u_values = []
+        for _ in range(1000):
+            raw = source.get_random_bytes(config.sample_count)
+            result = amplifier.amplify(raw)
+            u_values.append(result.u)
+
+        u_arr = np.array(u_values)
+
+        stat, p_value = scipy_stats.kstest(u_arr, "uniform")
+
+        assert p_value > 0.01, (
+            f"KS-test rejected uniformity: statistic={stat:.4f}, p={p_value:.4f}. "
+            f"u range: [{u_arr.min():.4f}, {u_arr.max():.4f}], "
+            f"mean={u_arr.mean():.4f}"
+        )
+
     def test_mock_source_u_value_spread(self) -> None:
         """MockUniformSource produces u-values that span the (0, 1) range.
 

@@ -23,6 +23,17 @@ class MockUniformSource(EntropySource):
         - **Null hypothesis testing**: ``mean=127.5`` (no bias)
         - **Weak-signal bias simulation**: ``mean=128.0`` (positive bias)
 
+    NOTE: when built via config (``entropy_source_type=mock_uniform`` or
+    ``fallback_mode=mock_uniform``), this source is ALWAYS constructed
+    unseeded — ``build_entropy_source``'s ``accepts_config`` heuristic
+    inspects only the first constructor parameter (``mean``), so no config
+    field can reach ``seed``. Seeding happens only through direct
+    construction in tests. For deterministic sampling use the per-request
+    ``seeded_prng`` source (``deterministic_prng`` preset) instead: it is
+    keyed per request and emits UNIFORM bytes matching the z-score
+    amplifier's population parameters, whereas this source emits clipped
+    normal bytes (docs/determinism.md §3.2.1).
+
     Args:
         mean: Centre of the normal distribution for byte generation.
             Default is 127.5, the expected mean of a uniform byte distribution.

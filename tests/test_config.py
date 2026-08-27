@@ -512,6 +512,7 @@ class TestFieldSets:
                 "rba_min_p",
                 "truncate_first",
                 "bypass",
+                "seed",
             }
         )
         assert intended == PER_REQUEST_FIELDS
@@ -725,3 +726,101 @@ class TestEntropySourceInstances:
         assert resolved.entropy_source_type == "qbert_prng_uniform"
         # The instances declaration itself rides along unchanged.
         assert resolved.entropy_source_instances == defaults.entropy_source_instances
+
+
+# ---------------------------------------------------------------------------
+# Deterministic-lane cross-field validation (seed / seeded_prng)
+# ---------------------------------------------------------------------------
+
+#: The minimal valid deterministic-lane field set (mirrors the
+#: ``deterministic_prng`` preset plus a seed).
+_DETERMINISTIC_KWARGS: dict[str, Any] = {
+    "seed": 42,
+    "entropy_source_type": "seeded_prng",
+    "signal_amplifier_type": "zscore_mean",
+    "zscore_calibration_samples": 0,
+    "entropy_prefetch": False,
+}
+
+
+class TestDeterministicLaneValidation:
+    """The seed/seeded_prng envelope is cross-validated at construction
+    (docs/determinism.md §6 T2) — every forbidden combination raises
+    ConfigValidationError on EVERY construction path."""
+
+    def test_valid_deterministic_combo_constructs(self) -> None:
+        config = QRSamplerConfig(**_DETERMINISTIC_KWARGS, _env_file=None)  # type: ignore[call-arg]
+        assert config.seed == 42
+        assert config.entropy_source_type == "seeded_prng"
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"entropy_source_type": "system"},  # seed without the keyed source
+            {"entropy_source_type": "quantum_grpc"},
+            {"seed": None},  # keyed source without a seed
+            {"signal_amplifier_type": "ecdf"},  # live-calibrated u
+            {"signal_amplifier_type": "server"},  # server-integrated u
+            {"zscore_calibration_samples": 200},  # calibration draws
+            {"entropy_prefetch": True},  # redeem-miss byte reshuffling
+            {"bypass": True},  # native sampler, pipeline never runs
+            {"temperature_strategy": "coherence_gate"},  # live coherence boost
+        ],
+    )
+    def test_forbidden_combinations_raise(self, override: dict[str, Any]) -> None:
+        kwargs = {**_DETERMINISTIC_KWARGS, **override}
+        with pytest.raises(ConfigValidationError):
+            QRSamplerConfig(**kwargs, _env_file=None)  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize("strategy", ["hvh_drift", "ring_buffer_ar"])
+    def test_stateful_strategies_warn_but_construct(self, strategy: str) -> None:
+        """Stateful strategies stay ALLOWED (the future lane for other
+        sampling methods) but warn: their state does not survive an engine
+        preemption re-add."""
+        with pytest.warns(UserWarning, match="preemption"):
+            config = QRSamplerConfig(
+                **{**_DETERMINISTIC_KWARGS, "temperature_strategy": strategy},
+                _env_file=None,  # type: ignore[call-arg]
+            )
+        assert config.temperature_strategy == strategy
+
+    def test_seed_bounds(self) -> None:
+        with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError (range)
+            QRSamplerConfig(**{**_DETERMINISTIC_KWARGS, "seed": -1}, _env_file=None)  # type: ignore[call-arg]
+        with pytest.raises(Exception):  # noqa: B017
+            QRSamplerConfig(**{**_DETERMINISTIC_KWARGS, "seed": 2**63}, _env_file=None)  # type: ignore[call-arg]
+
+    def test_process_default_seed_rejected_by_resolve_config(self) -> None:
+        """QR_SEED (a defaults-level seed) is rejected: the deterministic
+        lane is opted into per request only."""
+        defaults = QRSamplerConfig(**_DETERMINISTIC_KWARGS, _env_file=None)  # type: ignore[call-arg]
+        with pytest.raises(ConfigValidationError, match="per request"):
+            resolve_config(defaults, {})
+
+    def test_preset_with_seed_resolves(self, default_config: QRSamplerConfig) -> None:
+        """qr_preset=deterministic_prng + qr_seed is the supported request
+        shape; the preset pins the envelope, the seed keys the stream."""
+        resolved = resolve_config(
+            default_config, {"qr_preset": "deterministic_prng", "qr_seed": 1905}
+        )
+        assert resolved.seed == 1905
+        assert resolved.entropy_source_type == "seeded_prng"
+        assert resolved.signal_amplifier_type == "zscore_mean"
+        assert resolved.zscore_calibration_samples == 0
+        assert resolved.temperature_strategy == "fixed"
+        assert resolved.fixed_temperature == 1.0
+        assert resolved.entropy_prefetch is False
+        assert resolved.top_k == 0
+        assert resolved.top_p == 1.0
+
+    def test_preset_without_seed_raises(self, default_config: QRSamplerConfig) -> None:
+        """The preset deliberately carries no seed — a request selecting it
+        without qr_seed fails loudly instead of silently sharing a stream."""
+        with pytest.raises(ConfigValidationError, match="seed"):
+            resolve_config(default_config, {"qr_preset": "deterministic_prng"})
+
+    def test_seed_alone_raises(self, default_config: QRSamplerConfig) -> None:
+        """qr_seed without the deterministic envelope must not silently
+        relabel a QRNG lane."""
+        with pytest.raises(ConfigValidationError, match="seeded_prng"):
+            resolve_config(default_config, {"qr_seed": 42})

@@ -53,6 +53,7 @@ endpoints.
 | `qbert0g.config.yaml.example` | The shared daemon config. **Byte-identical** to `Qbert0G/deployments/qr-server/qbert0g.config.yaml.example` — edit both together. |
 | `qr-sampler-vllm.service` | The shared vLLM + qr-sampler engine unit. |
 | `qr-server.env.example` | Environment for the shared vLLM (model path + entropy transport + the `qr-sampler` key). |
+| `tier2-replay.conf.example` | Temporary systemd drop-in for the Tier-2 bitwise-replay verification mode (see the deterministic-lane section). |
 | `README.md` | This file. |
 
 The two apps supply their own `*.service` + `.env` (with their own qbert0g key
@@ -102,10 +103,15 @@ curl -s http://127.0.0.1:8000/health/entropy     # quantum lane healthy
 
 Then smoke-test the lanes before calling it done: one qthought REFLECT turn
 (the `propose_speech` tool call must parse — this is the `qwen3_xml`
-regression canary), one owui `chat_light` chat, and two identical seeded
-`qr_bypass` requests (byte-identical outputs prove the deterministic lane
-survived the model swap). Rollback is step 2 in reverse: point
-`SHARED_MODEL_PATH` back at the previous checkpoint dir and restart.
+regression canary), one owui `chat_light` chat, and two identical
+`deterministic_prng` requests (same `qr_seed`) sent **back-to-back with no
+other traffic** — identical outputs confirm the deterministic lane survived
+the model swap. Note the qualifier: on this checkpoint the engine kernels
+are NOT batch-invariant, so byte-identical replies are only guaranteed when
+the requests run under identical batch conditions (solo back-to-back
+requests, or the Tier-2 replay mode below); a mismatch under concurrent
+load is expected physics, not a regression. Rollback is step 2 in reverse:
+point `SHARED_MODEL_PATH` back at the previous checkpoint dir and restart.
 
 ## The `dfqrng` kernel driver — kernel upgrades WILL break it unless DKMS'd
 
@@ -220,11 +226,77 @@ seam. The current lanes:
 | qthought THINK | `qthought_think` | yes | truncated (tool call must parse) |
 | qthought SPEAK | `qthought_voice` | yes | free distribution |
 | owui / external | `chat_light` | **no** | fresh quantum entropy, plain fixed T |
+| owui / external | `deterministic_prng` | **no** | seeded control lane — requires `qr_seed`; see below |
 
 `chat_light` is the lighter lane added for owui and any future external caller:
 fresh quantum entropy into the sampler with **no** coherence gate. It is
 referenced by the plain `qr_preset` string, so it does **not** cross `contract.py`
-and needs no `CONTRACT_VERSION` bump.
+and needs no `CONTRACT_VERSION` bump. The same is true of `deterministic_prng`.
+
+## Deterministic lane & bitwise replay (Tier 2)
+
+The `deterministic_prng` preset + a per-request `qr_seed` give the sampling
+layer full determinism: bytes are a pure function of `(seed, token index)`
+via a counter-based per-request Philox source, so batching, row threads,
+prefetch, and concurrent traffic cannot change which bytes a token receives,
+and engine preemption re-adds resume the counter from the emitted-token
+count. No preinit or env change is needed — `seeded_prng` is per-request
+constructed by the adapter and always request-valid.
+
+**Read this before claiming "deterministic":**
+
+> **Limitations.** Same seed ⇒ the sampler's random stream, amplified
+> u-values, and token choice *given the logits* are exactly reproducible,
+> independent of server load. However, the current checkpoint
+> (`qwen3.8-27b-prismaaqua`) is a Qwen3.5-architecture hybrid — 48 of its
+> 64 layers are gated-delta-net `linear_attention` layers whose GPU kernels
+> are **not batch-invariant**, and vLLM refuses to start it under
+> `VLLM_BATCH_INVARIANT=1`. The logits for your tokens can therefore still
+> vary with concurrent traffic, so replies at the same seed may differ
+> between runs under load. For a **fully reproducible bitwise replay** you
+> must either (a) run the engine in the Tier-2 replay mode below, or (b)
+> serve a full-attention model with `VLLM_BATCH_INVARIANT=1` (Tier 1 —
+> model-selection criteria in `docs/determinism.md` §5.2). Additional
+> rules: no templated system prompt (`{{...}}` variables), and the software
+> envelope (checkpoint, vLLM/torch/numpy versions, GPU layout) must be
+> pinned across replays.
+
+### Tier-2 replay mode (works with the current hybrid checkpoint)
+
+GPU kernels are run-to-run deterministic *given the batch*; Tier 2 makes
+the batch deterministic instead of making the kernels invariant to it.
+This is a **verification/research mode, not a serving mode** — it fully
+serializes the shared engine, so qthought and other users are paused.
+
+```bash
+# 1) Install the temporary drop-in (ships in this profile) + serialize:
+sudo install -D -m 644 tier2-replay.conf.example \
+    /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+sudo sed -i 's/^SHARED_MAX_NUM_SEQS=.*/SHARED_MAX_NUM_SEQS=1/' /etc/qr-server/qr-server.env
+
+# 2) Quiesce the other engine clients for the session:
+sudo systemctl stop qthought          # and avoid compare panes / other chats
+
+# 3) Restart into replay mode:
+sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
+#    If qr-llm-owui was restarted recently, wait out its boot-probe
+#    watchdog (~30 min of periodic real completions) or restart owui and
+#    wait for its probes to settle before measuring.
+
+# 4) Replay: send the identical deterministic_prng request (same messages,
+#    same qr_seed) N times; all N token streams must be bitwise identical.
+
+# 5) Restore: remove the drop-in, restore SHARED_MAX_NUM_SEQS, restart.
+sudo rm /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
+sudo systemctl start qthought
+```
+
+On a mismatch, triage at the first divergent token using the sampling
+logger's per-token records: `u_value` differs ⇒ entropy-layer bug (report
+it); same `u_value` but different token ⇒ engine-side logits variance
+(batch conditions were not actually identical). Any
+`entropy.request.stateless_row` warning during a replay run invalidates it.
 
 ## Provisioning keys — draw keys on `dragonfly-0`, study keys on the controls
 

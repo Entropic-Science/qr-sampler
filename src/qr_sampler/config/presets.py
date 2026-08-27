@@ -100,6 +100,32 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "top_k": 0,
         "top_p": 1.0,
     },
+    # Deterministic control lane (docs/determinism.md §5.3): a counter-based
+    # per-request PRNG replaces the quantum stream, so bytes are a pure
+    # function of (qr_seed, token index) — reproducible independent of
+    # batching, thread order, and concurrent traffic. Pins the whole
+    # deterministic envelope: stateless zscore_mean amplifier (no
+    # calibration draws), STATIC temperature (stateless ⇒ preemption-proof),
+    # no prefetch, untruncated distribution mirroring normal_t1 so the lane
+    # is a like-for-like control arm. The preset deliberately carries NO
+    # seed — the seed always arrives as its own per-request qr_seed (a
+    # request with this preset and no qr_seed fails validation loudly).
+    # CAVEAT: same seed ⇒ same u sequence and same token GIVEN the logits;
+    # bitwise-identical replies additionally need deterministic logits
+    # (batch-invariant engine or Tier-2 serialized replay — see
+    # profiles/presets/deterministic_prng.yaml and docs/determinism.md §5.5).
+    # NOT scientific lineage; referenced by the plain qr_preset string, so
+    # it does not cross contract.py.
+    "deterministic_prng": {
+        "entropy_source_type": "seeded_prng",
+        "signal_amplifier_type": "zscore_mean",
+        "zscore_calibration_samples": 0,
+        "temperature_strategy": "fixed",
+        "fixed_temperature": 1.0,
+        "entropy_prefetch": False,
+        "top_k": 0,
+        "top_p": 1.0,
+    },
     # Qthought decode lane (qr_sampler.qthought.QthoughtRoller). The grammar
     # makes one full-size entropy fetch per case-frame decision, each reduced to
     # a uniform via the amplifier — same shape as one token-sampling step's

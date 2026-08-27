@@ -96,8 +96,22 @@ def resolve_config(
         A new QRSamplerConfig with overrides applied.
 
     Raises:
-        ConfigValidationError: If any qr_* key is unknown or non-overridable.
+        ConfigValidationError: If any qr_* key is unknown or non-overridable,
+            or if the process defaults carry a seed (per-request only).
     """
+    # The deterministic-lane seed is PER-REQUEST ONLY (docs/determinism.md
+    # §6 T2): a process-level QR_SEED would silently key every concurrent
+    # conversation to one identical stream. Rejected here — the merge below
+    # copies defaults into every request, so this is the single choke point
+    # for process-default provenance (the model validator cannot tell a
+    # default from an override).
+    if defaults.seed is not None:
+        raise ConfigValidationError(
+            "A process-default seed (QR_SEED) is not supported: the "
+            "deterministic lane is opted into per request via qr_seed, so "
+            "identical concurrent conversations never silently collide on "
+            "one stream."
+        )
     extra_args = expand_extra_args(extra_args, defaults)
     if not extra_args:
         return defaults

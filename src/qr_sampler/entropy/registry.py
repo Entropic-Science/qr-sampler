@@ -45,6 +45,7 @@ class EntropySourceRegistry:
         "timing_noise": "qr_sampler.entropy.timing:TimingNoiseSource",
         "openentropy": "qr_sampler.entropy.openentropy:OpenEntropySource",
         "quantum_grpc": "qr_sampler.entropy.qgrpc:QuantumGrpcSource",
+        "seeded_prng": "qr_sampler.entropy.seeded:SeededPrngSource",
     }
 
     _registry: ClassVar[dict[str, type[EntropySource]]] = {}

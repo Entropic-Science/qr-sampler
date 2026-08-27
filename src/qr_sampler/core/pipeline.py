@@ -30,7 +30,7 @@ from qr_sampler.core.types import PrefetchContext, SamplingResult
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.entropy.named import InstanceNamedSource
 from qr_sampler.entropy.registry import EntropySourceRegistry
-from qr_sampler.exceptions import EntropyUnavailableError
+from qr_sampler.exceptions import ConfigValidationError, EntropyUnavailableError
 from qr_sampler.logging.logger import SamplingLogger
 from qr_sampler.logging.types import TokenSamplingRecord
 from qr_sampler.selection.selector import TokenSelector
@@ -155,6 +155,23 @@ def build_entropy_source(config: QRSamplerConfig) -> EntropySource:
         merged.update({key: value for key, value in instance_spec.items() if key != "type"})
         merged["entropy_source_type"] = instance_spec["type"]
         config = QRSamplerConfig.model_validate(merged)
+
+    # The deterministic lane's seeded source is PER-REQUEST ONLY: a
+    # process-level SeededPrngSource shared by all requests would be a
+    # seeded SHARED stream — reproducible in isolation, nondeterministic
+    # under concurrency (docs/determinism.md §3.2.2). The engine adapter
+    # constructs one instance per seeded request; this factory (process
+    # defaults, preinit pipelines, fallback legs) must never build one.
+    # Checked AFTER instance expansion so a declared instance whose
+    # ``type`` is seeded_prng cannot evade it.
+    if config.entropy_source_type == "seeded_prng":
+        raise ConfigValidationError(
+            "entropy_source_type='seeded_prng' cannot be built as a "
+            "process-level source (a shared seeded stream is "
+            "nondeterministic under concurrency). It is constructed "
+            "per-request by the engine adapter when qr_seed is supplied — "
+            "use the 'deterministic_prng' preset."
+        )
 
     source_cls = EntropySourceRegistry.get(config.entropy_source_type)
 
@@ -291,6 +308,7 @@ class SamplingPipeline:
         config_hash_str: str | None = None,
         prefetch_ctx: PrefetchContext | None = None,
         build_onehot: bool = True,
+        entropy_source: EntropySource | None = None,
     ) -> SamplingResult:
         """Sample a single token from a 1-D logit array.
 
@@ -314,6 +332,15 @@ class SamplingPipeline:
                 adapters that write the one-hot directly into their own
                 tensors pass ``False`` to avoid a vocab-size allocation +
                 fill per token.
+            entropy_source: Per-request entropy source override (``None``
+                = use the pipeline's source). Carries the deterministic
+                lane's per-request ``SeededPrngSource`` (mirroring the
+                config/amplifier/strategy override pattern), so a seeded
+                request rides the DEFAULT pipeline while every fetch in
+                this call goes to its own keyed source. An override is
+                never the pipeline's ``FallbackEntropySource``, so the
+                fallback-detection bookkeeping below is naturally inert
+                for it.
 
         Returns:
             SamplingResult with ``token_id``, optional ``one_hot`` numpy
@@ -325,6 +352,7 @@ class SamplingPipeline:
         active_config = config if config is not None else self._config
         active_amplifier = amplifier if amplifier is not None else self._amplifier
         active_strategy = strategy if strategy is not None else self._strategy
+        active_source = entropy_source if entropy_source is not None else self._entropy_source
         hash_str = config_hash_str if config_hash_str is not None else self._default_config_hash
 
         # --- 1. Compute temperature ---
@@ -342,7 +370,7 @@ class SamplingPipeline:
         # the uniform u directly, so stages 2-3 collapse into the fetch).
         t_fetch_start = time.perf_counter_ns()
         entropy_is_fallback = False
-        entropy_source_name = self._entropy_source.name
+        entropy_source_name = active_source.name
         ticket = prefetch_ctx.ticket if prefetch_ctx is not None else None
 
         draw_mode = bool(getattr(active_amplifier, "requires_server_draw", False))
@@ -352,7 +380,7 @@ class SamplingPipeline:
 
         if draw_mode:
             try:
-                u_value, draw_meta = self._entropy_source.get_draw(
+                u_value, draw_meta = active_source.get_draw(
                     active_config.draw_block_bytes,
                     active_config.draw_source_id,
                     ticket,
@@ -366,21 +394,21 @@ class SamplingPipeline:
                 # coherence-gate strategy clears its stored evidence and
                 # holds exactly T_base — a dead PurityService yields a
                 # boring base-temperature model, never a fabricated signal.
-                raw_bytes = self._entropy_source.get_random_bytes(active_config.sample_count)
+                raw_bytes = active_source.get_random_bytes(active_config.sample_count)
         elif ticket is not None:
-            raw_bytes = self._entropy_source.get_random_bytes_with_ticket(
+            raw_bytes = active_source.get_random_bytes_with_ticket(
                 active_config.sample_count, ticket
             )
         else:
-            raw_bytes = self._entropy_source.get_random_bytes(active_config.sample_count)
+            raw_bytes = active_source.get_random_bytes(active_config.sample_count)
 
         # Detect if fallback was used (byte fetches only — the wrapper's
         # bookkeeping means "who provided BYTES"; draws are primary-only).
-        if raw_bytes is not None and isinstance(self._entropy_source, FallbackEntropySource):
-            entropy_source_name = self._entropy_source.last_source_used
-            entropy_is_fallback = (
-                self._entropy_source.last_source_used != self._entropy_source.primary_name
-            )
+        # A per-request override (deterministic lane) is never a
+        # FallbackEntropySource, so this guard is inert for it.
+        if raw_bytes is not None and isinstance(active_source, FallbackEntropySource):
+            entropy_source_name = active_source.last_source_used
+            entropy_is_fallback = active_source.last_source_used != active_source.primary_name
         if draw_mode and raw_bytes is not None:
             # The draw itself failed: this token is degraded regardless of
             # which source ultimately provided the substitute bytes.
@@ -460,13 +488,13 @@ class SamplingPipeline:
                 # a degraded token: prefetch_draw never raises, and the next
                 # token then retries the draw path (serially if this yields
                 # None), so recovery is automatic.
-                next_ticket = self._entropy_source.prefetch_draw(
+                next_ticket = active_source.prefetch_draw(
                     active_config.draw_block_bytes,
                     active_config.draw_source_id,
                     next_nonce,
                 )
             else:
-                next_ticket = self._entropy_source.prefetch(active_config.sample_count, next_nonce)
+                next_ticket = active_source.prefetch(active_config.sample_count, next_nonce)
 
         # --- 6. Build one-hot numpy array (optional) ---
         one_hot: np.ndarray | None = None
