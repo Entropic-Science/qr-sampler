@@ -153,6 +153,30 @@ class TestSeedOverrideUpdateState:
             # anything else reaches the client as an opaque 500.
             assert isinstance(excinfo.value, ValueError)
 
+    def test_validate_params_mirrors_worker_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """API-side dry-run and worker-side resolution MUST agree on the
+        defaults they merge over. With QR_PRESET=qthought_think (the live
+        deployment), the process defaults carry the server amplifier —
+        a seeded envelope that does not pin its amplifier must be
+        rejected HERE (clean 400), not first in the engine worker (the
+        2026-08-27 live incident: silent native-bypass degradation)."""
+        from qr_sampler.exceptions import ConfigValidationError
+
+        monkeypatch.setenv("QR_PRESET", "qthought_think")
+        no_amp_pin = {
+            "qr_preset": "normal_t1",
+            "qr_seed": 7,
+            "qr_entropy_source_type": "seeded_prng",
+            "qr_entropy_prefetch": False,
+            "qr_zscore_calibration_samples": 0,
+        }
+        with pytest.raises(ConfigValidationError, match="stateless amplifier"):
+            VLLMAdapter.validate_params(MockSamplingParams(extra_args=no_amp_pin))
+        # The full envelope (amplifier pinned) passes over the same defaults.
+        VLLMAdapter.validate_params(
+            MockSamplingParams(extra_args={**no_amp_pin, "qr_signal_amplifier_type": "zscore_mean"})
+        )
+
     def test_update_state_never_raises_on_bad_config(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

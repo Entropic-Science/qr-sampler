@@ -846,36 +846,55 @@ class TestDeterministicLaneValidation:
         with pytest.raises(ConfigValidationError, match="seed"):
             resolve_config(default_config, {"qr_entropy_source_type": "seeded_prng"})
 
-    def test_seeded_envelope_composes_with_any_chat_preset(
-        self, default_config: QRSamplerConfig
-    ) -> None:
+    def test_seeded_envelope_composes_with_any_chat_preset(self) -> None:
         """The seeded entropy is an AXIS, not a sampling method: callers
         (the owui compare proxy) ride the deterministic envelope on top of
         any chat preset via FR-10 caller-wins keys — full stochastic
-        sampling under the chosen strategy, with reproducible draws. The
-        stateful creative strategy warns (preemption caveat) but resolves."""
+        sampling under the chosen strategy, with reproducible draws.
+
+        Deliberately tested over DEPLOYMENT-SHAPED defaults (the env
+        preset qthought_think pre-expanded, as the engine adapter builds
+        them): those defaults carry signal_amplifier_type='server' and
+        the coherence gate, so the envelope MUST pin the amplifier or a
+        preset that does not pin its own (creative/normal) inherits the
+        server amplifier and fails validation — the exact live incident
+        of 2026-08-27. The stateful creative strategy warns (preemption
+        caveat) but resolves."""
         import warnings as _warnings
 
+        deployment_defaults = resolve_config(
+            QRSamplerConfig(preset="qthought_think", _env_file=None),  # type: ignore[call-arg]
+            None,
+        ).model_copy(update={"preset": ""})
+        assert deployment_defaults.signal_amplifier_type == "server"  # the trap
+
+        envelope = {
+            "qr_seed": 7,
+            "qr_entropy_source_type": "seeded_prng",
+            "qr_signal_amplifier_type": "zscore_mean",
+            "qr_entropy_prefetch": False,
+            "qr_zscore_calibration_samples": 0,
+        }
         for preset, strategy in (
             ("creative_sampling", "hvh_drift"),
             ("normal_t1", "fixed"),
             ("chat_light", "fixed"),
         ):
-            extra = {
-                "qr_preset": preset,
-                "qr_seed": 7,
-                "qr_entropy_source_type": "seeded_prng",
-                "qr_entropy_prefetch": False,
-                "qr_zscore_calibration_samples": 0,
-            }
             with _warnings.catch_warnings():
                 _warnings.simplefilter("ignore")  # hvh_drift's preemption warning
-                resolved = resolve_config(default_config, extra)
+                resolved = resolve_config(deployment_defaults, {"qr_preset": preset, **envelope})
             assert resolved.seed == 7, preset
             assert resolved.entropy_source_type == "seeded_prng", preset
-            # The preset's SAMPLING side is untouched by the envelope —
-            # chat_light's own entropy pin is the one caller-overridden key.
+            assert resolved.signal_amplifier_type == "zscore_mean", preset
+            # The preset's SAMPLING side is untouched by the envelope.
             assert resolved.temperature_strategy == strategy, preset
+
+        # Without the amplifier pin, presets that do not pin their own
+        # amplifier inherit 'server' from the defaults and must fail —
+        # loudly documenting why the pin is part of the recipe.
+        partial = {k: v for k, v in envelope.items() if k != "qr_signal_amplifier_type"}
+        with pytest.raises(ConfigValidationError, match="stateless amplifier"):
+            resolve_config(deployment_defaults, {"qr_preset": "normal_t1", **partial})
 
     def test_seeded_prng_instance_type_rejected(self) -> None:
         """A QR_ENTROPY_SOURCE_INSTANCES declaration cannot smuggle in a

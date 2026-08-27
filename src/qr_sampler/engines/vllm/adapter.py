@@ -89,6 +89,27 @@ _DEFAULT_PREINIT = "quantum_grpc,system"
 # lives on ``QRSamplerConfig.entropy_source_instances``.
 _INSTANCES_ENV_VAR = "QR_ENTROPY_SOURCE_INSTANCES"
 
+
+def _process_default_config() -> QRSamplerConfig:
+    """Build the PROCESS-default config exactly as the engine worker does.
+
+    ``QR_PRESET`` (and any ``QR_*`` env) is expanded into the defaults —
+    e.g. ``QR_PRESET=qthought_think`` bakes ``signal_amplifier_type=server``
+    and the coherence gate into the merge base every per-request
+    ``resolve_config`` runs over — and the ``preset`` field is then cleared
+    so per-request resolution does not re-expand it. Shared by the
+    adapter's ``__init__`` AND ``validate_params``'s dry-run: the two MUST
+    agree, or the API server accepts request shapes the engine worker then
+    rejects (observed live: a seeded request over a preset that does not
+    pin the amplifier merged the deployment's ``server`` default and was
+    rejected only in the worker, silently degrading to native sampling).
+    """
+    defaults = resolve_config(QRSamplerConfig(), None)
+    if defaults.preset:
+        defaults = defaults.model_copy(update={"preset": ""})
+    return defaults
+
+
 # Sources constructed PER REQUEST by this adapter rather than pre-initialised
 # as pipelines. Always allowed through ``validate_params`` regardless of the
 # env-derived preinit list — they have no preinit entry by design (a
@@ -272,11 +293,10 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # in Qbert" migrate is switched on for serving: ``QR_PRESET=qthought_purity``
         # makes every token one server-integrated draw (``signal_amplifier_type
         # =server`` + ``draw_block_bytes``), the amplification having moved
-        # server-side — the client just draws. The ``preset`` field is then
-        # cleared so the per-request ``resolve_config`` does not re-expand it.
-        self._default_config = resolve_config(QRSamplerConfig(), None)
-        if self._default_config.preset:
-            self._default_config = self._default_config.model_copy(update={"preset": ""})
+        # server-side — the client just draws. Built by the same helper
+        # validate_params dry-runs against, so API-side acceptance and
+        # worker-side resolution can never disagree.
+        self._default_config = _process_default_config()
 
         # --- Pre-initialise one pipeline per allowed entropy source ---
         # The default source from QR_ENTROPY_SOURCE_TYPE is always included
@@ -569,7 +589,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                         f"{_INSTANCES_ENV_VAR} at process startup to include it."
                     )
             try:
-                defaults = QRSamplerConfig()
+                defaults = _process_default_config()
             except Exception:  # Intentional breadth: a broken process env
                 # (e.g. malformed QR_ENTROPY_SOURCE_INSTANCES JSON) is not
                 # this request's fault — the engine itself refuses to start

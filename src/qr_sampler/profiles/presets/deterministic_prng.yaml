@@ -7,9 +7,12 @@ description: |
   reproducible draws -- NOT greedy/argmax decoding; the sampling math
   is identical to normal_t1, only the randomness is keyed. (The seeded
   entropy also composes with ANY other sampling preset: ride
-  qr_seed + qr_entropy_source_type=seeded_prng + qr_entropy_prefetch=0
+  qr_seed + qr_entropy_source_type=seeded_prng
+  + qr_signal_amplifier_type=zscore_mean + qr_entropy_prefetch=0
   + qr_zscore_calibration_samples=0 alongside qr_preset=<any> --
-  caller keys win over preset keys, FR-10.) Reproducible independent
+  caller keys win over preset keys, FR-10; the amplifier pin matters
+  because per-request merges run over the deployment's preset-expanded
+  process defaults, which may carry the server amplifier.) Reproducible independent
   of batching,
   row-thread scheduling, prefetch timing, and concurrent traffic
   (docs/determinism.md, the batch-invariance idea applied to the RNG
