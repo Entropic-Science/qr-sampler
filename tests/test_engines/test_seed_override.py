@@ -146,8 +146,12 @@ class TestSeedOverrideUpdateState:
             {"qr_preset": "deterministic_prng", "qr_seed": 1, "qr_bypass": True},
         ]
         for extra in bad_shapes:
-            with pytest.raises(ConfigValidationError):
+            with pytest.raises(ConfigValidationError) as excinfo:
                 VLLMAdapter.validate_params(MockSamplingParams(extra_args=extra))
+            # The boundary raise must ALSO be a ValueError: that is what
+            # vLLM's OpenAI server maps to a clean per-request 400 —
+            # anything else reaches the client as an opaque 500.
+            assert isinstance(excinfo.value, ValueError)
 
     def test_update_state_never_raises_on_bad_config(
         self, caplog: pytest.LogCaptureFixture

@@ -44,7 +44,7 @@ from qr_sampler.core.types import PrefetchContext
 from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.engines.vllm.telemetry import _PerfAggregator
 from qr_sampler.entropy.seeded import SeededPrngSource
-from qr_sampler.exceptions import ConfigValidationError
+from qr_sampler.exceptions import ConfigValidationError, RequestRejectedError
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 # Formal V1 LogitsProcessor base.
@@ -549,38 +549,41 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         extra_args = getattr(params, "extra_args", None) or {}
         if not extra_args:
             return
-        validate_extra_args(extra_args)
-        requested = extra_args.get("qr_entropy_source_type")
-        if isinstance(requested, str):
-            allowed = _allowed_source_names(
-                os.environ.get(_PREINIT_ENV_VAR, _DEFAULT_PREINIT),
-                os.environ.get(_INSTANCES_ENV_VAR, ""),
-                os.environ.get(
-                    "QR_ENTROPY_SOURCE_TYPE",
-                    str(QRSamplerConfig.model_fields["entropy_source_type"].default),
-                ),
-            )
-            if requested not in allowed:
-                raise ConfigValidationError(
-                    f"Entropy source {requested!r} is not pre-initialised for "
-                    f"this deployment. Pre-initialised sources: "
-                    f"{sorted(allowed)}. Set {_PREINIT_ENV_VAR} / "
-                    f"{_INSTANCES_ENV_VAR} at process startup to include it."
+        try:
+            validate_extra_args(extra_args)
+            requested = extra_args.get("qr_entropy_source_type")
+            if isinstance(requested, str):
+                allowed = _allowed_source_names(
+                    os.environ.get(_PREINIT_ENV_VAR, _DEFAULT_PREINIT),
+                    os.environ.get(_INSTANCES_ENV_VAR, ""),
+                    os.environ.get(
+                        "QR_ENTROPY_SOURCE_TYPE",
+                        str(QRSamplerConfig.model_fields["entropy_source_type"].default),
+                    ),
                 )
-        try:
-            defaults = QRSamplerConfig()
-        except Exception:  # Intentional breadth: a broken process env
-            # (e.g. malformed QR_ENTROPY_SOURCE_INSTANCES JSON) is not this
-            # request's fault — the engine itself refuses to start on it,
-            # so the dry-run is skipped rather than failing every request
-            # here (mirrors _allowed_source_names' malformed-JSON tolerance).
-            return
-        try:
+                if requested not in allowed:
+                    raise ConfigValidationError(
+                        f"Entropy source {requested!r} is not pre-initialised for "
+                        f"this deployment. Pre-initialised sources: "
+                        f"{sorted(allowed)}. Set {_PREINIT_ENV_VAR} / "
+                        f"{_INSTANCES_ENV_VAR} at process startup to include it."
+                    )
+            try:
+                defaults = QRSamplerConfig()
+            except Exception:  # Intentional breadth: a broken process env
+                # (e.g. malformed QR_ENTROPY_SOURCE_INSTANCES JSON) is not
+                # this request's fault — the engine itself refuses to start
+                # on it, so the dry-run is skipped rather than failing every
+                # request (mirrors _allowed_source_names' JSON tolerance).
+                return
             resolve_config(defaults, extra_args)
-        except PydanticValidationError as err:
-            # Normalise to the config-surface exception type so callers
-            # see one rejection shape for keys, names, and values alike.
-            raise ConfigValidationError(str(err)) from err
+        except (ConfigValidationError, PydanticValidationError) as err:
+            # Re-raise as the vLLM-boundary type: RequestRejectedError is
+            # also a ValueError, which vLLM's OpenAI server maps to a clean
+            # per-request 400 — a plain ConfigValidationError (or pydantic
+            # ValidationError surfaced through settings machinery) would
+            # reach the client as an opaque 500 InternalServerError.
+            raise RequestRejectedError(str(err)) from err
 
     def update_state(self, batch_update: Any | None) -> None:
         """Process batch composition changes.
