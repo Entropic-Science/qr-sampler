@@ -824,3 +824,33 @@ class TestDeterministicLaneValidation:
         relabel a QRNG lane."""
         with pytest.raises(ConfigValidationError, match="seeded_prng"):
             resolve_config(default_config, {"qr_seed": 42})
+
+    def test_explicit_source_override_cannot_defeat_the_preset_pairing(
+        self, default_config: QRSamplerConfig
+    ) -> None:
+        """Caller keys WIN over preset keys (FR-10), so an explicit
+        qr_entropy_source_type riding alongside the deterministic preset
+        would strip the seeded source while keeping the seed — the
+        cross-field rule must catch the merged result through the
+        resolve path, not just direct construction."""
+        with pytest.raises(ConfigValidationError, match="seeded_prng"):
+            resolve_config(
+                default_config,
+                {
+                    "qr_preset": "deterministic_prng",
+                    "qr_seed": 1,
+                    "qr_entropy_source_type": "system",
+                },
+            )
+        # And symmetrically: the keyed source demanded without a key.
+        with pytest.raises(ConfigValidationError, match="seed"):
+            resolve_config(default_config, {"qr_entropy_source_type": "seeded_prng"})
+
+    def test_seeded_prng_instance_type_rejected(self) -> None:
+        """A QR_ENTROPY_SOURCE_INSTANCES declaration cannot smuggle in a
+        process-level seeded stream; the rejection names the env var."""
+        with pytest.raises(ConfigValidationError, match="QR_ENTROPY_SOURCE_INSTANCES"):
+            QRSamplerConfig(
+                entropy_source_instances={"det_lane": {"type": "seeded_prng"}},
+                _env_file=None,  # type: ignore[call-arg]
+            )

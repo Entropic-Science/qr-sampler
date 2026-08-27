@@ -30,6 +30,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from pydantic import ValidationError as PydanticValidationError
 
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig, resolve_config, validate_extra_args
@@ -144,11 +145,14 @@ class _RequestState:
             ``entropy.request.completed`` event so an operator can spot
             "Modal Succeeded but 0 tokens" failure modes (K-5) from the
             log stream alone.
-        dominant_source_name: Snapshot of ``pipeline.entropy_source.name``
-            at routing time. For the always-primary case this is the
-            actual source used; if a future change switches sources
-            mid-request, this becomes the routing-time hint and the
-            completion event should record the observed dominant.
+        dominant_source_name: Snapshot of the RESOLVED source's name at
+            routing time — the entropy override's name when one is
+            present (deterministic lane), else
+            ``pipeline.entropy_source.name``. For the always-primary
+            case this is the actual source used; if a future change
+            switches sources mid-request, this becomes the routing-time
+            hint and the completion event should record the observed
+            dominant.
         prefetch_salt: Per-request random salt for commitment-nonce
             derivation (commit-then-fetch entropy pipelining).
         entropy_ticket: In-flight prefetch ticket for this request's next
@@ -160,6 +164,14 @@ class _RequestState:
             request, keyed by ``config.seed``); passed through to
             ``sample_token(entropy_source=...)`` so the request rides the
             default pipeline but fetches from its own keyed source.
+        output_tok_ids: The request's LIVE emitted-token list (the
+            ``BatchUpdate`` contract guarantees added requests hand the
+            adapter a reference that always reflects the latest tokens),
+            or ``None`` when the added shape did not carry one. Used to
+            re-sync the seeded source's counter to the token POSITION
+            before every draw — vLLM samples-then-discards
+            partial-prefill rows, so a consumed-order counter would
+            drift under load (see ``SeededPrngSource.set_step``).
     """
 
     __slots__ = (
@@ -169,6 +181,7 @@ class _RequestState:
         "dominant_source_name",
         "entropy_override",
         "entropy_ticket",
+        "output_tok_ids",
         "pipeline",
         "prefetch_salt",
         "source",
@@ -184,6 +197,7 @@ class _RequestState:
         strategy: TemperatureStrategy,
         config_hash_str: str,
         entropy_override: SeededPrngSource | None = None,
+        output_tok_ids: list[int] | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.config = config
@@ -191,6 +205,7 @@ class _RequestState:
         self.strategy = strategy
         self.config_hash_str = config_hash_str
         self.entropy_override = entropy_override
+        self.output_tok_ids = output_tok_ids
         self.source = entropy_override if entropy_override is not None else pipeline.entropy_source
         self.tokens_generated = 0
         self.dominant_source_name = self.source.name
@@ -515,8 +530,21 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         instance names). This runs in the API-server process, so an unknown
         name becomes a clean per-request rejection instead of an engine-worker
         raise (AUDIT.md A-1). Preset-expanded source types are not re-checked
-        here (builtin presets only ever set ``quantum_grpc``); the
-        ``update_state`` lookup remains the authoritative guard.
+        here (builtin presets only ever set ``quantum_grpc`` or, for the
+        deterministic lane, the always-allowed per-request-only
+        ``seeded_prng``); the ``update_state`` lookup remains the
+        authoritative guard.
+
+        Finally the FULL per-request resolution is dry-run here:
+        ``validate_extra_args`` checks key names only, so every
+        value-level and cross-field rejection (seed bounds, the
+        deterministic-lane envelope pairing, numeric coercions) would
+        otherwise first fire inside the engine worker's ``update_state``
+        — where an uncaught raise kills the whole shared engine
+        (EngineDeadError; GL-01 / AUDIT A-1, the same threat model as
+        the source-name allowlist above). The defaults are reconstructed
+        from env exactly as the engine worker builds its own; the cost
+        is per request-add, not per token.
         """
         extra_args = getattr(params, "extra_args", None) or {}
         if not extra_args:
@@ -539,6 +567,20 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                     f"{sorted(allowed)}. Set {_PREINIT_ENV_VAR} / "
                     f"{_INSTANCES_ENV_VAR} at process startup to include it."
                 )
+        try:
+            defaults = QRSamplerConfig()
+        except Exception:  # Intentional breadth: a broken process env
+            # (e.g. malformed QR_ENTROPY_SOURCE_INSTANCES JSON) is not this
+            # request's fault — the engine itself refuses to start on it,
+            # so the dry-run is skipped rather than failing every request
+            # here (mirrors _allowed_source_names' malformed-JSON tolerance).
+            return
+        try:
+            resolve_config(defaults, extra_args)
+        except PydanticValidationError as err:
+            # Normalise to the config-surface exception type so callers
+            # see one rejection shape for keys, names, and values alike.
+            raise ConfigValidationError(str(err)) from err
 
     def update_state(self, batch_update: Any | None) -> None:
         """Process batch composition changes.
@@ -660,8 +702,31 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
 
             extra_args = getattr(params, "extra_args", None) or {}
 
-            # Resolve per-request config.
-            req_config = resolve_config(self._default_config, extra_args)
+            # Resolve per-request config. Defense in depth: validate_params
+            # already dry-runs this exact resolution in the API-server
+            # process, so a raise here means a request reached the engine
+            # WITHOUT that validation (direct engine embedding, ABI drift).
+            # It must never escape — an uncaught raise in update_state
+            # kills the whole shared engine (EngineDeadError; GL-01/A-1).
+            # The request degrades to a LOUD native-sampler bypass: wrong
+            # lane semantics for one request beats engine death for all.
+            try:
+                req_config = resolve_config(self._default_config, extra_args)
+            except (ConfigValidationError, PydanticValidationError) as err:
+                logger.error(
+                    "request %d: per-request config REJECTED in update_state "
+                    "(should have been rejected API-side by validate_params); "
+                    "degrading this request to native-sampler bypass: %s",
+                    req_idx,
+                    err,
+                    extra={
+                        "event": "entropy.request.rejected_config",
+                        "req_idx": req_idx,
+                        "extra_args_keys": sorted(extra_args.keys()),
+                    },
+                )
+                self._request_states[req_idx] = _BypassState()
+                continue
 
             # Bypass wins over everything else in extra_args: no pipeline
             # routing (so an un-preinit'd source name cannot raise in the
@@ -696,7 +761,11 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             entropy_override: SeededPrngSource | None = None
             if req_config.seed is not None:
                 # The model validator pinned entropy_source_type to
-                # "seeded_prng" whenever seed is set.
+                # "seeded_prng" whenever seed is set. initial_step covers
+                # shapes with no live token list; when the list IS live
+                # (production tuple ABI), _sample_row re-syncs the step to
+                # len(output_tok_ids) before every draw, which also makes
+                # this resume line redundant-but-consistent.
                 entropy_override = SeededPrngSource(
                     seed=req_config.seed,
                     initial_step=len(output_tok_ids or []),
@@ -747,6 +816,9 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 strategy=strategy,
                 config_hash_str=hash_str,
                 entropy_override=entropy_override,
+                # Keep the LIVE list reference (BatchUpdate contract), not a
+                # copy — _sample_row reads its current length per draw.
+                output_tok_ids=output_tok_ids if isinstance(output_tok_ids, list) else None,
             )
             self._request_states[req_idx] = state
 
@@ -968,16 +1040,32 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             # the process-default pipeline keeps the engine alive, but the
             # text would be attributed to the caller's requested config —
             # a silent-misconfig channel. In healthy operation this fires
-            # zero times, so it is loud on purpose.
-            logger.warning(
+            # zero times, so it is loud on purpose. ERROR (not WARNING):
+            # if the lost state belonged to a deterministic (seeded)
+            # request, this token was silently drawn from the QRNG default
+            # — the determinism guarantee fails invisibly to the caller
+            # (the adapter cannot know here what the lost state promised;
+            # docs/determinism.md footgun #5). Any occurrence during a
+            # replay/verification run invalidates that run.
+            logger.error(
                 "row %d sampled with NO per-request state — routing to the "
-                "process-default pipeline; the caller's qr_* args are NOT in "
-                "effect for this token",
+                "process-default pipeline; the caller's qr_* args (including "
+                "any deterministic-lane seed) are NOT in effect for this "
+                "token",
                 i,
                 extra={"event": "entropy.request.stateless_row", "req_idx": i},
             )
         prefetch_ctx: PrefetchContext | None = None
         if state is not None:
+            if state.entropy_override is not None and state.output_tok_ids is not None:
+                # Re-sync the seeded counter to the TOKEN POSITION before
+                # the draw: vLLM samples-then-discards partial-prefill
+                # rows (its own generators get rewound by 4 for them), so
+                # a consumed-order counter drifts under load. With the
+                # position sync, a discarded row draws the SAME block as
+                # the real next token — a pure function of position can
+                # safely be evaluated twice.
+                state.entropy_override.set_step(len(state.output_tok_ids))
             pipeline = state.pipeline
             req_config: QRSamplerConfig | None = state.config
             amplifier: SignalAmplifier | None = state.amplifier

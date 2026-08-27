@@ -5,15 +5,34 @@
 # restart afterwards. This fully serializes the shared engine — qthought
 # and every other engine client are effectively paused while it is active.
 #
-# Install:
+# Install AS "zz-tier2-replay.conf" — the name matters: systemd applies
+# drop-ins in lexical order and the box's standing "box.conf" drop-in also
+# overrides ExecStart; "zz-" sorts after it so THIS ExecStart wins
+# ("99-..." would sort BEFORE "box.conf" and silently lose).
+#
 #   sudo install -D -m 644 tier2-replay.conf.example \
-#       /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+#       /etc/systemd/system/qr-sampler-vllm.service.d/zz-tier2-replay.conf
 #   # also set SHARED_MAX_NUM_SEQS=1 in /etc/qr-server/qr-server.env
 #   sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
+#   # VERIFY the effective env — /etc/qr-server/qr-server.env is an
+#   # EnvironmentFile and systemd gives EnvironmentFile= precedence over
+#   # the Environment= lines below, so any same-named var there (e.g. an
+#   # uncommented QR_APPLY_PARALLEL_ROWS) silently wins. Check with:
+#   #   systemctl show qr-sampler-vllm -p Environment
 #
 # Remove:
-#   sudo rm /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+#   sudo rm /etc/systemd/system/qr-sampler-vllm.service.d/zz-tier2-replay.conf
 #   # restore SHARED_MAX_NUM_SEQS, then daemon-reload + restart
+#
+# Client-side prerequisite: owui attaches a non-zero "priority" field to
+# chat AND compare-pane requests whenever QR_CHAT_PRIORITY is set in
+# /etc/qr-llm-owui/qr-llm-owui.env (it is an OWUI-side variable — setting
+# it in THIS unit would do nothing). --scheduling-policy priority is
+# therefore KEPT below: with clients quiesced and max-num-seqs=1,
+# priority scheduling is trivially deterministic, while dropping it would
+# make every owui request error ("priority other than 0 ... does not use
+# priority scheduling"). To replay through owui, leave QR_CHAT_PRIORITY
+# alone; to replay via direct curl to :8000, either works.
 #
 # What each line pins (verdict codes reference docs/determinism.md §3):
 #   OMP/OPENBLAS single-thread — the entropy/varentropy helpers' BLAS dot
@@ -21,21 +40,24 @@
 #   QR_APPLY_PARALLEL_ROWS=1 — single-threaded row loop (moot at batch=1,
 #     pinned for provenance).
 #   QR_ENTROPY_PREFETCH=0 — no redeem-miss byte reshuffling (B3).
+#   --no-enable-prefix-caching — no history-dependence via cached KV (A4).
+#   --max-num-batched-tokens 32768 — prefill never chunks (chunk layout
+#     changes reduction order on non-invariant kernels, A3) and the value
+#     stops riding a vLLM-version-dependent default across record/replay.
 #   VLLM_PP_LAYER_PARTITION stays whatever the box drop-in already sets —
 #     changing it between record and replay changes the envelope.
 #
-# NOTE: --no-enable-prefix-caching must ride ExecStart, so this drop-in
-# re-declares it. Keep the flags below in sync with the profile unit's
-# ExecStart (systemd drop-ins replace ExecStart wholesale, hence the
-# empty ExecStart= line first).
+# NOTE: systemd drop-ins replace ExecStart wholesale (hence the empty
+# ExecStart= line first). The flags below mirror the LIVE box unit
+# (box.conf) as of 2026-08; before installing, diff them against
+# `systemctl cat qr-sampler-vllm` and carry over any drift — a replay
+# under different engine flags is a different envelope, not a replay.
 
 [Service]
 Environment=OMP_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=QR_APPLY_PARALLEL_ROWS=1
 Environment=QR_ENTROPY_PREFETCH=0
-# Uniform priority: admission order must not depend on QR_CHAT_PRIORITY.
-Environment=QR_CHAT_PRIORITY=
 
 ExecStart=
 ExecStart=/opt/vllm-venv/bin/vllm serve ${SHARED_MODEL_PATH} \
@@ -43,6 +65,8 @@ ExecStart=/opt/vllm-venv/bin/vllm serve ${SHARED_MODEL_PATH} \
     --served-model-name ${SHARED_MODEL_NAME} \
     --host 127.0.0.1 --port 8000 \
     --max-num-seqs ${SHARED_MAX_NUM_SEQS} \
+    --max-num-batched-tokens 32768 \
+    --scheduling-policy priority \
     --no-enable-prefix-caching \
     --middleware qr_sampler.engines.vllm.health.entropy_health_middleware \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \

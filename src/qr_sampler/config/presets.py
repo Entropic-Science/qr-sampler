@@ -106,10 +106,15 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # batching, thread order, and concurrent traffic. Pins the whole
     # deterministic envelope: stateless zscore_mean amplifier (no
     # calibration draws), STATIC temperature (stateless ⇒ preemption-proof),
-    # no prefetch, untruncated distribution mirroring normal_t1 so the lane
-    # is a like-for-like control arm. The preset deliberately carries NO
-    # seed — the seed always arrives as its own per-request qr_seed (a
-    # request with this preset and no qr_seed fails validation loudly).
+    # no prefetch, and a FULLY untruncated distribution: top_k/top_p AND
+    # min_p_base/truncate_first are pinned explicitly so an env-level
+    # QR_MIN_P_BASE / QR_TRUNCATE_FIRST cannot silently truncate or reorder
+    # a lane documented as untruncated (normal_t1 pins only top_k/top_p and
+    # inherits those env knobs — deliberate difference: this lane's whole
+    # envelope must resolve identically on every deployment). The preset
+    # deliberately carries NO seed — the seed always arrives as its own
+    # per-request qr_seed (a request with this preset and no qr_seed fails
+    # validation loudly).
     # CAVEAT: same seed ⇒ same u sequence and same token GIVEN the logits;
     # bitwise-identical replies additionally need deterministic logits
     # (batch-invariant engine or Tier-2 serialized replay — see
@@ -125,6 +130,8 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "entropy_prefetch": False,
         "top_k": 0,
         "top_p": 1.0,
+        "min_p_base": 0.0,
+        "truncate_first": False,
     },
     # Qthought decode lane (qr_sampler.qthought.QthoughtRoller). The grammar
     # makes one full-size entropy fetch per case-frame decision, each reduced to

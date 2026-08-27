@@ -104,14 +104,18 @@ curl -s http://127.0.0.1:8000/health/entropy     # quantum lane healthy
 Then smoke-test the lanes before calling it done: one qthought REFLECT turn
 (the `propose_speech` tool call must parse — this is the `qwen3_xml`
 regression canary), one owui `chat_light` chat, and two identical
-`deterministic_prng` requests (same `qr_seed`) sent **back-to-back with no
-other traffic** — identical outputs confirm the deterministic lane survived
-the model swap. Note the qualifier: on this checkpoint the engine kernels
-are NOT batch-invariant, so byte-identical replies are only guaranteed when
-the requests run under identical batch conditions (solo back-to-back
-requests, or the Tier-2 replay mode below); a mismatch under concurrent
-load is expected physics, not a regression. Rollback is step 2 in reverse:
-point `SHARED_MODEL_PATH` back at the previous checkpoint dir and restart.
+`deterministic_prng` requests (same `qr_seed`). For the deterministic pair,
+compare the **per-token `u_value` records** from the sampling logger, not
+the reply bytes: the u-sequence is what the lane guarantees under load, and
+it must match exactly. Reply BYTES matching additionally requires identical
+batch conditions, which a fresh post-restart box does not offer — the owui
+boot-probe watchdog fires real completions for up to ~30 min after an owui
+restart, and normal serving keeps prefix caching on, so the second request
+is a maximal cache-hit whose logits can legitimately differ at the last ulp
+on non-batch-invariant kernels. Byte-identical replies are the Tier-2
+replay mode's claim (below), not this smoke test's. Rollback is step 2 in
+reverse: point `SHARED_MODEL_PATH` back at the previous checkpoint dir and
+restart.
 
 ## The `dfqrng` kernel driver — kernel upgrades WILL break it unless DKMS'd
 
@@ -269,16 +273,25 @@ This is a **verification/research mode, not a serving mode** — it fully
 serializes the shared engine, so qthought and other users are paused.
 
 ```bash
-# 1) Install the temporary drop-in (ships in this profile) + serialize:
+# 1) Install the temporary drop-in (ships in this profile) + serialize.
+#    The zz- name is load-bearing: drop-ins apply in lexical order and the
+#    box's standing box.conf also overrides ExecStart — zz- sorts after it.
 sudo install -D -m 644 tier2-replay.conf.example \
-    /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+    /etc/systemd/system/qr-sampler-vllm.service.d/zz-tier2-replay.conf
 sudo sed -i 's/^SHARED_MAX_NUM_SEQS=.*/SHARED_MAX_NUM_SEQS=1/' /etc/qr-server/qr-server.env
 
 # 2) Quiesce the other engine clients for the session:
 sudo systemctl stop qthought          # and avoid compare panes / other chats
+#    owui may stay up (its QR_CHAT_PRIORITY is fine — the drop-in keeps
+#    --scheduling-policy priority precisely so owui requests still work),
+#    but no one else should chat during the replay window.
 
-# 3) Restart into replay mode:
+# 3) Restart into replay mode + verify the effective environment:
 sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
+systemctl show qr-sampler-vllm -p Environment   # EnvironmentFile
+#    (/etc/qr-server/qr-server.env) OVERRIDES the drop-in's Environment=
+#    lines — confirm OMP/OPENBLAS/QR_APPLY_PARALLEL_ROWS/QR_ENTROPY_PREFETCH
+#    landed and nothing in qr-server.env shadows them.
 #    If qr-llm-owui was restarted recently, wait out its boot-probe
 #    watchdog (~30 min of periodic real completions) or restart owui and
 #    wait for its probes to settle before measuring.
@@ -287,7 +300,7 @@ sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
 #    same qr_seed) N times; all N token streams must be bitwise identical.
 
 # 5) Restore: remove the drop-in, restore SHARED_MAX_NUM_SEQS, restart.
-sudo rm /etc/systemd/system/qr-sampler-vllm.service.d/99-tier2-replay.conf
+sudo rm /etc/systemd/system/qr-sampler-vllm.service.d/zz-tier2-replay.conf
 sudo systemctl daemon-reload && sudo systemctl restart qr-sampler-vllm
 sudo systemctl start qthought
 ```

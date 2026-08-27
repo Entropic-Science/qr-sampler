@@ -9,9 +9,11 @@ description: |
   layer). Pins the whole deterministic envelope: seeded_prng source,
   stateless zscore_mean amplifier with zero calibration draws, STATIC
   fixed temperature (stateless, so engine preemption re-adds cannot
-  lose strategy state), no entropy prefetch, and the untruncated
-  top_k=0 / top_p=1.0 distribution mirroring normal_t1 -- a
-  like-for-like control arm beside the QRNG lanes.
+  lose strategy state), no entropy prefetch, and a fully untruncated
+  distribution (top_k=0, top_p=1.0, min_p_base=0.0, truncate_first
+  false -- all pinned explicitly so env-level knobs cannot silently
+  truncate the lane) -- a like-for-like control arm beside the QRNG
+  lanes.
 
   The preset carries NO seed: the seed always arrives per request as
   qr_seed (required -- a request with this preset and no qr_seed fails
@@ -46,3 +48,5 @@ overrides:
   entropy_prefetch: false
   top_k: 0
   top_p: 1.0
+  min_p_base: 0.0
+  truncate_first: false

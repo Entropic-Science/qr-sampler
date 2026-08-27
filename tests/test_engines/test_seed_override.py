@@ -9,14 +9,12 @@ ZERO entropy from the shared pipeline sources.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
+import pytest
 
 from qr_sampler.engines.vllm.adapter import VLLMAdapter, _RequestState
-
-if TYPE_CHECKING:
-    import pytest
 from qr_sampler.entropy.seeded import SeededPrngSource
 from tests.test_engines.test_vllm_adapter import (
     MockAddedRequest,
@@ -132,6 +130,60 @@ class TestSeedOverrideUpdateState:
         preinit entry (it is per-request-constructed by design)."""
         VLLMAdapter.validate_params(_det_params(qr_entropy_source_type="seeded_prng"))
 
+    def test_validate_params_rejects_partial_deterministic_shapes(self) -> None:
+        """Cross-field/value violations must be rejected API-SIDE by
+        validate_params (clean per-request error), never first raise
+        inside the engine worker's update_state (EngineDeadError;
+        GL-01/A-1). validate_params dry-runs the full resolve_config."""
+        from qr_sampler.exceptions import ConfigValidationError
+
+        bad_shapes = [
+            {"qr_seed": 42},  # seed without the deterministic envelope
+            {"qr_preset": "deterministic_prng"},  # preset without a seed
+            {"qr_preset": "deterministic_prng", "qr_seed": 1, "qr_entropy_source_type": "system"},
+            {"qr_preset": "deterministic_prng", "qr_seed": -1},  # value bounds
+            {"qr_preset": "deterministic_prng", "qr_seed": 2**63},
+            {"qr_preset": "deterministic_prng", "qr_seed": 1, "qr_bypass": True},
+        ]
+        for extra in bad_shapes:
+            with pytest.raises(ConfigValidationError):
+                VLLMAdapter.validate_params(MockSamplingParams(extra_args=extra))
+
+    def test_update_state_never_raises_on_bad_config(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Defense in depth: a malformed request that somehow evades
+        validate_params must NOT kill the engine worker — the request
+        degrades to a loud native-sampler bypass."""
+        import logging
+
+        from qr_sampler.engines.vllm.adapter import _BypassState
+
+        adapter = _make_adapter()
+        try:
+            with caplog.at_level(logging.ERROR, logger="qr_sampler"):
+                adapter.update_state(
+                    MockBatchUpdate(
+                        added=[
+                            MockAddedRequest(
+                                req_index=0,
+                                sampling_params=MockSamplingParams(
+                                    extra_args={"qr_seed": 42}  # invalid combo
+                                ),
+                            )
+                        ]
+                    )
+                )
+            assert isinstance(adapter._request_states[0], _BypassState)
+            rejected = [
+                r
+                for r in caplog.records
+                if getattr(r, "event", "") == "entropy.request.rejected_config"
+            ]
+            assert len(rejected) == 1
+        finally:
+            adapter.close()
+
 
 class TestSeedOverrideApply:
     def test_same_seed_rows_agree_across_threaded_steps(self) -> None:
@@ -189,16 +241,21 @@ class TestSeedOverrideApply:
 
     def test_resumed_replay_matches_uninterrupted_suffix(self) -> None:
         """A preemption-style re-add at k=5 replays exactly steps 5..11 of
-        the uninterrupted run."""
+        the uninterrupted run. The re-add hands the adapter a LIVE
+        emitted-token list (production tuple/attr ABI), which the engine
+        keeps appending to — the harness simulates that append."""
         adapter = _make_adapter()
         try:
 
-            def _run(steps: int) -> list[int]:
+            def _run(steps: int, live: list[int] | None) -> list[int]:
                 tokens = []
                 for _ in range(steps):
                     logits = _flat_logits(rows=1)
                     adapter.apply(logits)
-                    tokens.append(_selected(logits[0]))
+                    tok = _selected(logits[0])
+                    tokens.append(tok)
+                    if live is not None:
+                        live.append(tok)
                 return tokens
 
             adapter.update_state(
@@ -206,21 +263,85 @@ class TestSeedOverrideApply:
                     added=[MockAddedRequest(req_index=0, sampling_params=_det_params())]
                 )
             )
-            full = _run(12)
+            full = _run(12, None)  # no live list -> internal counter path
 
             adapter.update_state(MockBatchUpdate(removed=[0]))
+            resumed_live = full[:5]  # 5 tokens already emitted pre-preemption
             adapter.update_state(
                 MockBatchUpdate(
                     added=[
                         MockAddedRequest(
                             req_index=0,
                             sampling_params=_det_params(),
-                            output_tok_ids=[0, 0, 0, 0, 0],  # 5 tokens already emitted
+                            output_tok_ids=resumed_live,
                         )
                     ]
                 )
             )
-            assert _run(7) == full[5:]
+            assert _run(7, resumed_live) == full[5:]
+        finally:
+            adapter.close()
+
+    def test_step_follows_live_output_list_not_draw_count(self) -> None:
+        """The counter is a pure function of TOKEN POSITION: with a live
+        output_tok_ids list attached (production tuple ABI), extra draws
+        at the same position — vLLM's sampled-then-discarded
+        partial-prefill rows — re-draw the SAME block, and the counter
+        only advances when the emitted-token list grows."""
+        adapter = _make_adapter()
+        try:
+            live_output: list[int] = []
+            added = (0, _det_params(), [1, 2, 3], live_output)
+            adapter.update_state(MockBatchUpdate(added=[added]))  # type: ignore[list-item]
+
+            # Two applies WITHOUT growing the list (the discarded-row
+            # shape): both must select the identical token from block 0.
+            logits_a = _flat_logits(rows=1)
+            adapter.apply(logits_a)
+            first = _selected(logits_a[0])
+            logits_b = _flat_logits(rows=1)
+            adapter.apply(logits_b)
+            assert _selected(logits_b[0]) == first
+
+            # Growing the list advances the position -> a fresh block.
+            live_output.append(first)
+            state = adapter._request_states[0]
+            assert isinstance(state, _RequestState)
+            logits_c = _flat_logits(rows=1)
+            adapter.apply(logits_c)
+            assert state.entropy_override is not None
+            assert state.entropy_override.next_step == 2  # drew block 1
+        finally:
+            adapter.close()
+
+    def test_live_list_replay_immune_to_discarded_draws(self) -> None:
+        """End-to-end: a run polluted by discarded-row extra draws still
+        replays bitwise — the load-invariance property the position sync
+        exists to restore."""
+        adapter = _make_adapter()
+        try:
+
+            def _run(extra_draws_at: set[int]) -> list[int]:
+                live: list[int] = []
+                adapter.update_state(
+                    MockBatchUpdate(added=[(0, _det_params(), [9], live)])  # type: ignore[list-item]
+                )
+                tokens = []
+                for step in range(8):
+                    if step in extra_draws_at:
+                        # Simulate a discarded partial-prefill row: an
+                        # apply whose result vLLM throws away (list does
+                        # not grow).
+                        adapter.apply(_flat_logits(rows=1))
+                    logits = _flat_logits(rows=1)
+                    adapter.apply(logits)
+                    tok = _selected(logits[0])
+                    tokens.append(tok)
+                    live.append(tok)
+                adapter.update_state(MockBatchUpdate(removed=[0]))
+                return tokens
+
+            assert _run(set()) == _run({0, 3, 5})
         finally:
             adapter.close()
 

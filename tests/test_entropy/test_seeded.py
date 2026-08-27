@@ -58,6 +58,21 @@ class TestSeededPrngDeterminism:
         b.get_random_bytes(10_000)  # large draw
         assert a.get_random_bytes(_BLOCK) == b.get_random_bytes(_BLOCK)
 
+    def test_set_step_pins_the_next_block(self) -> None:
+        """set_step re-syncs the counter (the adapter's per-draw position
+        sync); re-drawing a pinned step reproduces the block exactly —
+        the property that makes vLLM's sampled-then-discarded
+        partial-prefill rows harmless."""
+        src = SeededPrngSource(seed=11)
+        block0 = src.get_random_bytes(_BLOCK)  # consumed step 0
+        src.set_step(0)
+        assert src.get_random_bytes(_BLOCK) == block0  # re-drawn, identical
+        src.set_step(5)
+        assert src.next_step == 5
+        assert src.get_random_bytes(_BLOCK) == SeededPrngSource(
+            seed=11, initial_step=5
+        ).get_random_bytes(_BLOCK)
+
     def test_thread_hammer_order_free_block_set(self) -> None:
         """N threads racing on ONE instance produce exactly the block set
         for steps 0..N-1 — order-free determinism, the property that makes
@@ -128,14 +143,12 @@ class TestSeededPrngFactoryRejection:
             build_entropy_source(config)
 
     def test_instance_alias_cannot_evade_rejection(self) -> None:
-        """A named instance whose type is seeded_prng is caught at/after
-        instance expansion (determinism.md §6 D12): the expanded config is
-        revalidated (seeded_prng with no seed fails), and the factory's own
-        rejection backstops it. Either raise point is acceptable — no
-        process-level source is ever built."""
-        config = QRSamplerConfig(
-            entropy_source_type="prng_lane",
-            entropy_source_instances={"prng_lane": {"type": "seeded_prng"}},
-        )
-        with pytest.raises(ConfigValidationError):
-            build_entropy_source(config)
+        """A named instance whose type is seeded_prng is rejected at config
+        construction (the _validate_entropy_source_instances rule names
+        QR_ENTROPY_SOURCE_INSTANCES), so no process-level seeded source
+        can ever be declared, let alone built."""
+        with pytest.raises(ConfigValidationError, match="seeded_prng"):
+            QRSamplerConfig(
+                entropy_source_type="prng_lane",
+                entropy_source_instances={"prng_lane": {"type": "seeded_prng"}},
+            )

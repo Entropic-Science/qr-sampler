@@ -4,21 +4,56 @@
 qr-server deployment (vLLM 0.24.0, torch 2.11.0+cu130, 4× RTX 5060 Ti, PP=4/TP=1).
 Line numbers reference those working trees.*
 
-> **Status update (2026-08-27).** The §6 spec is IMPLEMENTED: tasks T1–T7 landed
-> in qr-sampler (`seeded_prng` source, `seed` field + cross-field validation,
-> `deterministic_prng` preset, adapter override with preemption-resume, tests)
-> and T5–T6 in qr-llm-owui (Filter preset + compare-mode seeded lane). T8 is
-> reduced to the Tier-2 runbook (`deployments/qr-server/README.md` +
-> `tier2-replay.conf.example`): the checkpoint swapped to
-> `qwen3.8-27b-prismaaqua` (`efae774`), whose live `config.json` was verified
-> to declare 48/64 `linear_attention` (GDN) layers (`full_attention_interval:
-> 4`) — so the A9 blocker CARRIES OVER and `VLLM_BATCH_INVARIANT=1` still
-> refuses to start. References to `prismaquant-qwen` as "current" below are
-> historical; the A9 verdict applies unchanged to the new checkpoint.
-> Implementation deviations from the spec (helper widening for
-> `output_tok_ids`, a code-level `_PER_REQUEST_ONLY_SOURCES` allowlist union,
-> validation as a `@model_validator` rather than in `resolve.py`) are
-> documented in the landing commit.
+> **Status update (2026-08-27).** The §6 spec is IMPLEMENTED: tasks T1–T4 and
+> T7 landed in qr-sampler (`seeded_prng` source, `seed` field + cross-field
+> validation, `deterministic_prng` preset, adapter override with
+> preemption-resume, tests) and T5–T6 in qr-llm-owui (Filter preset +
+> compare-mode seeded lane). T8 is reduced to the Tier-2 runbook
+> (`deployments/qr-server/README.md` + `tier2-replay.conf.example`): the
+> checkpoint swapped to `qwen3.8-27b-prismaaqua` (`efae774`), whose live
+> `config.json` was verified to declare 48/64 `linear_attention` (GDN) layers
+> (`full_attention_interval: 4`) — so the A9 blocker CARRIES OVER and
+> `VLLM_BATCH_INVARIANT=1` still refuses to start (upstream: vLLM #42960).
+> References to `prismaquant-qwen` as "current" below are historical; the A9
+> verdict applies unchanged to the new checkpoint. Implementation deviations
+> from the spec (helper widening for `output_tok_ids`, a code-level
+> `_PER_REQUEST_ONLY_SOURCES` allowlist union, validation as a
+> `@model_validator` rather than in `resolve.py`) are documented in the
+> landing commit.
+>
+> **Audit addendum (2026-08-27, post-landing ultracode review):**
+>
+> 1. **Discarded partial-prefill rows (new B8, fixed).** vLLM V1 samples
+>    chunked-prefill rows and DISCARDS the token (`discard_request_mask` in
+>    `gpu_model_runner`; vLLM rewinds its own per-request generators by 4 for
+>    them — verified in the deployed 0.24.0). A consumed-order counter would
+>    therefore drift with batch-mates' share of the token budget. Fix: the
+>    adapter re-syncs the seeded source's counter to `len(output_tok_ids)`
+>    (the LIVE list the `BatchUpdate` contract guarantees) before every draw,
+>    so the block index is a pure function of token POSITION — a discarded
+>    row re-draws the same block, which a pure function tolerates. This also
+>    makes preemption resume automatic. Caveat pinned: never enable vLLM
+>    `--async-scheduling` for seeded requests (placeholder tokens can pad the
+>    live list); the deployment does not use it.
+> 2. **Footgun #5 deviation.** The stateless-row fallback logs ERROR and
+>    routes to the process default instead of raising (a per-row raise in the
+>    engine worker would itself be EngineDeadError, and the adapter cannot
+>    know what the lost state promised). Any `entropy.request.stateless_row`
+>    occurrence during a replay/verification run invalidates that run.
+> 3. **API-side validation hardened.** `validate_params` now dry-runs the
+>    full `resolve_config` so every value-level and cross-field rejection
+>    (seed bounds, envelope pairing) surfaces as a clean per-request error in
+>    the API server, never as an engine-worker raise; the worker-side
+>    resolution is additionally wrapped (degrades to a loud native bypass).
+> 4. **Semantic notes for lane users:** (a) `n>1`/`best_of` children share
+>    one `qr_seed` ⇒ n identical completions — use one request per sample;
+>    (b) every conversation TURN restarts the counter at block 0 with the
+>    same seed, so the control arm's u-stream is identical across turns and
+>    across users on a shared seed — fine for determinism, but cross-turn or
+>    cross-user analyses see a CORRELATED control, so vary seeds per run in
+>    studies; (c) guided decoding / `bad_words`-style vocab masks run after
+>    the one-hot force and can veto the forced token — keep them off this
+>    lane (pre-existing property of all qr lanes).
 
 This document maps every source of nondeterminism in the serving stack **other than
 the intentional one** (physical entropy driving token selection), and lays out the

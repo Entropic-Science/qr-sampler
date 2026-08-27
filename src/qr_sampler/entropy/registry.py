@@ -133,8 +133,12 @@ class EntropySourceRegistry:
         Resolves every builtin table entry and triggers entry-point
         loading on first call so third-party sources are included. The
         returned dict is a shallow copy; mutating it does not affect the
-        registry. Used by engine adapters at startup to pre-initialise
-        pipelines for every available entropy source.
+        registry. This is an introspection/test surface — the vLLM
+        adapter pre-initialises from the QR_PREINIT_ENTROPY_SOURCES env
+        list, NOT from this mapping. Any code that constructs one
+        instance of every listed source must skip ``seeded_prng``: it is
+        per-request-only by design, and its process-level construction
+        path (``build_entropy_source``) raises.
 
         Returns:
             A new dict mapping each registered identifier to its class.

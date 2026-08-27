@@ -214,6 +214,16 @@ class QRSamplerConfig(BaseSettings):
                     f"a registered source type (got {source_type!r}). "
                     f"Available: {sorted(known_types)}"
                 )
+            if source_type == "seeded_prng":
+                raise ConfigValidationError(
+                    f"Entropy-source instance {name!r} (QR_ENTROPY_SOURCE_INSTANCES) "
+                    f"declares type 'seeded_prng', which cannot be a process-level "
+                    f"instance: the deterministic lane's source is constructed PER "
+                    f"REQUEST by the engine adapter (a shared seeded stream is "
+                    f"nondeterministic under concurrency). Remove the instance and "
+                    f"select the lane per-request via qr_preset=deterministic_prng "
+                    f"+ qr_seed."
+                )
             bad_keys = sorted(set(spec) - {"type"} - ENTROPY_INSTANCE_OVERRIDE_ALLOWLIST)
             if bad_keys:
                 raise ConfigValidationError(
@@ -273,9 +283,12 @@ class QRSamplerConfig(BaseSettings):
             "envelope pinned by the 'deterministic_prng' preset (stateless "
             "zscore amplifier, zero calibration draws, no prefetch); the "
             "combination is cross-validated at config construction. "
-            "PER-REQUEST ONLY: a process-level QR_SEED is rejected by "
-            "resolve_config — identical concurrent conversations must "
-            "never silently collide on one stream. CAVEAT: same seed "
+            "PER-REQUEST ONLY: a process-level QR_SEED fails at config "
+            "construction for the common env-only case (seed without the "
+            "seeded_prng envelope), and resolve_config rejects any "
+            "defaults-level seed that survives construction — identical "
+            "concurrent conversations must never silently collide on one "
+            "stream. CAVEAT: same seed "
             "guarantees an identical entropy stream and identical token "
             "choice GIVEN the logits; bitwise-identical replies also need "
             "deterministic logits (batch-invariant engine or the Tier-2 "
@@ -1002,7 +1015,11 @@ class QRSamplerConfig(BaseSettings):
             raise ConfigValidationError(
                 "entropy_source_type='seeded_prng' requires a per-request "
                 "seed (qr_seed): the source is keyed per request and has no "
-                "process-default stream by design."
+                "process-default stream by design. If this raised at process "
+                "startup: the deterministic lane is PER-REQUEST ONLY — do "
+                "not set QR_PRESET=deterministic_prng, QR_SEED, or list "
+                "seeded_prng in QR_PREINIT_ENTROPY_SOURCES; callers select "
+                "it via qr_preset=deterministic_prng + qr_seed."
             )
         if self.signal_amplifier_type not in DETERMINISTIC_LANE_AMPLIFIERS:
             raise ConfigValidationError(

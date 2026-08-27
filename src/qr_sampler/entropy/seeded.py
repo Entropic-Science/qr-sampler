@@ -31,6 +31,20 @@ class SeededPrngSource(EntropySource):
     rebuilds per-request state mid-generation) resumes at the correct
     block: the adapter passes ``initial_step=len(output_ids)``.
 
+    ``set_step()`` exists because a consumed-order counter alone is NOT
+    load-invariant on vLLM V1: the engine samples partial-prefill
+    (chunked-prefill) rows and DISCARDS the token (it rewinds its own
+    per-request torch generators by 4 for exactly this reason —
+    ``gpu_model_runner``'s ``discard_request_mask``), and the
+    LogitsProcessor interface does not expose the discard mask. Each
+    extra prefill chunk would consume one counter block, making block
+    indices depend on batch-mates' share of the token budget. The engine
+    adapter therefore re-syncs the step to ``len(output_tok_ids)`` (the
+    live list the ``BatchUpdate`` contract guarantees) before EVERY
+    draw: a discarded row then draws the SAME block as the real next
+    token — harmless, because a pure function of position can safely be
+    evaluated twice, which a consumed-order counter cannot.
+
     Uniform bytes match the z-score amplifier's default population
     parameters (``population_mean=127.5``, ``population_std=255/sqrt(12)``)
     — the same assumption the QRNG lanes make, so the deterministic lane
@@ -72,6 +86,19 @@ class SeededPrngSource(EntropySource):
     def next_step(self) -> int:
         """The counter block the next ``get_random_bytes()`` call will use."""
         return self._step
+
+    def set_step(self, step: int) -> None:
+        """Pin the next draw to counter block *step* (0-based token index).
+
+        Called by the engine adapter before every draw with the request's
+        live emitted-token count, so the block index is a pure function
+        of TOKEN POSITION rather than of how many draws happened —
+        immune to vLLM's sampled-then-discarded partial-prefill rows
+        (see class docstring). Idempotent; safe to call concurrently
+        with draws (the draw's step reservation is lock-atomic).
+        """
+        with self._lock:
+            self._step = step
 
     def get_random_bytes(self, n: int) -> bytes:
         """Return *n* uniform bytes from the next counter block.
