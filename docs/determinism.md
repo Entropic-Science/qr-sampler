@@ -45,7 +45,27 @@ Line numbers reference those working trees.*
 >    (seed bounds, envelope pairing) surfaces as a clean per-request error in
 >    the API server, never as an engine-worker raise; the worker-side
 >    resolution is additionally wrapped (degrades to a loud native bypass).
-> 4. **Semantic notes for lane users:** (a) `n>1`/`best_of` children share
+> 4. **Live finding (2026-08-27, measured on the deployed box): the current
+>    checkpoint's forward pass is not even RUN-TO-RUN deterministic.** With
+>    the engine solo (qthought stopped, unique cache salts), a seeded
+>    single-token request at T=2.0 flipped its first token across identical
+>    runs (1 in 6), and seeded hot lanes (fixed T=1.53, hvh_drift) diverged
+>    within ~5 tokens on every replay pair — while greedy (qr_bypass,
+>    temperature 0) and all T=1.0 seeded lanes replayed identically across
+>    many trials, and the sampler layer's u-sequence was verified bitwise
+>    stable on the box. Interpretation: small run-to-run logit noise
+>    (suspects: GDN linear-attention Triton kernels / NVFP4 compressed-
+>    tensors kernels — atomics or environment-dependent splits), invisible
+>    to argmax and to T=1 sampling, but decisive once hot temperatures put
+>    ``u`` in the dense probability tail where CDF boundaries are ~1e-4
+>    apart. Consequence: on THIS checkpoint, §2's "kernels are run-to-run
+>    deterministic" premise fails, so even Tier-2 serialization only
+>    delivers bitwise replies for COOL lanes (T≈1, observed) — hot-lane
+>    bitwise replay needs the noise source eliminated (the Tier-1 model
+>    path, or an upstream kernel fix). The sampler-layer guarantee (same
+>    seed ⇒ same u-sequence and same token GIVEN the logits) holds at every
+>    temperature.
+> 5. **Semantic notes for lane users:** (a) `n>1`/`best_of` children share
 >    one `qr_seed` ⇒ n identical completions — use one request per sample;
 >    (b) every conversation TURN restarts the counter at block 0 with the
 >    same seed, so the control arm's u-stream is identical across turns and

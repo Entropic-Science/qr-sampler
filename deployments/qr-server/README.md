@@ -265,12 +265,21 @@ constructed by the adapter and always request-valid.
 > envelope (checkpoint, vLLM/torch/numpy versions, GPU layout) must be
 > pinned across replays.
 
-### Tier-2 replay mode (works with the current hybrid checkpoint)
+### Tier-2 replay mode (works with the current hybrid checkpoint — cool lanes)
 
-GPU kernels are run-to-run deterministic *given the batch*; Tier 2 makes
-the batch deterministic instead of making the kernels invariant to it.
-This is a **verification/research mode, not a serving mode** — it fully
-serializes the shared engine, so qthought and other users are paused.
+Tier 2 makes the batch deterministic instead of making the kernels
+invariant to it. **Measured limitation (2026-08-27, live):** this
+checkpoint's kernels carry a small RUN-TO-RUN logit jitter even solo
+(suspects: GDN linear-attention / NVFP4 kernels), so Tier-2 bitwise
+replay holds in practice for **cool lanes (T≈1: `deterministic_prng`,
+seeded `normal_t1`/`chat_light`)** and for greedy — but HOT seeded lanes
+(creative, fixed T≳1.5) can still flip words between runs, because hot
+sampling lands `u` in the dense probability tail where ~1e-4 CDF shifts
+change the token. Hot-lane bitwise replay needs the Tier-1 model path.
+The sampler's u-sequence is deterministic at every temperature (verify
+via per-token `u_value` records). This is a **verification/research
+mode, not a serving mode** — it fully serializes the shared engine, so
+qthought and other users are paused.
 
 ```bash
 # 1) Install the temporary drop-in (ships in this profile) + serialize.
