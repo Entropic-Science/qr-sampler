@@ -3,7 +3,14 @@ name: "Deterministic (seeded PRNG)"
 description: |
   Deterministic control lane: a counter-based per-request PRNG replaces
   the quantum stream, so random bytes are a pure function of
-  (qr_seed, token index) -- reproducible independent of batching,
+  (qr_seed, token index). This is FULL stochastic sampling with
+  reproducible draws -- NOT greedy/argmax decoding; the sampling math
+  is identical to normal_t1, only the randomness is keyed. (The seeded
+  entropy also composes with ANY other sampling preset: ride
+  qr_seed + qr_entropy_source_type=seeded_prng + qr_entropy_prefetch=0
+  + qr_zscore_calibration_samples=0 alongside qr_preset=<any> --
+  caller keys win over preset keys, FR-10.) Reproducible independent
+  of batching,
   row-thread scheduling, prefetch timing, and concurrent traffic
   (docs/determinism.md, the batch-invariance idea applied to the RNG
   layer). Pins the whole deterministic envelope: seeded_prng source,

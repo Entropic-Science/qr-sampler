@@ -846,6 +846,37 @@ class TestDeterministicLaneValidation:
         with pytest.raises(ConfigValidationError, match="seed"):
             resolve_config(default_config, {"qr_entropy_source_type": "seeded_prng"})
 
+    def test_seeded_envelope_composes_with_any_chat_preset(
+        self, default_config: QRSamplerConfig
+    ) -> None:
+        """The seeded entropy is an AXIS, not a sampling method: callers
+        (the owui compare proxy) ride the deterministic envelope on top of
+        any chat preset via FR-10 caller-wins keys — full stochastic
+        sampling under the chosen strategy, with reproducible draws. The
+        stateful creative strategy warns (preemption caveat) but resolves."""
+        import warnings as _warnings
+
+        for preset, strategy in (
+            ("creative_sampling", "hvh_drift"),
+            ("normal_t1", "fixed"),
+            ("chat_light", "fixed"),
+        ):
+            extra = {
+                "qr_preset": preset,
+                "qr_seed": 7,
+                "qr_entropy_source_type": "seeded_prng",
+                "qr_entropy_prefetch": False,
+                "qr_zscore_calibration_samples": 0,
+            }
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")  # hvh_drift's preemption warning
+                resolved = resolve_config(default_config, extra)
+            assert resolved.seed == 7, preset
+            assert resolved.entropy_source_type == "seeded_prng", preset
+            # The preset's SAMPLING side is untouched by the envelope —
+            # chat_light's own entropy pin is the one caller-overridden key.
+            assert resolved.temperature_strategy == strategy, preset
+
     def test_seeded_prng_instance_type_rejected(self) -> None:
         """A QR_ENTROPY_SOURCE_INSTANCES declaration cannot smuggle in a
         process-level seeded stream; the rejection names the env var."""
