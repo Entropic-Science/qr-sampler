@@ -18,13 +18,14 @@ description: |
 experimental: false
 origin: null
 overrides:
+  # 2026-11-02 Qwen3.8 retune: cooler base, gate range halved (see presets.py).
   entropy_source_type: quantum_grpc
   signal_amplifier_type: server
   temperature_strategy: coherence_gate
   coherence_inner_strategy: fixed
   fixed_temperature: 1.0
   coherence_threshold: 3.5
-  coherence_t_boost_max: 0.5
+  coherence_t_boost_max: 0.25
   coherence_ema_alpha: 0.3
   draw_block_bytes: 102400  # 100 KiB (2026-07: was 1 MiB; latency tranche)
   top_k: 0

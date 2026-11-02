@@ -10,7 +10,7 @@ from qr_sampler.cli.main import cli
 # V7_HVD_R02_00 "HVD champion" hyperparameters that must appear in info
 # output (replaced the V7_GDT_R05_02 GDT bell-lift on 2026-08-26).
 V7_HYPERPARAM_VALUES = [
-    "1.53",  # hvh_t_base
+    "1.3",  # hvh_t_base
     "0.3",  # hvh_alpha_h
     "-0.2",  # hvh_alpha_vh
     "1.0",  # hvh_gamma_dh

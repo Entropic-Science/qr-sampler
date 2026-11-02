@@ -60,10 +60,13 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # Replaced the V7_GDT_R05_02 GDT bell-lift on 2026-08-26 after it went
     # incoherent on Qwen3.8-PrismaAQUA (tuned at the t_peak=1.5 family
     # coherence cliff on Qwen3.6 — the tuning did not transfer).
+    # 2026-11-02 Qwen3.8 retune: hvh_t_base 1.53 -> 1.3 (one static-ladder step
+    # cooler; the champion was never re-measured on Qwen3.8 and r07 put the new
+    # model's coherence cliff at T~1.6, not ~1.8). Other eight knobs verbatim.
     # Experimental — see profiles/presets/creative_sampling.yaml for origin.
     "creative_sampling": {
         "temperature_strategy": "hvh_drift",
-        "hvh_t_base": 1.53,
+        "hvh_t_base": 1.3,
         "hvh_alpha_h": 0.3,
         "hvh_alpha_vh": -0.2,
         "hvh_gamma_dh": 1.0,
@@ -159,7 +162,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     # the coherence-gated EDT temperature. This lane must emit a PARSEABLE
     # ``propose_speech`` tool call, and that constrains BOTH knobs:
     #   * top_k=50 / top_p=0.9 truncation removes the low-probability tail, and
-    #   * a COOL/adaptive inner strategy (EDT ~0.8) keeps the structure intact.
+    #   * a COOL/adaptive inner strategy (EDT ~0.7) keeps the structure intact.
     # A hot inner strategy (hvh_drift base 1.45) corrupts the tool call even WITH
     # truncation — under quantum-uniform selection the heat re-introduces garbage
     # tokens → strength parses 0.0 → the mind never speaks. So REFLECT is the
@@ -168,11 +171,11 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     PRESET_QTHOUGHT_THINK: {
         "temperature_strategy": "coherence_gate",
         "coherence_inner_strategy": "edt",
-        "edt_base_temp": 0.8,
+        "edt_base_temp": 0.7,
         "top_k": 50,
         "top_p": 0.9,
         "coherence_threshold": 3.5,
-        "coherence_t_boost_max": 0.5,
+        "coherence_t_boost_max": 0.25,
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
@@ -180,21 +183,32 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "sample_count": 6000,
         "zscore_calibration_samples": 200,
     },
-    # Qthought SPEAK lane — the user-visible voice, deliberately UNtruncated
-    # (top_k=0 / top_p=1.0): the spoken turn is free text with no structure to
-    # protect, so it samples the FULL distribution over server-integrated 100 KiB
-    # draws under the coherence-gated EDT temperature — all the quantum
-    # randomness and weirdness the entropy affords. Truncation stays on the
-    # REFLECT lane only.
+    # Qthought SPEAK lane — the user-visible voice. No top_k (the spoken turn is
+    # free text with no structure to protect) over server-integrated 100 KiB
+    # draws under the coherence-gated EDT temperature — the quantum randomness
+    # the entropy affords. The one cut is the top_p=0.95 far-tail guard that
+    # qr-llm-owui's creative lane proved on the shared engine (2026-07-10): an
+    # imperfect quantum uniform under an UNtruncated distribution lands in the
+    # garbage tail (word salad, premature EOS). Structural top_k/top_p
+    # truncation stays on the REFLECT lane only.
+    #
+    # 2026-11-02 Qwen3.8 retune (both qthought lanes + qthought_purity's gate):
+    # qr-llm-research r07 re-measured the static ladder on the new checkpoint
+    # — coherence at a given T sits ~4-5 points lower and the cliff moved from
+    # T≈1.8 to T≈1.6 (one ladder step hotter, `cross_model_report.md`). So
+    # edt_base_temp 0.8 → 0.7 and the gate's range is halved
+    # (coherence_t_boost_max 0.5 → 0.25): the fully-open gate now tops out at
+    # an EDT base of 0.95 instead of 1.3. The gate's threshold / EMA are
+    # untouched — it opens as often as before, it just lifts less.
     # ``sample_count`` / ``zscore_calibration_samples`` are degrade-fallback only.
     PRESET_QTHOUGHT_VOICE: {
         "temperature_strategy": "coherence_gate",
         "coherence_inner_strategy": "edt",
-        "edt_base_temp": 0.8,
+        "edt_base_temp": 0.7,
         "top_k": 0,
-        "top_p": 1.0,
+        "top_p": 0.95,
         "coherence_threshold": 3.5,
-        "coherence_t_boost_max": 0.5,
+        "coherence_t_boost_max": 0.25,
         "coherence_ema_alpha": 0.3,
         "entropy_source_type": "quantum_grpc",
         "signal_amplifier_type": "server",
@@ -214,7 +228,7 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "coherence_inner_strategy": "fixed",
         "fixed_temperature": 1.0,
         "coherence_threshold": 3.5,
-        "coherence_t_boost_max": 0.5,
+        "coherence_t_boost_max": 0.25,
         "coherence_ema_alpha": 0.3,
         "draw_block_bytes": 102400,  # 100 KiB (2026-07: was 1 MiB; latency tranche)
         "top_k": 0,

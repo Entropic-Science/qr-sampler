@@ -22,7 +22,7 @@ from qr_sampler.exceptions import ConfigValidationError
 # profiles/presets/creative_sampling.yaml for origin).
 _CREATIVE_EXPECTED: dict[str, object] = {
     "qr_temperature_strategy": "hvh_drift",
-    "qr_hvh_t_base": 1.53,
+    "qr_hvh_t_base": 1.3,
     "qr_hvh_alpha_h": 0.3,
     "qr_hvh_alpha_vh": -0.2,
     "qr_hvh_gamma_dh": 1.0,
@@ -158,7 +158,7 @@ class TestResolveConfigIntegration:
         defaults = QRSamplerConfig(_env_file=None)  # type: ignore[call-arg]
         result = resolve_config(defaults, {"qr_preset": "creative_sampling"})
         assert result.temperature_strategy == "hvh_drift"
-        assert result.hvh_t_base == 1.53
+        assert result.hvh_t_base == 1.3
         assert result.hvh_alpha_h == 0.3
         assert result.hvh_alpha_vh == -0.2
         assert result.hvh_gamma_dh == 1.0
@@ -185,7 +185,7 @@ class TestResolveConfigIntegration:
         )
         result = resolve_config(defaults, None)
         assert result.temperature_strategy == "hvh_drift"
-        assert result.hvh_t_base == 1.53
+        assert result.hvh_t_base == 1.3
 
     def test_resolve_config_per_request_preset_overrides_env_var(self) -> None:
         defaults = QRSamplerConfig(  # type: ignore[call-arg]

@@ -12,7 +12,7 @@ Pins the acceptance criteria for the cross-repo increment:
   (server u consumed verbatim, purity label / integrator / coherence triple
   on the record).
 - Temperature gates when the stub reports ``z_c`` above threshold: with
-  ``r = 1`` and ``ema_alpha = 1.0``, ``T_pre == T_base + 0.5`` EXACTLY
+  ``r = 1`` and ``ema_alpha = 1.0``, ``T_pre == T_base + 0.25`` EXACTLY
   (the Amendment 1 saturation pin, here across a real wire round trip).
 - Temperature does NOT gate when ``coherence_valid=false``.
 """
@@ -169,11 +169,11 @@ class TestQthoughtPurityEndToEnd:
     def test_gate_boosts_exactly_t_base_plus_half(
         self, gated_service: tuple[str, ScriptedPurityServicer]
     ) -> None:
-        """Amendment 1 pin: r=1 above threshold, alpha=1.0 => T_pre = T_base + 0.5.
+        """Amendment 1 pin: r=1 above threshold, alpha=1.0 => T_pre = T_base + 0.25.
 
         The gate lags by one draw: token 1 samples at exactly T_base (no
         meta yet); token 2 sees token 1's coherence and boosts by exactly
-        ``coherence_t_boost_max * r = 0.5``.
+        ``coherence_t_boost_max * r = 0.25``.
         """
         address, _servicer = gated_service
         pipeline, source = _build_pipeline(address, qr_coherence_ema_alpha=1.0)
@@ -187,9 +187,9 @@ class TestQthoughtPurityEndToEnd:
         assert first.record.gate_open is False
         assert first.record.gate_boost == 0.0
 
-        assert second.record.temperature_used == 1.0 + 0.5  # exact saturation
+        assert second.record.temperature_used == 1.0 + 0.25  # exact saturation
         assert second.record.gate_open is True
-        assert second.record.gate_boost == 0.5
+        assert second.record.gate_boost == 0.25
 
     def test_no_gate_when_coherence_invalid(
         self, invalid_coherence_service: tuple[str, ScriptedPurityServicer]

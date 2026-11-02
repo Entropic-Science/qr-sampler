@@ -98,7 +98,7 @@ class TestLoadBuiltinProfiles:
         assert preset.origin is not None
         assert "V7_HVD_R02_00" in preset.origin
         assert preset.overrides["temperature_strategy"] == "hvh_drift"
-        assert preset.overrides["hvh_t_base"] == 1.53
+        assert preset.overrides["hvh_t_base"] == 1.3
 
     def test_load_preset_normal_t1(self, loader: ProfileLoader) -> None:
         preset = loader.load_preset("normal_t1")

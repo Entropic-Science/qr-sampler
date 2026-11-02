@@ -12,17 +12,18 @@ description: |
 experimental: false
 origin: null
 overrides:
+  # 2026-11-02 Qwen3.8 retune: cooler base, gate range halved (see presets.py).
   # Server-integrated 100 KiB draws per token under the coherence gate, with the
   # composed edt strategy (cooler than REFLECT) as the gate's inner strategy.
   # sample_count / zscore_calibration_samples are degrade-fallback only.
   temperature_strategy: coherence_gate
   coherence_inner_strategy: edt
-  edt_base_temp: 0.8
-  # Deliberately UNtruncated: free text, all the quantum weirdness. See presets.py.
+  edt_base_temp: 0.7
+  # No top_k (free text); top_p 0.95 is the owui-proven far-tail guard. See presets.py.
   top_k: 0
-  top_p: 1.0
+  top_p: 0.95
   coherence_threshold: 3.5
-  coherence_t_boost_max: 0.5
+  coherence_t_boost_max: 0.25
   coherence_ema_alpha: 0.3
   entropy_source_type: quantum_grpc
   signal_amplifier_type: server

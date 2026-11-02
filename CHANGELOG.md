@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Qwen3.8 retune of the lane presets (cooler base, half the gate range)
+
+#### 2026-11-02
+
+- **`creative_sampling`**: `hvh_t_base` 1.53 → 1.3; the other eight HVD
+  champion knobs unchanged. The champion was tuned on the previous
+  checkpoint and never re-measured on Qwen3.8; qr-llm-research's r07
+  cross-model replication (`results/dtsv7_r07/cross_model_report.md`) put
+  the new model one static-ladder step hotter (coherence ~4–5 points lower
+  at every T, the coherence cliff at T≈1.6 instead of T≈1.8) and the HVD
+  r06 champions lost their significant margin there.
+- **`qthought_think` / `qthought_voice`**: `edt_base_temp` 0.8 → 0.7 and
+  `coherence_t_boost_max` 0.5 → 0.25 (the fully-open gate now tops out at
+  an EDT base of 0.95, not 1.3). `coherence_threshold` / `coherence_ema_alpha`
+  unchanged — the gate opens as often, it lifts less.
+- **`qthought_voice`**: `top_p` 1.0 → 0.95 — the far-tail guard
+  qr-llm-owui's creative lane has carried since 2026-07-10 (imperfect
+  quantum uniforms under an untruncated distribution landed in the garbage
+  tail). `top_k` stays 0; structural truncation remains REFLECT-only.
+- **`qthought_purity`**: `coherence_t_boost_max` 0.5 → 0.25 (gate
+  consistency across the three gated lanes); `fixed_temperature` 1.0 kept
+  as the neutral reference.
+- `QRSamplerConfig` field defaults are untouched; only the presets move.
+  Contract-level pins (`tests/test_contract.py`) updated in step; the
+  qthought consumer derives its console defaults from these presets.
+
 ### Added — `edt_paper` temperature strategy
 
 #### 2026-08-06

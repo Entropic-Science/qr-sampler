@@ -14,6 +14,7 @@ description: |
 experimental: false
 origin: "Derived from creative_sampling (V6_HVD_R01_01) with a hotter base temperature"
 overrides:
+  # 2026-11-02 Qwen3.8 retune: cooler base, gate range halved (see presets.py).
   # Server-integrated 100 KiB draws per token under the coherence gate, with the
   # divergent hvh_drift family as the gate's inner strategy. sample_count /
   # zscore_calibration_samples are degrade-fallback only.
@@ -21,12 +22,12 @@ overrides:
   # EDT (cool/adaptive), not hvh_drift: a hot inner strategy corrupts the
   # propose_speech tool call even WITH truncation. See presets.py.
   coherence_inner_strategy: edt
-  edt_base_temp: 0.8
+  edt_base_temp: 0.7
   # top_k/top_p truncation is load-bearing HERE (valid tool call); SPEAK is free.
   top_k: 50
   top_p: 0.9
   coherence_threshold: 3.5
-  coherence_t_boost_max: 0.5
+  coherence_t_boost_max: 0.25
   coherence_ema_alpha: 0.3
   entropy_source_type: quantum_grpc
   signal_amplifier_type: server

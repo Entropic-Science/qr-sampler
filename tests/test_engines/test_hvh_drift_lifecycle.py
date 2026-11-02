@@ -132,7 +132,7 @@ def test_preset_resolves_through_resolve_config() -> None:
         # Preset expansion must have flipped the strategy field on the
         # resolved per-request config (sanity check on the FR-10 path).
         assert state.config.temperature_strategy == "hvh_drift"
-        assert state.config.hvh_t_base == 1.53
+        assert state.config.hvh_t_base == 1.3
         assert state.config.hvh_min_p_base == 0.039045
 
         _add_hvh_request(adapter, req_index=1)
