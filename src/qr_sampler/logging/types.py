@@ -139,3 +139,12 @@ class TokenSamplingRecord:
     # TemperatureResult diagnostics when present (coherence_gate only).
     gate_open: bool | None = field(default=None)
     gate_boost: float | None = field(default=None)
+
+    # The selected token's bracket in the cumulative distribution: the
+    # token is the one whose ``[cdf_lo, cdf_hi)`` holds ``u_value``.
+    cdf_lo: float | None = field(default=None)
+    cdf_hi: float | None = field(default=None)
+    # Every candidate after temperature and truncation as
+    # ``(token_id, probability)``, most probable first. Filled only when
+    # the caller asked for it (the token log does, for the first token).
+    top_entries: tuple[tuple[int, float], ...] | None = field(default=None)

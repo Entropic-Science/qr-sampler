@@ -540,12 +540,52 @@ All configuration is done via environment variables with the `QR_` prefix (a `.e
 | `QR_OE_TIMEOUT` | `5.0` | OpenEntropy harvest timeout (s) |
 | `QR_PRESET` | *(unset)* | Process-wide default preset |
 
+### Per-request token log
+
+A request can ask the sampler to write down, for every token it generates, the
+uniform draw `u` and the stretch of the cumulative distribution that belongs to
+the token it picked. With those two a reader can check, token by token, that the
+sampler picked the token its draw selects.
+
+Turn it on for the server by setting `QR_TOKEN_LOG_DIR`, and for a request by
+sending both keys in `vllm_xargs`:
+
+```json
+{"qr_token_log": true, "qr_request_id": "run_ab12/qrng/card:0007"}
+```
+
+The file is `<QR_TOKEN_LOG_DIR>/<request id>.jsonl`, with `/` in the id written
+as `__`. The id may use letters, digits and `._:/@=+-`. One JSON object per
+line, one line per token:
+
+| Field | Meaning |
+|---|---|
+| `token_index` | Position of the token in the reply, from 0 |
+| `token_id`, `token_rank`, `token_prob` | The token picked, its rank among the candidates, its probability |
+| `u_value` | The uniform draw that selected it |
+| `cdf_lo`, `cdf_hi` | The token's bracket: candidates are laid end to end in descending probability, and the token is the one whose bracket holds `u_value` |
+| `temperature_used`, `min_p_used`, `num_candidates` | The sampling settings in force for this token |
+| `entropy_is_fallback` | Whether this draw came from the fallback source |
+| `timestamp_ns` | When sampling of the token began |
+
+The first line also has `entropy_source_used` and `top_entries`: the candidates
+after temperature and truncation as `[token_id, probability]` pairs, most
+probable first, cut at the smallest set holding 0.9995 of the probability. Later
+lines leave the candidate list out, which keeps a line under about 250 bytes.
+
+The log never changes sampling. The two keys are not part of the configuration,
+so a logged request has the same config hash and draws the same tokens as the
+same request without them. A file is rewritten from the start when its request
+id is used again. Probabilities are 32-bit floats inside the engine, so a
+bracket's width equals `token_prob` to about 1e-7, not exactly.
+
 Environment-only settings (read outside the config model):
 
 | Environment variable | Default | Description |
 |---|---|---|
 | `QR_ENTROPY_STATUS_FILE` | `<tempdir>/qr_entropy_status.json` | Cross-process entropy-status file (`telemetry/status_file.py`); empty string disables |
 | `QR_PREINIT_ENTROPY_SOURCES` | `quantum_grpc,system` | Sources the vLLM adapter pre-initialises pipelines for |
+| `QR_TOKEN_LOG_DIR` | unset | Directory for per-request token logs (`logging/token_log.py`). Unset means no request can write one. |
 
 ### Sampling parameters (per-request overridable)
 
@@ -579,6 +619,7 @@ Environment-only settings (read outside the config model):
 | `QR_BYPASS` | `qr_bypass` | `false` | Skip the qr pipeline; engine-native sampling for this request |
 | `QR_LOG_LEVEL` | `qr_log_level` | `summary` | Logging: `none`, `summary`, `full` |
 | `QR_DIAGNOSTIC_MODE` | `qr_diagnostic_mode` | `false` | Store all token records in memory |
+| — | `qr_token_log`, `qr_request_id` | off | Write this request's per-token log to `<QR_TOKEN_LOG_DIR>/<request id>.jsonl` (see [Per-request token log](#per-request-token-log)). Log controls only: they are not configuration and do not change the config hash or what is sampled. |
 
 ---
 

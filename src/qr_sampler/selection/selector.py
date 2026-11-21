@@ -11,6 +11,8 @@ Semantic interpretation of u:
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from qr_sampler.exceptions import TokenSelectionError
@@ -52,6 +54,7 @@ class TokenSelector:
         u: float,
         min_p: float = 0.0,
         truncate_first: bool = False,
+        want_candidates: bool = False,
     ) -> SelectionResult:
         """Select one token from the logit distribution using CDF lookup.
 
@@ -84,6 +87,13 @@ class TokenSelector:
             truncate_first: When True, apply the min-p mask BEFORE
                 temperature (truncate-first-then-temperature order).
                 Default False preserves the pinned selector order.
+            want_candidates: When True, ``diagnostics["candidates"]``
+                lists every surviving token as ``(token_id, prob)`` in
+                descending probability. It reads the distribution the
+                selection used and never changes which token is picked.
+                The greedy path (temperature <= 0) reports neither a
+                bracket nor candidates; the pipeline fills in the trivial
+                ones.
 
         Returns:
             SelectionResult with the selected token and diagnostics.
@@ -92,7 +102,9 @@ class TokenSelector:
             TokenSelectionError: If no candidate tokens survive filtering.
         """
         if truncate_first:
-            return self._select_truncate_first(logits, temperature, top_k, top_p, u, min_p)
+            return self._select_truncate_first(
+                logits, temperature, top_k, top_p, u, min_p, want_candidates
+            )
 
         if temperature <= 0:
             # Zero temperature -> greedy (pick max logit).
@@ -119,7 +131,9 @@ class TokenSelector:
         # computation exactly up to summation-order rounding (last ulp) —
         # the same equivalence class as the ``_CDF_FAST_HEAD`` path.
         if 0 < top_k < vocab_size:
-            return self._select_compact_top_k(logits, temperature, top_k, top_p, u, min_p)
+            return self._select_compact_top_k(
+                logits, temperature, top_k, top_p, u, min_p, want_candidates
+            )
 
         # 1. Temperature scaling. T == 1.0 is an exact no-op — skip the
         # full-vocab divide (softmax never mutates its input).
@@ -150,22 +164,27 @@ class TokenSelector:
             raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
 
         # 6-8. CDF selection.
-        vocab_idx, rank, prob, num_candidates = self._cdf_select(
+        vocab_idx, rank, prob, num_candidates, cdf_lo, cdf_hi = self._cdf_select_bracket(
             probs, u, num_candidates=num_candidates
         )
 
+        diagnostics: dict[str, Any] = {
+            "effective_top_k": effective_k,
+            "effective_top_p_candidates": effective_n,
+            "effective_min_p_candidates": effective_min_p_candidates,
+            "min_p_used": min_p,
+            "u": u,
+            "cdf_lo": cdf_lo,
+            "cdf_hi": cdf_hi,
+        }
+        if want_candidates:
+            diagnostics["candidates"] = self.candidate_entries(probs)
         return SelectionResult(
             token_id=vocab_idx,
             token_rank=rank,
             token_prob=prob,
             num_candidates=num_candidates,
-            diagnostics={
-                "effective_top_k": effective_k,
-                "effective_top_p_candidates": effective_n,
-                "effective_min_p_candidates": effective_min_p_candidates,
-                "min_p_used": min_p,
-                "u": u,
-            },
+            diagnostics=diagnostics,
         )
 
     def _select_compact_top_k(
@@ -176,6 +195,7 @@ class TokenSelector:
         top_p: float,
         u: float,
         min_p: float,
+        want_candidates: bool = False,
     ) -> SelectionResult:
         """Default-order selection compacted onto the top-k support.
 
@@ -228,22 +248,30 @@ class TokenSelector:
         if effective_n == 0:
             raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
 
-        sub_idx, rank, prob, num_candidates = self._cdf_select(
+        sub_idx, rank, prob, num_candidates, cdf_lo, cdf_hi = self._cdf_select_bracket(
             probs, u, num_candidates=num_candidates
         )
 
+        diagnostics: dict[str, Any] = {
+            "effective_top_k": top_k,
+            "effective_top_p_candidates": effective_n,
+            "effective_min_p_candidates": effective_min_p_candidates,
+            "min_p_used": min_p,
+            "u": u,
+            "cdf_lo": cdf_lo,
+            "cdf_hi": cdf_hi,
+        }
+        if want_candidates:
+            # Sub-indices map back to vocabulary ids through the top-k support.
+            diagnostics["candidates"] = [
+                (int(top_idx[sub]), p) for sub, p in self.candidate_entries(probs)
+            ]
         return SelectionResult(
             token_id=int(top_idx[sub_idx]),
             token_rank=rank,
             token_prob=prob,
             num_candidates=num_candidates,
-            diagnostics={
-                "effective_top_k": top_k,
-                "effective_top_p_candidates": effective_n,
-                "effective_min_p_candidates": effective_min_p_candidates,
-                "min_p_used": min_p,
-                "u": u,
-            },
+            diagnostics=diagnostics,
         )
 
     def _select_truncate_first(
@@ -254,6 +282,7 @@ class TokenSelector:
         top_p: float,
         u: float,
         min_p: float,
+        want_candidates: bool = False,
     ) -> SelectionResult:
         """Truncate-first-then-temperature selection (EVDT-TT order).
 
@@ -325,21 +354,26 @@ class TokenSelector:
             raise TokenSelectionError("No candidate tokens survived top-k and top-p filtering")
 
         # 6-8. CDF selection.
-        vocab_idx, rank, prob, num_candidates = self._cdf_select(probs, u)
+        vocab_idx, rank, prob, num_candidates, cdf_lo, cdf_hi = self._cdf_select_bracket(probs, u)
 
+        diagnostics: dict[str, Any] = {
+            "effective_top_k": effective_k,
+            "effective_top_p_candidates": effective_n,
+            "effective_min_p_candidates": effective_min_p_candidates,
+            "min_p_used": min_p,
+            "u": u,
+            "truncate_first": True,
+            "cdf_lo": cdf_lo,
+            "cdf_hi": cdf_hi,
+        }
+        if want_candidates:
+            diagnostics["candidates"] = self.candidate_entries(probs)
         return SelectionResult(
             token_id=vocab_idx,
             token_rank=rank,
             token_prob=prob,
             num_candidates=num_candidates,
-            diagnostics={
-                "effective_top_k": effective_k,
-                "effective_top_p_candidates": effective_n,
-                "effective_min_p_candidates": effective_min_p_candidates,
-                "min_p_used": min_p,
-                "u": u,
-                "truncate_first": True,
-            },
+            diagnostics=diagnostics,
         )
 
     @staticmethod
@@ -507,6 +541,41 @@ class TokenSelector:
         Raises:
             TokenSelectionError: If no tokens have non-zero probability.
         """
+        vocab_idx, rank, prob, count, _lo, _hi = TokenSelector._cdf_select_bracket(
+            probs, u, num_candidates=num_candidates
+        )
+        return vocab_idx, rank, prob, count
+
+    @staticmethod
+    def candidate_entries(probs: np.ndarray) -> list[tuple[int, float]]:
+        """Every token with non-zero probability as ``(index, prob)``, most probable first.
+
+        Read-only companion of :meth:`_cdf_select`: it lists the distribution
+        the selection was made from and has no part in the selection.
+        """
+        nonzero = np.flatnonzero(probs > 0)
+        order = nonzero[np.argsort(probs[nonzero])[::-1]]
+        return [(int(i), float(probs[i])) for i in order]
+
+    @staticmethod
+    def _cdf_select_bracket(
+        probs: np.ndarray, u: float, num_candidates: int | None = None
+    ) -> tuple[int, int, float, int, float, float]:
+        """:meth:`_cdf_select` plus the selected token's cumulative bracket.
+
+        The bracket ``[cdf_lo, cdf_hi)`` is the stretch of the cumulative
+        distribution (candidates in descending probability) that belongs to
+        the selected token: the token is the one whose bracket holds ``u``.
+        The last candidate's bracket is closed at exactly 1.0, because the
+        candidates carry the whole mass and the running sum may stop a few
+        ulps short of it.
+
+        Returns:
+            ``(vocabulary index, rank, probability, num_candidates, cdf_lo, cdf_hi)``.
+
+        Raises:
+            TokenSelectionError: If no tokens have non-zero probability.
+        """
         # Get non-zero probability tokens.
         if num_candidates is None:
             num_candidates = int(np.count_nonzero(probs > 0))
@@ -537,6 +606,8 @@ class TokenSelector:
                         rank,
                         float(head_probs[rank]),
                         num_candidates,
+                        float(head_cdf[rank - 1]) if rank > 0 else 0.0,
+                        1.0 if rank == num_candidates - 1 else float(head_cdf[rank]),
                     )
             # Fall through: selection lies beyond the head (rare tail
             # draw) — take the exact full-sort path below.
@@ -560,5 +631,7 @@ class TokenSelector:
 
         vocab_idx = int(candidate_indices[rank])
         prob = float(candidate_probs[rank])
+        cdf_lo = float(cdf[rank - 1]) if rank > 0 else 0.0
+        cdf_hi = 1.0 if rank == num_candidates - 1 else float(cdf[rank])
 
-        return vocab_idx, rank, prob, num_candidates
+        return vocab_idx, rank, prob, num_candidates, cdf_lo, cdf_hi

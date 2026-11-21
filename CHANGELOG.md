@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — per-request token log
+
+#### 2026-11-21
+
+- A request that sends `qr_token_log: true` and `qr_request_id` gets one
+  JSON-lines file under `QR_TOKEN_LOG_DIR`, one small row per generated
+  token: the draw `u`, the selected token's cumulative bracket (`cdf_lo`,
+  `cdf_hi`), its id, rank and probability, and the temperature and min-p in
+  force. The first row also lists the candidates. The two keys are log
+  controls, not configuration: the config hash and the sampled tokens are
+  the same with and without them (`tests/test_logging/test_token_log.py`).
+- `TokenSamplingRecord` gains `cdf_lo`, `cdf_hi` and `top_entries`;
+  `TokenSelector.select` gains `want_candidates`. Selection is unchanged.
+- `qr-sampler-vllm.service` declares `StateDirectory=qr-sampler` for the
+  log directory.
+
 ### Changed — Qwen3.8 retune of the lane presets (cooler base, half the gate range)
 
 #### 2026-11-02

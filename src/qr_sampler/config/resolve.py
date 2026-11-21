@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from qr_sampler.config.log_args import LOG_ARG_KEYS, TokenLogArgError, parse_log_args
 from qr_sampler.config.model import ALL_FIELDS, PER_REQUEST_FIELDS, QRSamplerConfig
 from qr_sampler.config.presets import expand_extra_args, resolve_preset
 from qr_sampler.exceptions import ConfigValidationError
@@ -62,6 +63,9 @@ def validate_extra_args(extra_args: dict[str, Any]) -> None:
             # Delegates the name check to resolve_preset (single owner).
             resolve_preset(extra_args[key], {})
             continue
+        if key in LOG_ARG_KEYS:
+            # Log controls, not sampler configuration (checked once below).
+            continue
         field_name = _strip_prefix(key)
         if field_name not in ALL_FIELDS:
             raise ConfigValidationError(
@@ -72,6 +76,10 @@ def validate_extra_args(extra_args: dict[str, Any]) -> None:
                 f"Field '{field_name}' is an infrastructure field and cannot be "
                 f"overridden per-request via extra_args"
             )
+    try:
+        parse_log_args(extra_args)
+    except TokenLogArgError as err:
+        raise ConfigValidationError(str(err)) from err
 
 
 def resolve_config(
@@ -122,7 +130,10 @@ def resolve_config(
     # Extract and apply valid overrides.
     overrides: dict[str, Any] = {}
     for key, value in extra_args.items():
-        if not key.startswith("qr_"):
+        if not key.startswith("qr_") or key in LOG_ARG_KEYS:
+            # Log controls never become configuration: a logged request
+            # resolves to the same config, and the same config hash, as an
+            # unlogged one.
             continue
         field_name = _strip_prefix(key)
         overrides[field_name] = value
