@@ -191,13 +191,13 @@ class TestBracket:
 
 
 class TestRows:
-    def test_a_row_is_small_and_rounded(self) -> None:
-        row = sober_row(3, _record())
+    def test_a_row_is_small_and_keeps_the_draw_exact(self) -> None:
+        row = sober_row(3, _record(token_prob=0.2000000000123))
         assert row == {
             "token_index": 3,
             "token_id": 7,
             "timestamp_ns": 1_700_000_000_000,
-            "u_value": 0.123456789,
+            "u_value": 0.123456789012345,
             "cdf_lo": 0.1,
             "cdf_hi": 0.3,
             "token_rank": 1,
@@ -208,6 +208,12 @@ class TestRows:
             "entropy_is_fallback": False,
         }
         assert len(json.dumps(row, separators=(",", ":"))) < 260
+
+    def test_a_draw_next_to_a_bracket_edge_stays_inside_it(self) -> None:
+        lo = 0.30000000000000004
+        row = sober_row(1, _record(u_value=lo + 1e-16, cdf_lo=lo, cdf_hi=0.4))
+        assert row["cdf_lo"] <= row["u_value"] <= row["cdf_hi"]
+        assert json.loads(json.dumps(row))["u_value"] == lo + 1e-16
 
     def test_only_the_first_row_carries_candidates_and_the_source(self) -> None:
         entries = ((7, 0.6), (2, 0.3), (9, 0.1))

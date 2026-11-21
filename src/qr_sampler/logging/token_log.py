@@ -56,7 +56,8 @@ LOG_DIR_ENV = "QR_TOKEN_LOG_DIR"
 CANDIDATE_MASS = 0.9995
 #: Hard ceiling on the candidate list, whatever the mass says.
 MAX_CANDIDATES = 4096
-#: Significant digits kept for every float in a row.
+#: Significant digits kept for the floats that are reported, not compared
+#: (probabilities, temperature, min-p). The draw and its bracket stay exact.
 FLOAT_DIGITS = 10
 
 
@@ -103,9 +104,12 @@ def sober_row(token_index: int, record: TokenSamplingRecord) -> dict[str, Any]:
         "token_index": token_index,
         "token_id": record.token_id,
         "timestamp_ns": record.timestamp_ns,
-        "u_value": _num(record.u_value),
-        "cdf_lo": _num(record.cdf_lo),
-        "cdf_hi": _num(record.cdf_hi),
+        # Exact, not rounded: a reader checks cdf_lo <= u_value <= cdf_hi
+        # with no tolerance, and three independently rounded numbers could
+        # fail that for a draw that sits next to a bracket edge.
+        "u_value": float(record.u_value),
+        "cdf_lo": None if record.cdf_lo is None else float(record.cdf_lo),
+        "cdf_hi": None if record.cdf_hi is None else float(record.cdf_hi),
         "token_rank": record.token_rank,
         "token_prob": _num(record.token_prob),
         "temperature_used": _num(record.temperature_used),
