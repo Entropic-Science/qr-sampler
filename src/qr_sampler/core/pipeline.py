@@ -20,7 +20,7 @@ import logging
 import math
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -80,6 +80,13 @@ def derive_commit_nonce(salt: bytes, step: int, prev_token_id: int) -> int:
     ).digest()
     nonce = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
     return nonce or 1
+
+
+def _as_entries(candidates: Any) -> tuple[tuple[int, float], ...] | None:
+    """The selector's candidate list as an immutable record field."""
+    if candidates is None:
+        return None
+    return tuple((int(token_id), float(prob)) for token_id, prob in candidates)
 
 
 def config_hash(config: QRSamplerConfig) -> str:
@@ -309,6 +316,7 @@ class SamplingPipeline:
         prefetch_ctx: PrefetchContext | None = None,
         build_onehot: bool = True,
         entropy_source: EntropySource | None = None,
+        want_candidates: bool = False,
     ) -> SamplingResult:
         """Sample a single token from a 1-D logit array.
 
@@ -460,6 +468,7 @@ class SamplingPipeline:
             u_value,
             min_p=min_p,
             truncate_first=active_config.truncate_first,
+            want_candidates=want_candidates,
         )
         select_ms = (time.perf_counter_ns() - t_stage) / 1_000_000.0
 
@@ -526,6 +535,20 @@ class SamplingPipeline:
             sample_mean = math.nan
             z_score = draw_meta.z
 
+        # The selected token's cumulative bracket and, when asked for, the
+        # candidate list. A greedy selection (temperature <= 0) has one
+        # candidate holding the whole distribution.
+        select_diag = selection.diagnostics
+        candidates = select_diag.get("candidates")
+        if select_diag.get("greedy"):
+            bracket_lo: float | None = 0.0
+            bracket_hi: float | None = 1.0
+            if want_candidates:
+                candidates = [(selection.token_id, 1.0)]
+        else:
+            bracket_lo = select_diag.get("cdf_lo")
+            bracket_hi = select_diag.get("cdf_hi")
+
         # Optional HVH-Drift / preset diagnostics. ``.get`` returns ``None``
         # for non-HVH strategies and pre-Step-2 selectors that omit min_p_used.
         temp_diag = temp_result.diagnostics
@@ -568,6 +591,9 @@ class SamplingPipeline:
             draw_source_id=draw_meta.source_id if draw_meta is not None else None,
             gate_open=temp_diag.get("gate_open"),
             gate_boost=temp_diag.get("gate_boost"),
+            cdf_lo=bracket_lo,
+            cdf_hi=bracket_hi,
+            top_entries=_as_entries(candidates),
         )
 
         # --- 8. Log ---

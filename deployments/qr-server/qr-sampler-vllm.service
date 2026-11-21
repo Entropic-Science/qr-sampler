@@ -40,6 +40,9 @@ Type=simple
 # / QR_FALLBACK_MODE vars that bind the shared vLLM to the co-located qbert0g
 # daemon with the `qr-sampler` API key. See qr-server.env.example.
 EnvironmentFile=/etc/qr-server/qr-server.env
+# /var/lib/qr-sampler, for the optional per-request token log
+# (QR_TOKEN_LOG_DIR in the .env). Harmless when the log is off.
+StateDirectory=qr-sampler
 # Pipeline parallelism (not tensor) because the 4x RTX 5060s have no NVLink: TP
 # would all-reduce across PCIe every layer and choke; PP crosses the bus only a
 # handful of times per forward pass.

@@ -34,6 +34,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig, resolve_config, validate_extra_args
+from qr_sampler.config.log_args import TokenLogArgError, parse_log_args
 from qr_sampler.core.pipeline import (
     SamplingPipeline,
     build_pipeline,
@@ -45,6 +46,7 @@ from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.engines.vllm.telemetry import _PerfAggregator
 from qr_sampler.entropy.seeded import SeededPrngSource
 from qr_sampler.exceptions import ConfigValidationError, RequestRejectedError
+from qr_sampler.logging.token_log import TokenLogWriter, log_path, token_log_dir
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
 # Formal V1 LogitsProcessor base.
@@ -207,6 +209,7 @@ class _RequestState:
         "prefetch_salt",
         "source",
         "strategy",
+        "token_log",
         "tokens_generated",
     )
 
@@ -232,6 +235,8 @@ class _RequestState:
         self.dominant_source_name = self.source.name
         self.prefetch_salt = os.urandom(16)
         self.entropy_ticket: Any | None = None
+        #: Per-request token log writer, or ``None`` (the usual case).
+        self.token_log: TokenLogWriter | None = None
 
 
 class _BypassState:
@@ -675,6 +680,39 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             with contextlib.suppress(Exception):
                 ticket.cancel()
             state.entropy_ticket = None
+        # A dropped state is a finished request: its token log is complete.
+        token_log = getattr(state, "token_log", None)
+        if token_log is not None:
+            token_log.close()
+            state.token_log = None
+
+    def _open_token_log(self, req_idx: int, extra_args: dict[str, Any]) -> TokenLogWriter | None:
+        """The request's token log writer, or ``None`` when it asked for none.
+
+        Never raises: a request that asks for a log the server cannot write
+        still generates, without one, and the reason is logged.
+        """
+        try:
+            wanted, request_id = parse_log_args(extra_args)
+        except TokenLogArgError as err:
+            logger.error(
+                "request %d: token log arguments rejected, generating without a log: %s",
+                req_idx,
+                err,
+                extra={"event": "token_log.rejected", "req_idx": req_idx},
+            )
+            return None
+        if not wanted or request_id is None:
+            return None
+        directory = token_log_dir()
+        if directory is None:
+            logger.warning(
+                "request %d asked for a token log but QR_TOKEN_LOG_DIR is not set",
+                req_idx,
+                extra={"event": "token_log.unavailable", "req_idx": req_idx},
+            )
+            return None
+        return TokenLogWriter(log_path(directory, request_id))
 
     def _update_state_impl(self, batch_update: Any | None) -> None:
         # Operation order follows the vLLM V1 LogitsProcessor contract
@@ -843,6 +881,7 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 # copy — _sample_row reads its current length per draw.
                 output_tok_ids=output_tok_ids if isinstance(output_tok_ids, list) else None,
             )
+            state.token_log = self._open_token_log(req_idx, extra_args)
             self._request_states[req_idx] = state
 
             # Commit-then-fetch, step 0: fire the FIRST token's entropy
@@ -1079,7 +1118,18 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
                 extra={"event": "entropy.request.stateless_row", "req_idx": i},
             )
         prefetch_ctx: PrefetchContext | None = None
+        token_log: TokenLogWriter | None = None
+        token_index = 0
         if state is not None:
+            token_log = state.token_log
+            # Position of the token being sampled. The live output list is
+            # the truth: vLLM samples and then discards partial-prefill
+            # rows, which the call counter would count as tokens.
+            token_index = (
+                len(state.output_tok_ids)
+                if state.output_tok_ids is not None
+                else state.tokens_generated
+            )
             if state.entropy_override is not None and state.output_tok_ids is not None:
                 # Re-sync the seeded counter to the TOKEN POSITION before
                 # the draw: vLLM samples-then-discards partial-prefill
@@ -1123,7 +1173,11 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             prefetch_ctx=prefetch_ctx,
             build_onehot=False,
             entropy_source=state.entropy_override if state is not None else None,
+            # Only the first token's candidates are logged.
+            want_candidates=token_log is not None and token_index == 0,
         )
+        if token_log is not None:
+            token_log.write(token_index, result.record)
 
         # Store the in-flight ticket for this request's NEXT token
         # (fired inside sample_token immediately after selection).
