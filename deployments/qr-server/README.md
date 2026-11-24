@@ -232,13 +232,33 @@ request:
 | Hashed | `qr_conditioning_mode: hash_truncate` (+ optional `qr_conditioning_hash`, `qr_conditioning_in_bytes`, `qr_conditioning_keep_bytes`) | Qbert0G hashes its raw read block by block and serves only the head of each digest. The served bytes are uniform; defaults are SHA-256 over 128 raw bytes, 16 kept (80,000 raw bytes per 10,000-byte token). |
 | Raw with a matched control | `qr_conditioning_mode: raw` (default) on the quantum arm; `qr_entropy_source_type: qbert_prng_resample` on the control arm | Both arms see the same non-uniform byte statistics: the control replays seeded windows of a frozen recorded dragonfly-0 pool. |
 
-Hashed needs a byte-path amplifier (`qr_signal_amplifier_type: zscore_mean`
-with `qr_zscore_calibration_samples: 0`), because this profile's process
-default is the `server` draw amplifier and draws integrate raw blocks. The
+Hashed needs the byte-path amplifier (`qr_signal_amplifier_type: zscore_mean`
+with `qr_zscore_calibration_samples: 0`): server-integrated draws are
+referenced to the raw device fingerprint and are refused with conditioning.
+At least half of every digest is always discarded (`keep_bytes` at most half
+the digest size, `in_bytes` at least twice `keep_bytes`); a request that asks
+for more is refused, because serving more of a digest may compromise the
+integrity of the signal. The
 entropy server echoes the conditioning it applied and qr-sampler refuses bytes
 without a matching echo, so a daemon that predates conditioning produces a
 labelled fallback token, never raw bytes passed off as hashed. Each token's
 record (and its token-log row) carries the applied conditioning.
+
+## Process defaults: none of any application's
+
+`qr-server.env` sets no `QR_PRESET`. A process-wide preset is expanded into
+the defaults that every request merges over, so whatever a request leaves
+unset is inherited from it. This profile used to carry
+`QR_PRESET=qthought_think`, and the other callers silently inherited its
+`server` amplifier, its 6,000-byte draw and its 200 calibration draws. The
+engine's defaults are now the library's own (`zscore_mean`, 10,000 bytes per
+token, no calibration, fixed T=1), and the rule for every caller is: send the
+whole envelope. qr-llm-api, qr-llm-owui and qr-llm-evals each pin the
+amplifier, the calibration count, `qr_sample_count` and the conditioning in
+every request, so what they show in their settings is what the engine does.
+qthought sends its own `qthought_think` / `qthought_voice` presets per request
+and needs nothing from the process defaults either. The engine logs a warning
+at startup if `QR_PRESET` is set.
 
 ## Per-request lanes (no new server, no contract bump)
 

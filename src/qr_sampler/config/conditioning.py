@@ -62,7 +62,8 @@ def conditioning_problem(mode: str, hash_name: str, in_bytes: int, keep_bytes: i
     if not 1 <= keep_bytes <= digest_size // 2:
         return (
             f"conditioning_keep_bytes must be between 1 and {digest_size // 2} for "
-            f"{hash_name} (at least half of every digest is discarded), got {keep_bytes}"
+            f"{hash_name}, got {keep_bytes}: at least half of every digest must be "
+            "discarded, serving more may compromise the integrity of the signal"
         )
     if in_bytes < 2 * keep_bytes:
         return (
