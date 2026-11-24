@@ -117,6 +117,10 @@ def sober_row(token_index: int, record: TokenSamplingRecord) -> dict[str, Any]:
         "num_candidates": record.num_candidates,
         "entropy_is_fallback": record.entropy_is_fallback,
     }
+    if record.conditioning is not None:
+        # Present only on conditioned tokens, so a raw request's rows keep
+        # their exact shape.
+        row["conditioning"] = record.conditioning
     if token_index == 0:
         row["entropy_source_used"] = record.entropy_source_used
         if record.top_entries is not None:

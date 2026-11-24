@@ -44,6 +44,7 @@ class InstanceNamedSource(EntropySource):
     def __init__(self, inner: EntropySource, instance_name: str) -> None:
         self._inner = inner
         self._instance_name = instance_name
+        self.supports_conditioning = bool(getattr(inner, "supports_conditioning", False))
 
     @property
     def name(self) -> str:
@@ -60,9 +61,9 @@ class InstanceNamedSource(EntropySource):
         """Delegate availability to the wrapped source."""
         return self._inner.is_available
 
-    def get_random_bytes(self, n: int) -> bytes:
+    def get_random_bytes(self, n: int, **kwargs: Any) -> bytes:
         """Delegate to the wrapped source."""
-        return self._inner.get_random_bytes(n)
+        return self._inner.get_random_bytes(n, **kwargs)
 
     def get_random_float64(
         self,
@@ -72,13 +73,13 @@ class InstanceNamedSource(EntropySource):
         """Delegate to the wrapped source (it may override the default)."""
         return self._inner.get_random_float64(shape, out)
 
-    def prefetch(self, n: int, nonce: int | None = None) -> Any | None:
+    def prefetch(self, n: int, nonce: int | None = None, **kwargs: Any) -> Any | None:
         """Delegate to the wrapped source."""
-        return self._inner.prefetch(n, nonce)
+        return self._inner.prefetch(n, nonce, **kwargs)
 
-    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
+    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None, **kwargs: Any) -> bytes:
         """Delegate to the wrapped source."""
-        return self._inner.get_random_bytes_with_ticket(n, ticket)
+        return self._inner.get_random_bytes_with_ticket(n, ticket, **kwargs)
 
     def get_draw(
         self, block_bytes: int, source_id: str, ticket: Any | None = None

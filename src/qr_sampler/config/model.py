@@ -22,6 +22,7 @@ from typing import Any
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from qr_sampler.config.conditioning import conditioning_problem
 from qr_sampler.exceptions import ConfigValidationError
 
 #: Marker for per-request-overridable fields (see module docstring).
@@ -47,6 +48,13 @@ DETERMINISTIC_LANE_FORBIDDEN_STRATEGIES: frozenset[str] = frozenset({"coherence_
 #: principle; the reconstruction is not implemented, hence the warning.
 DETERMINISTIC_LANE_STATEFUL_WARN_STRATEGIES: frozenset[str] = frozenset(
     {"hvh_drift", "ring_buffer_ar"}
+)
+
+#: Builtin entropy sources that are not a gRPC entropy server and so
+#: cannot apply server-side conditioning. A named instance is always
+#: gRPC-backed; third-party sources are checked when the request runs.
+CONDITIONING_UNSUPPORTED_SOURCES: frozenset[str] = frozenset(
+    {"system", "mock_uniform", "timing_noise", "openentropy", "seeded_prng"}
 )
 
 #: Infrastructure fields a named entropy-source instance may override.
@@ -422,6 +430,46 @@ class QRSamplerConfig(BaseSettings):
             "failure: every u pinned to an extreme selects the same lexicon "
             "index on every draw). Baseline correction, not censoring — the "
             "same rationale as the server-integrated draw path."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+
+    # --- Entropy conditioning (per-request overridable) ---
+    # What the entropy server does to its raw bytes before serving them on
+    # the byte path. See config/conditioning.py.
+
+    conditioning_mode: str = Field(
+        default="raw",
+        description=(
+            "Entropy conditioning: 'raw' serves the device's measured bytes "
+            "untouched; 'hash_truncate' has the entropy server hash its raw "
+            "read block by block and serve only the head of each digest, so "
+            "the served bytes are uniform whatever the device's own byte "
+            "distribution is. Needs a gRPC entropy source and a byte-path "
+            "amplifier (not 'server')."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    conditioning_hash: str = Field(
+        default="sha256",
+        description="hash_truncate: hash function (sha256, sha512, sha3_256, blake2b)",
+        json_schema_extra=_PER_REQUEST,
+    )
+    conditioning_in_bytes: int = Field(
+        default=128,
+        ge=1,
+        description=(
+            "hash_truncate: raw bytes hashed per digest. Must be at least "
+            "2 * conditioning_keep_bytes."
+        ),
+        json_schema_extra=_PER_REQUEST,
+    )
+    conditioning_keep_bytes: int = Field(
+        default=16,
+        ge=1,
+        description=(
+            "hash_truncate: leading bytes of each digest that are served. At "
+            "most half the digest: the rest is always discarded."
         ),
         json_schema_extra=_PER_REQUEST,
     )
@@ -983,6 +1031,45 @@ class QRSamplerConfig(BaseSettings):
         ),
         json_schema_extra=_PER_REQUEST,
     )
+
+    @model_validator(mode="after")
+    def _validate_conditioning(self) -> QRSamplerConfig:
+        """Cross-validate the entropy-conditioning selection.
+
+        A ``@model_validator`` for the same reason as the deterministic
+        lane below: it must run on every construction path, so a bad
+        selection is a clean per-request rejection in the API server and
+        never a raise inside the engine worker.
+        """
+        problem = conditioning_problem(
+            self.conditioning_mode,
+            self.conditioning_hash,
+            self.conditioning_in_bytes,
+            self.conditioning_keep_bytes,
+        )
+        if problem is not None:
+            raise ConfigValidationError(problem)
+        if self.conditioning_mode == "raw":
+            return self
+        if self.signal_amplifier_type == "server":
+            raise ConfigValidationError(
+                "conditioning_mode='hash_truncate' applies to the byte path; "
+                "signal_amplifier_type='server' draws integrate raw blocks on the "
+                "entropy server. Use a byte-path amplifier (e.g. 'zscore_mean')."
+            )
+        if self.zscore_calibration_samples > 0:
+            raise ConfigValidationError(
+                "conditioning_mode='hash_truncate' serves uniform bytes, which need "
+                "no baseline calibration (and calibration reads raw blocks); set "
+                "zscore_calibration_samples=0."
+            )
+        if self.entropy_source_type in CONDITIONING_UNSUPPORTED_SOURCES:
+            raise ConfigValidationError(
+                f"conditioning_mode='hash_truncate' is applied by a gRPC entropy "
+                f"server; entropy_source_type={self.entropy_source_type!r} cannot "
+                "apply it."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_deterministic_lane(self) -> QRSamplerConfig:

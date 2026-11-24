@@ -43,6 +43,7 @@ database:
 # instances (QR_ENTROPY_SOURCE_INSTANCES in qr-server.env) carry one each:
 #   qbert0g keys create --name qr-sampler-prng-uniform --device prng_uniform
 #   qbert0g keys create --name qr-sampler-prng-markov  --device prng_markov
+#   qbert0g keys create --name qr-sampler-prng-resample --device prng_resample
 # No key binds draws to dragonfly-1 — it is the coherence reference only.
 auth:
   api_key: "sample-only-your-secure-bootstrap-key"
@@ -66,9 +67,33 @@ limits:
 # ── Post-processing ──────────────────────────────────────────────────────────
 # Entropy-research deployments REQUIRE raw — SHA-256 launders away exactly the
 # signal they study. (chardev devices ignore this: they serve whatever the
-# driver DMA delivers.)
+# driver DMA delivers.) This is the DEVICE-level mode and stays raw: the
+# daemon always measures raw bytes. A caller that wants uniform bytes selects
+# `hash_truncate` per request (see `conditioning:` below).
 post_processing:
   mode: raw
+
+# ── Per-request conditioning (byte path only) ────────────────────────────────
+# The daemon serves raw unless a request says otherwise in its gRPC metadata:
+#   qr-conditioning: hash_truncate
+#   qr-conditioning-hash / -in-bytes / -keep-bytes   (optional; defaults below)
+# hash_truncate cuts the raw read into `in_bytes` blocks, hashes each block on
+# its own and keeps only the first `keep_bytes` of each digest. Two rules are
+# fixed in code, not here: keep_bytes <= half the digest, and in_bytes >=
+# 2 * keep_bytes — the output is always much shorter than the raw input it
+# came from. With the defaults a 10,000-byte request reads 80,000 raw bytes.
+# The applied conditioning is echoed in initial metadata
+# (qr-conditioning-applied) and written, with the raw block's sha256, into the
+# request's provenance record. Callers that send no header (qthought, the
+# public qrng clients) get raw exactly as before. PurityService draws refuse
+# conditioning: their integrators are referenced to the raw fingerprint.
+conditioning:
+  allow_request: true
+  hashes: ["blake2b", "sha256", "sha3_256", "sha512"]
+  default_hash: sha256
+  default_in_bytes: 128
+  default_keep_bytes: 16
+  max_in_bytes: 4096
 
 # ── Freshness (the just-in-time measurement contract) ────────────────────────
 freshness:
@@ -119,6 +144,21 @@ controls:
     type: "prng_markov"
     model: "/etc/qthought/models/dragonfly-0_markov_v1.npz"
     seed: "0x243f6a8885a308d313198a2e03707344"
+  # Matched control for the NON-uniform raw stream: each request the seeded
+  # PRNG picks one contiguous window of a frozen recorded dragonfly-0 pool.
+  # A window is a real device read, so it keeps the card's byte distribution
+  # and its within-block correlation (the markov control keeps only lag 1).
+  # OPERATOR PREREQUISITE: record the pool THROUGH the running daemon first —
+  #   QBERT0G_API_KEY=<a dragonfly-0 key> python scripts/record_pool.py \
+  #       --device-id dragonfly-0 --bytes 268435456 \
+  #       --out /var/lib/qbert0g/pools/dragonfly-0_pool_v1.bin
+  # The pool is a snapshot and does not follow later device drift: re-record
+  # under a new name between study runs. Its sha256 is in every provenance
+  # fact of this control. The file must exist when the daemon STARTS.
+  - id: "prng_resample"
+    type: "prng_resample"
+    pool: "/var/lib/qbert0g/pools/dragonfly-0_pool_v1.bin"
+    seed: "0x13198a2e03707344a4093822299f31d0"
 
 # ── QPI: server-side integration, coherence, purity ─────────────────────────
 # One whole-block integrated draw (u) per PurityService request. ONLY
