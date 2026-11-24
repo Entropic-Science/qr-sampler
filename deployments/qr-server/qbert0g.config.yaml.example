@@ -197,3 +197,13 @@ purity:
 provenance:
   path: "/var/lib/qbert0g/provenance.jsonl"
   strict: false
+  # The log is bounded. When the next record would take the file past
+  # max_bytes it becomes <path>.1 (older archives shift up) and the archive
+  # beyond keep_files is dropped, so at most max_bytes * (keep_files + 1)
+  # stays on disk: 1 GiB at these defaults. A token-sampling client writes
+  # one record per token and the coherence monitor one per evaluation, so an
+  # unbounded log grows by gigabytes a week. For a study run that must keep
+  # every record, set max_bytes: 0 (never rotate) and archive the file
+  # yourself afterwards.
+  max_bytes: 268435456
+  keep_files: 3
