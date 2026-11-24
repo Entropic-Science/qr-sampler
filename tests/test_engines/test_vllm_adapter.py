@@ -6,6 +6,7 @@ and handles batch state management.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -291,6 +292,29 @@ class TestPipelineDelegation:
                 "QR_PREINIT_ENTROPY_SOURCES",
             ):
                 os.environ.pop(key, None)
+
+    def test_process_preset_is_warned_about(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A process-wide preset leaks its fields into every request that does
+        not set them, so starting with one is logged loudly; without one the
+        defaults are the library's own and nothing is logged."""
+        monkeypatch.setenv("QR_ENTROPY_SOURCE_TYPE", "mock_uniform")
+        monkeypatch.setenv("QR_FALLBACK_MODE", "error")
+        monkeypatch.setenv("QR_PREINIT_ENTROPY_SOURCES", "mock_uniform")
+        monkeypatch.delenv("QR_PRESET", raising=False)
+        with caplog.at_level(logging.WARNING, logger="qr_sampler"):
+            adapter = VLLMAdapter(vllm_config=None)
+            assert adapter.default_config.sample_count == 10000
+            assert adapter.default_config.signal_amplifier_type == "zscore_mean"
+            adapter.close()
+            assert not [r for r in caplog.records if "QR_PRESET" in r.getMessage()]
+
+            monkeypatch.setenv("QR_PRESET", "qthought_think")
+            adapter = VLLMAdapter(vllm_config=None)
+            assert adapter.default_config.sample_count == 6000
+            adapter.close()
+        assert any("QR_PRESET=qthought_think" in r.getMessage() for r in caplog.records)
 
     def test_close_delegates_to_pipeline(self) -> None:
         """close() delegates to pipeline.close()."""

@@ -435,6 +435,55 @@ Per-request stateful: a ring buffer of the last `rba_buffer_n` emitted token ids
 
 ---
 
+## Raw or hashed entropy
+
+A physical entropy device is not a perfect uniform source. The Dragonfly card this project runs on has a byte mean near 125 instead of 127.5, and its block means spread several times wider than independent bytes would. The default amplifier compares each token's byte mean with the ideal 127.5, so on raw bytes the draw `u` is skewed: measured on the live card, about 70% of draws fall below 0.1. An experiment that compares such a quantum arm with a uniform pseudo-random arm measures the device's byte histogram, not the source of the randomness. There are two ways to make the comparison fair. Both are selected per request and need a gRPC entropy server that implements them ([Qbert0G](https://github.com/Entropic-Science/Qbert0G) does).
+
+### Option 1: hashed (`hash_truncate`)
+
+```json
+{"extra_args": {
+  "qr_conditioning_mode": "hash_truncate",
+  "qr_conditioning_hash": "sha256",
+  "qr_conditioning_in_bytes": 128,
+  "qr_conditioning_keep_bytes": 16,
+  "qr_signal_amplifier_type": "zscore_mean",
+  "qr_zscore_calibration_samples": 0
+}}
+```
+
+The entropy server hashes its raw read in blocks of `in_bytes` and serves the first `keep_bytes` of each digest. The served bytes are uniform whatever the device's own distribution is, so the quantum arm can be compared directly with any uniform pseudo-random arm. At the defaults one served byte costs 8 raw bytes: a 10,000-byte token reads 80,000 bytes from the device, which adds no measurable latency on a PCIe card.
+
+Two rules are fixed in code, here and in the server, and cannot be configured away:
+
+- **At least half of every digest is discarded**: `keep_bytes` is at most half the digest size (16 for `sha256` and `sha3_256`, 32 for `sha512` and `blake2b`). Serving more than half of a digest may compromise the integrity of the signal, so such a setting is refused with an error that says so.
+- **Every block holds at least twice the bytes it yields**: `in_bytes` is at least `2 * keep_bytes`.
+
+The server echoes the conditioning it applied and qr-sampler refuses bytes without a matching echo, so a server that predates conditioning produces a labelled fallback token and never raw bytes passed off as hashed. Each token's record and token-log row carries the applied conditioning. Hashing is refused with the `server` amplifier (its draws are referenced to the raw device fingerprint), with calibration draws, with a seed, and on any source that is not a gRPC entropy server.
+
+### Option 2: raw, with a matched control (`prng_resample`)
+
+Leave `qr_conditioning_mode` at `raw` and keep the device's bytes exactly as measured. The quantum arm is then non-uniform, so the control arm must be non-uniform in the same way. Qbert0G's `prng_resample` control does that: it serves seeded, PRNG-chosen windows of a frozen pool of bytes recorded from the same device before the run. The control has the card's own byte statistics and short-range correlations, but nothing measured at request time reaches its output, and every block it served can be regenerated offline from `(pool, seed, draw_index, n)`.
+
+To use it:
+
+1. Record a pool on the entropy server and declare the control (`scripts/record_pool.py` and the `controls:` section in Qbert0G; its deployment README has the steps).
+2. Create an API key bound to the control and declare a named source instance for it on the engine:
+
+   ```bash
+   QR_ENTROPY_SOURCE_INSTANCES='{"qbert_prng_resample":{"type":"quantum_grpc","grpc_api_key":"<key bound to prng_resample>"}}'
+   ```
+
+3. Send the quantum arm with `qr_entropy_source_type: "quantum_grpc"` and the control arm with `qr_entropy_source_type: "qbert_prng_resample"`, everything else identical. The instance name is carried through every record, so the control is always labelled as pseudo-random.
+
+What to know before choosing this option:
+
+- The pool is a snapshot and the device drifts. On the live card the raw quantum z-mean was -2.2 while the pool recorded hours earlier gave -2.8. The match is close, not exact; record a fresh pool under a new name between study runs.
+- Both arms are skewed the same way, so the sampler behaves more greedily than its temperature suggests in both. The comparison is fair, but neither arm samples from the distribution the temperature strategy intends.
+- The control can also be hashed (`hash_truncate` applies to it like to any gRPC source), which gives a third arm: hashed pseudo-random bytes from the same pipeline.
+
+Hashed is the mode the Entropic Science applications use by default (qr-llm-api, qr-llm-owui, qr-llm-evals). The matched control is available here and in Qbert0G for experiments that must keep the raw bytes; qr-llm-evals does not offer it.
+
 ## Presets
 
 A preset is a named bundle of `qr_*` overrides that callers opt into via `qr_preset` (per-request) or `QR_PRESET` (env var, process-wide default). Six ship built in:
@@ -444,7 +493,7 @@ A preset is a named bundle of `qr_*` overrides that callers opt into via `qr_pre
 | `creative_sampling` | `hvh_drift` strategy with the V6_HVD_R01_01 winner hyperparameters + dynamic min-p | **Experimental** |
 | `normal_t1` | Vanilla `fixed` strategy at T=1, no top-k / top-p truncation | Stable baseline |
 | `qthought` | Entropy profile for the `QthoughtRoller` decode lane (quantum source + `zscore_thought`) | Frozen research lineage |
-| `qthought_think` | REFLECT sampling lane for qr-llm-qthought (hotter HVH-drift, 6,000-byte fetch) | Frozen research lineage |
+| `qthought_think` | REFLECT sampling lane for qr-llm-qthought (coherence-gated EDT, truncated; `server` amplifier, 6,000-byte fallback fetch) | Frozen research lineage |
 | `qthought_voice` | SPEAK sampling lane for qr-llm-qthought (EDT + nucleus/top-k, 10,000-byte fetch) | Frozen research lineage |
 | `qthought_purity` | Server-draw mode: `server` amplifier + `coherence_gate` over `fixed` at T=1 (PurityService required; degrades fail-safe) | QPI default composition |
 
@@ -466,6 +515,8 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json" -d
 ```
 
 Per-request `qr_preset` beats the `QR_PRESET` env var; per-request `qr_*` keys override individual values inside the active preset:
+
+> **`QR_PRESET` on a shared engine.** The env preset is expanded into the process defaults that every request merges over. A request that names its own `qr_preset` still inherits every field of the env preset that its own preset and keys do not set (amplifier, `sample_count`, calibration draws). On an engine that serves more than one application, leave `QR_PRESET` unset and have each caller send its full envelope; the vLLM adapter logs a warning at startup when it is set.
 
 ```json
 {"extra_args": {"qr_preset": "creative_sampling", "qr_hvh_t_base": 1.2}}

@@ -87,6 +87,7 @@ class TestSelection:
             (("nope", "sha256", 128, 16), "conditioning_mode"),
             (("hash_truncate", "md5", 128, 16), "conditioning_hash"),
             (("hash_truncate", "sha256", 128, 17), "at least half"),
+            (("hash_truncate", "sha256", 128, 17), "integrity of the signal"),
             (("hash_truncate", "sha512", 128, 33), "at least half"),
             (("hash_truncate", "sha256", 31, 16), "at least 2"),
         ],

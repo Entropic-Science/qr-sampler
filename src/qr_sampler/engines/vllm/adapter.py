@@ -307,6 +307,15 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
         # validate_params dry-runs against, so API-side acceptance and
         # worker-side resolution can never disagree.
         self._default_config = _process_default_config()
+        process_preset = QRSamplerConfig().preset
+        if process_preset:
+            logger.warning(
+                "QR_PRESET=%s is expanded into this engine's process defaults: every "
+                "request inherits each of its fields that the request does not set "
+                "itself (amplifier, sample_count, temperature strategy, truncation). "
+                "On an engine shared by several applications leave QR_PRESET unset.",
+                process_preset,
+            )
 
         # --- Pre-initialise one pipeline per allowed entropy source ---
         # The default source from QR_ENTROPY_SOURCE_TYPE is always included

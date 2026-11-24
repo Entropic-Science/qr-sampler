@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — the shared-engine profile carries no process preset
+
+#### 2026-11-24
+
+- `deployments/qr-server/qr-server.env.example` no longer sets
+  `QR_PRESET=qthought_think`. The preset was expanded into the process
+  defaults, so every caller inherited the fields it did not set itself: the
+  `server` amplifier, a 6,000-byte draw and 200 calibration draws. The engine
+  defaults are the library's own again; callers send their full envelope.
+- The vLLM adapter logs a warning at startup when `QR_PRESET` is set, naming
+  what requests inherit from it.
+- The `hash_truncate` keep-bytes error says why the limit exists: serving more
+  than half of a digest may compromise the integrity of the signal.
+- README: new section "Raw or hashed entropy" documents both modes, including
+  the `prng_resample` matched control for raw bytes.
+
 ### Added — entropy conditioning, per request
 
 #### 2026-11-24
