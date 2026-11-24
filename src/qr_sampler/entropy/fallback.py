@@ -85,6 +85,9 @@ class FallbackEntropySource(EntropySource):
     def __init__(self, primary: EntropySource, fallback: EntropySource) -> None:
         self._primary = primary
         self._fallback = fallback
+        # Conditioning is applied by the PRIMARY's entropy server; a token
+        # the fallback serves is unconditioned and recorded as fallback.
+        self.supports_conditioning = bool(getattr(primary, "supports_conditioning", False))
         self._last_source_used: str = primary.name
         # Per-thread view of "who served MY last fetch". The engine
         # adapter samples batch rows on concurrent worker threads (perf
@@ -162,8 +165,12 @@ class FallbackEntropySource(EntropySource):
         """
         return self._currently_degraded or self._draw_degraded
 
-    def get_random_bytes(self, n: int) -> bytes:
+    def get_random_bytes(self, n: int, **kwargs: Any) -> bytes:
         """Fetch bytes from the primary source, falling back if unavailable.
+
+        Extra keywords (``conditioning=``) go to the PRIMARY only: they ask
+        an entropy server to transform its raw bytes, which has no meaning
+        for the local fallback source.
 
         Only ``EntropyUnavailableError`` triggers fallback. All other
         exceptions propagate to the caller unchanged.
@@ -177,9 +184,9 @@ class FallbackEntropySource(EntropySource):
         Raises:
             EntropyUnavailableError: If **both** primary and fallback fail.
         """
-        return self._fetch_via(n, lambda: self._primary.get_random_bytes(n))
+        return self._fetch_via(n, lambda: self._primary.get_random_bytes(n, **kwargs))
 
-    def prefetch(self, n: int, nonce: int | None = None) -> Any | None:
+    def prefetch(self, n: int, nonce: int | None = None, **kwargs: Any) -> Any | None:
         """Delegate prefetch to the primary source.
 
         Never raises: a primary without async support (or one that fails
@@ -187,11 +194,11 @@ class FallbackEntropySource(EntropySource):
         ordinary synchronous fetch-with-fallback route.
         """
         try:
-            return self._primary.prefetch(n, nonce)
+            return self._primary.prefetch(n, nonce, **kwargs)
         except Exception:
             return None
 
-    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
+    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None, **kwargs: Any) -> bytes:
         """Redeem a prefetch ticket with identical failover semantics.
 
         The primary's redeem already degrades internally (failed ticket →
@@ -201,8 +208,10 @@ class FallbackEntropySource(EntropySource):
         status-file writes, and recovery transitions as the serial path.
         """
         if ticket is None:
-            return self.get_random_bytes(n)
-        return self._fetch_via(n, lambda: self._primary.get_random_bytes_with_ticket(n, ticket))
+            return self.get_random_bytes(n, **kwargs)
+        return self._fetch_via(
+            n, lambda: self._primary.get_random_bytes_with_ticket(n, ticket, **kwargs)
+        )
 
     def get_draw(
         self, block_bytes: int, source_id: str, ticket: Any | None = None

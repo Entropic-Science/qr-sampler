@@ -599,6 +599,10 @@ Environment-only settings (read outside the config model):
 | `QR_SAMPLE_COUNT` | `qr_sample_count` | `10000` | Entropy bytes fetched per token |
 | `QR_POPULATION_MEAN` | `qr_population_mean` | `127.5` | Null-hypothesis mean for byte values |
 | `QR_POPULATION_STD` | `qr_population_std` | `73.612...` | Population std for uniform [0, 255] |
+| `QR_CONDITIONING_MODE` | `qr_conditioning_mode` | `raw` | `raw` serves the device's measured bytes; `hash_truncate` has the entropy server hash its raw read block by block and serve only the head of each digest (uniform bytes). gRPC sources and byte-path amplifiers only |
+| `QR_CONDITIONING_HASH` | `qr_conditioning_hash` | `sha256` | `hash_truncate`: `sha256`, `sha512`, `sha3_256` or `blake2b` |
+| `QR_CONDITIONING_IN_BYTES` | `qr_conditioning_in_bytes` | `128` | `hash_truncate`: raw bytes hashed per digest (at least 2 x keep) |
+| `QR_CONDITIONING_KEEP_BYTES` | `qr_conditioning_keep_bytes` | `16` | `hash_truncate`: leading digest bytes served (at most half the digest) |
 | `QR_UNIFORM_CLAMP_EPSILON` | `qr_uniform_clamp_epsilon` | `1e-10` | Clamp u to avoid degenerate CDF |
 | `QR_TEMPERATURE_STRATEGY` | `qr_temperature_strategy` | `fixed` | Strategy: `fixed`, `edt`, `edt_paper`, `hvh_drift`, `coherence_gate`, `tt_exchange`, `evdt_tt`, `gdt`, `dynatemp`, `belltemp`, `mix_temperatures`, `ring_buffer_ar` |
 | `QR_COHERENCE_THRESHOLD` | `qr_coherence_threshold` | `3.5` | Minimum `coherence_z` for the gate to open |

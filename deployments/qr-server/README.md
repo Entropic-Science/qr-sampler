@@ -212,12 +212,33 @@ request without a restart.
 
 **Named instances:** `QR_ENTROPY_SOURCE_INSTANCES` (JSON) declares named
 instances of a source type with per-instance infrastructure overrides — the
-qr-server profile ships `qbert_prng_uniform` and `qbert_prng_markov`, both
-`quantum_grpc` pipelines whose API keys are bound to the daemon's seeded PRNG
-control sources (see key provisioning below). Declared instances are always
+qr-server profile ships `qbert_prng_uniform`, `qbert_prng_markov` and
+`qbert_prng_resample`, all `quantum_grpc` pipelines whose API keys are bound
+to the daemon's seeded PRNG control sources (see key provisioning below). Declared instances are always
 pre-initialised (union with the list above) and are selected per-request via
 `qr_entropy_source_type: "<instance name>"`; the instance name is carried
 end-to-end in diagnostics, so a PRNG lane is loudly labelled, never laundered.
+
+## Raw or hashed entropy, per request
+
+dragonfly-0's raw bytes are not uniform (byte mean near 125, block means
+several times more spread than independent bytes allow), and a byte-mean
+z-score against the ideal 127.5 turns that into a skewed draw `u`. There are
+two supported ways to run a comparison that is fair anyway, both selected per
+request:
+
+| Mode | Request keys | What it does |
+|---|---|---|
+| Hashed | `qr_conditioning_mode: hash_truncate` (+ optional `qr_conditioning_hash`, `qr_conditioning_in_bytes`, `qr_conditioning_keep_bytes`) | Qbert0G hashes its raw read block by block and serves only the head of each digest. The served bytes are uniform; defaults are SHA-256 over 128 raw bytes, 16 kept (80,000 raw bytes per 10,000-byte token). |
+| Raw with a matched control | `qr_conditioning_mode: raw` (default) on the quantum arm; `qr_entropy_source_type: qbert_prng_resample` on the control arm | Both arms see the same non-uniform byte statistics: the control replays seeded windows of a frozen recorded dragonfly-0 pool. |
+
+Hashed needs a byte-path amplifier (`qr_signal_amplifier_type: zscore_mean`
+with `qr_zscore_calibration_samples: 0`), because this profile's process
+default is the `server` draw amplifier and draws integrate raw blocks. The
+entropy server echoes the conditioning it applied and qr-sampler refuses bytes
+without a matching echo, so a daemon that predates conditioning produces a
+labelled fallback token, never raw bytes passed off as hashed. Each token's
+record (and its token-log row) carries the applied conditioning.
 
 ## Per-request lanes (no new server, no contract bump)
 
@@ -347,9 +368,10 @@ qbert0g keys create --name qr-sampler-prng-markov  --device prng_markov
 Paste each created key into its consuming process:
 `qr-sampler` → `QR_GRPC_API_KEY` in this profile's `qr-server.env`;
 `qthought` → `QR_GRPC_API_KEY` in qthought's own env;
-the two study keys → the matching `grpc_api_key` values inside
+the study keys → the matching `grpc_api_key` values inside
 `QR_ENTROPY_SOURCE_INSTANCES` in this profile's `qr-server.env`
-(`qbert_prng_uniform` / `qbert_prng_markov` instances).
+(`qbert_prng_uniform` / `qbert_prng_markov` / `qbert_prng_resample`
+instances).
 
 **No key binds draws to `dragonfly-1`.** That card is the coherence reference
 only.
@@ -371,6 +393,22 @@ P(1), lag-1 correlation) — eyeball it before use. Until the npz exists, either
 comment out the `prng_markov` control (and skip its key) or keep the daemon on
 the previous config; the `qbert_prng_markov` vLLM instance then simply rejects
 cleanly per-request.
+
+### `prng_resample` prerequisite — record the pool first (operator step)
+
+The `prng_resample` control replays seeded windows of a frozen raw dump of
+dragonfly-0. Record it through the running daemon before enabling the control:
+
+```bash
+# In the Qbert0G repo, with a key bound to dragonfly-0:
+QBERT0G_API_KEY=<key> python scripts/record_pool.py \
+    --device-id dragonfly-0 --bytes 268435456 \
+    --out /var/lib/qbert0g/pools/dragonfly-0_pool_v1.bin
+```
+
+The pool is a snapshot: re-record under a new name between study runs if the
+device has drifted. Until the file exists, comment out the control (and skip
+its key and instance).
 
 ### `provenance.strict: true` — recommended for study runs
 

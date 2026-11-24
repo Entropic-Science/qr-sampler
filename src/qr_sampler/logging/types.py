@@ -148,3 +148,9 @@ class TokenSamplingRecord:
     # ``(token_id, probability)``, most probable first. Filled only when
     # the caller asked for it (the token log does, for the first token).
     top_entries: tuple[tuple[int, float], ...] | None = field(default=None)
+
+    # Canonical string of the conditioning the entropy server applied to
+    # this token's bytes (e.g. ``hash_truncate;sha256;128;16``). ``None``
+    # for raw bytes, for the server-draw path, and for a token the local
+    # fallback source served.
+    conditioning: str | None = field(default=None)

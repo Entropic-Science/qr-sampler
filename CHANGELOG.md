@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — entropy conditioning, per request
+
+#### 2026-11-24
+
+- `qr_conditioning_mode` (`raw`, the default, or `hash_truncate`) with
+  `qr_conditioning_hash`, `qr_conditioning_in_bytes` and
+  `qr_conditioning_keep_bytes`, all per-request. With `hash_truncate` the
+  gRPC source asks the entropy server (Qbert0G) in call metadata to hash its
+  raw read block by block and serve only the head of each digest, so the
+  bytes the amplifier sees are uniform whatever the device's own byte
+  distribution is. `keep_bytes` is at most half the digest and `in_bytes` at
+  least twice `keep_bytes`; both are refused otherwise.
+- The server echoes the conditioning it applied; bytes without a matching
+  echo are refused (`EntropyUnavailableError`), so a server that predates
+  conditioning yields a labelled fallback token and never raw bytes used as
+  hashed ones. Works in unary, server-streaming and bidi modes (a non-raw
+  selection rides its own bidi stream) and on the pipelined prefetch path.
+- Rejected at request validation: `hash_truncate` with a non-gRPC builtin
+  source, with `signal_amplifier_type: server`, or with
+  `zscore_calibration_samples > 0`.
+- `TokenSamplingRecord.conditioning` and the token-log rows carry the applied
+  conditioning; both are absent for raw requests, whose rows are unchanged.
+- qr-server profile: `qbert_prng_resample` named instance (Qbert0G's
+  `prng_resample` control), the matched control for raw quantum bytes.
+- No proto change. A raw request is byte-identical on the wire to before.
+
 ### Added — per-request token log
 
 #### 2026-11-21

@@ -20,6 +20,7 @@ import contextlib
 import time
 from typing import TYPE_CHECKING, Any
 
+from qr_sampler.config.conditioning import APPLIED_HEADER, RAW, Conditioning
 from qr_sampler.exceptions import EntropyUnavailableError
 from qr_sampler.proto.entropy_service_pb2 import EntropyRequest, EntropyResponse
 from qr_sampler.proto.purity_service_pb2 import DrawRequest, DrawResponse
@@ -126,6 +127,28 @@ def decode_draw_reply(raw: bytes) -> DrawResponse:
     return msg
 
 
+async def _require_applied(call: Any, conditioning: Conditioning) -> None:
+    """Fail unless the server says it applied *conditioning*.
+
+    The server echoes the conditioning it applied in initial metadata. A
+    server that predates conditioning ignores the request metadata and
+    sends no echo — its bytes are raw, and using them as conditioned
+    bytes would silently change what the request asked for. So a missing
+    or different echo makes the fetch unavailable.
+    """
+    initial = await call.initial_metadata()
+    applied: str | None = None
+    for key, value in initial or ():
+        if key == APPLIED_HEADER:
+            applied = value.decode() if isinstance(value, bytes) else str(value)
+            break
+    if applied != conditioning.canonical():
+        raise EntropyUnavailableError(
+            f"entropy server did not apply conditioning {conditioning.canonical()!r} "
+            f"(it reported {applied!r}); refusing the bytes"
+        )
+
+
 class _FetchReply:
     """Decoded result of one entropy fetch, with true call latency.
 
@@ -203,6 +226,7 @@ class _BidiSession:
         loop: asyncio.AbstractEventLoop,
         decode: Callable[[bytes], tuple[Any, int]] = _decode_entropy_frame,
     ) -> None:
+        self.call = call  # exposed for the one-time initial-metadata check
         self._call = call
         self._loop = loop
         self._decode = decode
@@ -293,8 +317,16 @@ class GrpcTransport:
         # Streaming state (lazily initialized on the loop thread).
         self._bidi_session: _BidiSession | None = None
         self._draw_bidi_session: _BidiSession | None = None
+        # Conditioning is fixed by a stream's invocation metadata, so each
+        # non-raw selection gets its own persistent byte stream (keyed by
+        # the canonical string; a deployment uses a handful at most).
+        self._conditioned_bidi: dict[str, _BidiSession] = {}
 
-    async def fetch(self, n: int, nonce: int = 0) -> _FetchReply:
+    def _metadata_for(self, conditioning: Conditioning) -> tuple[tuple[str, str], ...] | None:
+        """Call metadata: API key plus the conditioning selection."""
+        return (self._metadata + conditioning.metadata()) or None
+
+    async def fetch(self, n: int, nonce: int = 0, conditioning: Conditioning = RAW) -> _FetchReply:
         """Route to the appropriate transport mode; measure true call time.
 
         Elapsed time is captured here, on the background loop, so it
@@ -303,28 +335,35 @@ class GrpcTransport:
         """
         t0 = time.perf_counter()
         if self._mode == "unary":
-            payload, seq, gen_ts = await self._fetch_unary(n, nonce)
+            payload, seq, gen_ts = await self._fetch_unary(n, nonce, conditioning)
         elif self._mode == "server_streaming":
-            payload, seq, gen_ts = await self._fetch_server_streaming(n, nonce)
+            payload, seq, gen_ts = await self._fetch_server_streaming(n, nonce, conditioning)
         elif self._mode == "bidi_streaming":
-            payload, seq, gen_ts = await self._fetch_bidi_streaming(n, nonce)
+            payload, seq, gen_ts = await self._fetch_bidi_streaming(n, nonce, conditioning)
         else:
             raise EntropyUnavailableError(f"Unknown gRPC mode: {self._mode!r}")
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return _FetchReply(payload, seq, gen_ts, elapsed_ms)
 
-    async def _fetch_unary(self, n: int, nonce: int = 0) -> tuple[bytes, int, int]:
+    async def _fetch_unary(
+        self, n: int, nonce: int = 0, conditioning: Conditioning = RAW
+    ) -> tuple[bytes, int, int]:
         """Single request-response per call. Simplest. Higher overhead."""
         request_bytes = encode_request(n, nonce)
         timeout_s = self._timeout_ms() / 1000.0
-        raw_response: bytes = await self._channel.unary_method(
+        call = self._channel.unary_method(
             request_bytes,
             timeout=timeout_s,
-            metadata=self._metadata or None,
+            metadata=self._metadata_for(conditioning),
         )
+        raw_response: bytes = await call
+        if not conditioning.is_raw:
+            await _require_applied(call, conditioning)
         return decode_reply(raw_response)
 
-    async def _fetch_server_streaming(self, n: int, nonce: int = 0) -> tuple[bytes, int, int]:
+    async def _fetch_server_streaming(
+        self, n: int, nonce: int = 0, conditioning: Conditioning = RAW
+    ) -> tuple[bytes, int, int]:
         """Use the streaming RPC in a request/response style.
 
         Sends one request and reads one response from the stream.
@@ -338,14 +377,20 @@ class GrpcTransport:
         stream_method = self._channel.stream_method
         if stream_method is None:  # pragma: no cover — validated at source init
             raise EntropyUnavailableError("Stream method not initialized")
-        call = stream_method(request_iterator(), metadata=self._metadata or None)
+        call = stream_method(request_iterator(), metadata=self._metadata_for(conditioning))
         raw_response: bytes | None = await call.read()
         if raw_response is None:
             raise EntropyUnavailableError("Server stream ended unexpectedly")
-        call.cancel()
+        try:
+            if not conditioning.is_raw:
+                await _require_applied(call, conditioning)
+        finally:
+            call.cancel()
         return decode_reply(raw_response)
 
-    async def _fetch_bidi_streaming(self, n: int, nonce: int = 0) -> tuple[bytes, int, int]:
+    async def _fetch_bidi_streaming(
+        self, n: int, nonce: int = 0, conditioning: Conditioning = RAW
+    ) -> tuple[bytes, int, int]:
         """Fetch over one persistent, correlation-safe bidirectional stream.
 
         The ``_BidiSession`` is lazily created on first call and reused;
@@ -354,26 +399,39 @@ class GrpcTransport:
         in-flight fetches — routine on the pipelined prefetch path — safe.
         If the stream breaks, the session is discarded and re-established
         on the next call.
+
+        A non-raw *conditioning* rides its own stream (the selection is
+        part of the stream's invocation metadata). The server's echo is
+        checked once per stream, on its first reply.
         """
+        key = conditioning.canonical()
         try:
-            session = self._bidi_session
+            session = self._bidi_session if conditioning.is_raw else self._conditioned_bidi.get(key)
+            fresh = session is None or session.dead
             if session is None or session.dead:
                 stream_method = self._channel.stream_method
                 if stream_method is None:  # pragma: no cover — validated at source init
                     raise EntropyUnavailableError("Stream method not initialized")
-                call = stream_method(metadata=self._metadata or None)
+                call = stream_method(metadata=self._metadata_for(conditioning))
                 loop = self._channel.loop
                 assert loop is not None  # running on the loop already
                 session = _BidiSession(call, loop)
-                self._bidi_session = session
+                if conditioning.is_raw:
+                    self._bidi_session = session
+                else:
+                    self._conditioned_bidi[key] = session
             result: tuple[bytes, int, int] = await session.request(encode_request(n, nonce), nonce)
+            if fresh and not conditioning.is_raw:
+                await _require_applied(session.call, conditioning)
             return result
-        except EntropyUnavailableError:
-            self._bidi_session = None
-            raise
         except Exception:
-            # Stream broken — reset for next call.
-            self._bidi_session = None
+            # Stream broken, or the echo check failed — reset for next call.
+            if conditioning.is_raw:
+                self._bidi_session = None
+            else:
+                dropped = self._conditioned_bidi.pop(key, None)
+                if dropped is not None:
+                    dropped.close()
             raise
 
     # --- Server-integrated draws (PurityService) ---
@@ -451,6 +509,7 @@ class GrpcTransport:
         """Forget the bidi sessions (after a channel reset tore down their loop)."""
         self._bidi_session = None
         self._draw_bidi_session = None
+        self._conditioned_bidi.clear()
 
     def close_bidi(self) -> None:
         """Shut down the bidi sessions, if any. Loop-thread only."""
@@ -460,3 +519,6 @@ class GrpcTransport:
         if self._draw_bidi_session is not None:
             self._draw_bidi_session.close()
             self._draw_bidi_session = None
+        for session in self._conditioned_bidi.values():
+            session.close()
+        self._conditioned_bidi.clear()

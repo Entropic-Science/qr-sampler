@@ -109,6 +109,14 @@ class EntropySource(ABC):
     #: draws via the ``qr_purity.PurityService`` protocol).
     supports_server_draw: ClassVar[bool] = False
 
+    #: Whether the byte methods accept a ``conditioning=`` keyword (a
+    #: :class:`~qr_sampler.config.conditioning.Conditioning`) and have the
+    #: entropy server apply it. The pipeline passes the keyword ONLY for a
+    #: non-raw selection and only to a source that sets this, so sources
+    #: that know nothing about conditioning keep their exact signatures.
+    #: Wrappers mirror the wrapped source's value per instance.
+    supports_conditioning: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

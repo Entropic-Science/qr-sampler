@@ -226,6 +226,10 @@ class TestResolveConfig:
     def test_all_per_request_fields_overridable(self, default_config: QRSamplerConfig) -> None:
         """Every field in PER_REQUEST_FIELDS should be overridable."""
         for field_name in PER_REQUEST_FIELDS:
+            if field_name == "conditioning_mode":
+                # A validated choice, and its non-default value needs a gRPC
+                # source: covered by tests/test_conditioning.py instead.
+                continue
             key = f"qr_{field_name}"
             # Use a value that's different from default
             field_info = QRSamplerConfig.model_fields[field_name]
@@ -437,6 +441,10 @@ class TestFieldSets:
                 "population_std",
                 "uniform_clamp_epsilon",
                 "zscore_calibration_samples",
+                "conditioning_mode",
+                "conditioning_hash",
+                "conditioning_in_bytes",
+                "conditioning_keep_bytes",
                 "temperature_strategy",
                 "fixed_temperature",
                 "edt_base_temp",

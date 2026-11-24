@@ -38,6 +38,7 @@ from qr_sampler.config.log_args import TokenLogArgError, parse_log_args
 from qr_sampler.core.pipeline import (
     SamplingPipeline,
     build_pipeline,
+    conditioning_kwargs,
     config_hash,
     derive_commit_nonce,
 )
@@ -45,7 +46,11 @@ from qr_sampler.core.types import PrefetchContext
 from qr_sampler.engines.base import EngineAdapter
 from qr_sampler.engines.vllm.telemetry import _PerfAggregator
 from qr_sampler.entropy.seeded import SeededPrngSource
-from qr_sampler.exceptions import ConfigValidationError, RequestRejectedError
+from qr_sampler.exceptions import (
+    ConfigValidationError,
+    EntropyUnavailableError,
+    RequestRejectedError,
+)
 from qr_sampler.logging.token_log import TokenLogWriter, log_path, token_log_dir
 from qr_sampler.temperature.registry import TemperatureStrategyRegistry
 
@@ -904,9 +909,16 @@ class VLLMAdapter(EngineAdapter, _VLLMLogitsProcessorBase):
             draw_mode = bool(getattr(amplifier, "requires_server_draw", False))
             if req_config.entropy_prefetch and not draw_mode and entropy_override is None:
                 first_nonce = derive_commit_nonce(state.prefetch_salt, 0, -1)
-                state.entropy_ticket = target_pipeline.entropy_source.prefetch(
-                    req_config.sample_count, first_nonce
-                )
+                try:
+                    first_kwargs = conditioning_kwargs(req_config, target_pipeline.entropy_source)
+                except EntropyUnavailableError:
+                    # A source that cannot condition: no prefetch; the first
+                    # sampling step reports it through the normal fetch path.
+                    first_kwargs = None
+                if first_kwargs is not None:
+                    state.entropy_ticket = target_pipeline.entropy_source.prefetch(
+                        req_config.sample_count, first_nonce, **first_kwargs
+                    )
 
             # Emit a single per-request routing event so an operator can
             # confirm the comparison pipe's per-column extra_args

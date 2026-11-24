@@ -34,6 +34,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
+from qr_sampler.config.conditioning import RAW, Conditioning
 from qr_sampler.entropy.base import DrawMeta, EntropySource
 from qr_sampler.entropy.qgrpc.breaker import AdaptiveCircuitBreaker
 from qr_sampler.entropy.qgrpc.channel import GrpcChannel
@@ -184,6 +185,10 @@ class QuantumGrpcSource(EntropySource):
     #: Server-integrated draws are served over the same channel via the
     #: ``qr_purity.PurityService`` protocol (see ``get_draw``).
     supports_server_draw: ClassVar[bool] = True
+
+    #: The byte methods take ``conditioning=``; the server applies it and
+    #: the transport refuses bytes whose echo does not match.
+    supports_conditioning = True
 
     def __init__(self, config: QRSamplerConfig) -> None:
         try:
@@ -356,8 +361,12 @@ class QuantumGrpcSource(EntropySource):
             return False
         return not self._breaker.is_blocking
 
-    def get_random_bytes(self, n: int) -> bytes:
+    def get_random_bytes(self, n: int, conditioning: Conditioning = RAW) -> bytes:
         """Fetch *n* random bytes from the gRPC entropy server.
+
+        A non-raw *conditioning* asks the server to transform its raw read
+        before serving (see :mod:`qr_sampler.config.conditioning`); the
+        fetch fails as unavailable if the server does not confirm it.
 
         Synchronous wrapper around the async transport. Uses the background
         event loop thread to dispatch async calls.
@@ -372,7 +381,12 @@ class QuantumGrpcSource(EntropySource):
             EntropyUnavailableError: If the server is unreachable or the
                 circuit breaker is open.
         """
-        reply = self._fetch_with_recovery(lambda: self._fetch_sync(n), what="entropy fetch")
+        if conditioning.is_raw:
+            reply = self._fetch_with_recovery(lambda: self._fetch_sync(n), what="entropy fetch")
+        else:
+            reply = self._fetch_with_recovery(
+                lambda: self._fetch_sync(n, conditioning), what="entropy fetch"
+            )
         return reply.payload
 
     def _fetch_with_recovery(self, fetch_fn: Callable[[], _ReplyT], *, what: str) -> _ReplyT:
@@ -469,7 +483,9 @@ class QuantumGrpcSource(EntropySource):
             f"gRPC {what} failed after {1 + self._retry_count} attempts: {last_error}"
         ) from last_error
 
-    def prefetch(self, n: int, nonce: int | None = None) -> PrefetchTicket | None:
+    def prefetch(
+        self, n: int, nonce: int | None = None, conditioning: Conditioning = RAW
+    ) -> PrefetchTicket | None:
         """Fire an asynchronous entropy fetch; return a redeemable ticket.
 
         Called by the sampling pipeline the instant the previous token is
@@ -499,7 +515,7 @@ class QuantumGrpcSource(EntropySource):
             return None
         try:
             self._channel.ensure()
-            future = self._channel.submit(self._transport.fetch(n, nonce or 0))
+            future = self._channel.submit(self._transport.fetch(n, nonce or 0, conditioning))
         except Exception as exc:
             logger.debug("prefetch dispatch failed: %s", exc)
             return None
@@ -507,8 +523,13 @@ class QuantumGrpcSource(EntropySource):
             self._prefetch_fired += 1
         return PrefetchTicket(future=future, nonce=nonce or 0, n=n)
 
-    def get_random_bytes_with_ticket(self, n: int, ticket: Any | None) -> bytes:
+    def get_random_bytes_with_ticket(
+        self, n: int, ticket: Any | None, conditioning: Conditioning = RAW
+    ) -> bytes:
         """Redeem a prefetched fetch, falling back to the serial path.
+
+        *conditioning* must be the selection the ticket was fired with; it
+        is used only when the ticket fails and the serial path refetches.
 
         On the happy path the response is already in flight (or already
         arrived) and the engine blocks only for the residual wait — the
@@ -519,7 +540,7 @@ class QuantumGrpcSource(EntropySource):
         less robust than the serial one.
         """
         if ticket is None:
-            return self.get_random_bytes(n)
+            return self.get_random_bytes(n, conditioning)
         if self._closed:
             ticket.cancel()
             raise EntropyUnavailableError("QuantumGrpcSource is closed")
@@ -535,7 +556,7 @@ class QuantumGrpcSource(EntropySource):
             with self._stats_lock:
                 self._prefetch_misses += 1
             logger.debug("prefetch redeem failed (%s); falling back to serial fetch", exc)
-            return self.get_random_bytes(n)
+            return self.get_random_bytes(n, conditioning)
 
         # Success bookkeeping mirrors the serial path.
         ticket.hit = True
@@ -659,9 +680,11 @@ class QuantumGrpcSource(EntropySource):
         )
         return response.u, meta
 
-    def _fetch_sync(self, n: int) -> _FetchReply:
+    def _fetch_sync(self, n: int, conditioning: Conditioning = RAW) -> _FetchReply:
         """Dispatch an async byte fetch to the background loop and block."""
-        return self._submit_and_wait(self._transport.fetch(n), n=n, what="entropy fetch")
+        return self._submit_and_wait(
+            self._transport.fetch(n, 0, conditioning), n=n, what="entropy fetch"
+        )
 
     def _draw_fetch_sync(self, source_id: str, block_bytes: int) -> _DrawFetchReply:
         """Dispatch an async draw fetch to the background loop and block."""

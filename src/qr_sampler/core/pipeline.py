@@ -26,6 +26,7 @@ import numpy as np
 
 from qr_sampler.amplification.registry import AmplifierRegistry
 from qr_sampler.config import QRSamplerConfig
+from qr_sampler.config.conditioning import conditioning_of
 from qr_sampler.core.types import PrefetchContext, SamplingResult
 from qr_sampler.entropy.fallback import FallbackEntropySource
 from qr_sampler.entropy.named import InstanceNamedSource
@@ -254,6 +255,31 @@ def build_pipeline(config: QRSamplerConfig, vocab_size: int) -> SamplingPipeline
     )
 
 
+def conditioning_kwargs(config: QRSamplerConfig, source: EntropySource) -> dict[str, Any]:
+    """Keyword arguments carrying *config*'s conditioning to a byte fetch.
+
+    Empty for ``raw``, so a raw request calls every source exactly as
+    before. For a non-raw selection the source must be able to have its
+    server apply it: one that cannot makes the fetch unavailable rather
+    than quietly handing back unconditioned bytes. (Builtin sources that
+    cannot are already rejected when the request's config is validated;
+    this guards third-party sources.)
+    """
+    conditioning = conditioning_of(
+        config.conditioning_mode,
+        config.conditioning_hash,
+        config.conditioning_in_bytes,
+        config.conditioning_keep_bytes,
+    )
+    if conditioning.is_raw:
+        return {}
+    if not getattr(source, "supports_conditioning", False):
+        raise EntropyUnavailableError(
+            f"entropy source {source.name!r} cannot apply conditioning {conditioning.canonical()!r}"
+        )
+    return {"conditioning": conditioning}
+
+
 class SamplingPipeline:
     """Engine-agnostic sampling pipeline.
 
@@ -382,6 +408,9 @@ class SamplingPipeline:
         ticket = prefetch_ctx.ticket if prefetch_ctx is not None else None
 
         draw_mode = bool(getattr(active_amplifier, "requires_server_draw", False))
+        # Conditioning rides the byte path only (config validation refuses
+        # it together with the server-draw amplifier).
+        cond_kwargs = {} if draw_mode else conditioning_kwargs(active_config, active_source)
         draw_meta: DrawMeta | None = None
         raw_bytes: bytes | None = None
         u_value: float = 0.0  # always overwritten below
@@ -405,10 +434,10 @@ class SamplingPipeline:
                 raw_bytes = active_source.get_random_bytes(active_config.sample_count)
         elif ticket is not None:
             raw_bytes = active_source.get_random_bytes_with_ticket(
-                active_config.sample_count, ticket
+                active_config.sample_count, ticket, **cond_kwargs
             )
         else:
-            raw_bytes = active_source.get_random_bytes(active_config.sample_count)
+            raw_bytes = active_source.get_random_bytes(active_config.sample_count, **cond_kwargs)
 
         # Detect if fallback was used (byte fetches only — the wrapper's
         # bookkeeping means "who provided BYTES"; draws are primary-only).
@@ -503,7 +532,9 @@ class SamplingPipeline:
                     next_nonce,
                 )
             else:
-                next_ticket = active_source.prefetch(active_config.sample_count, next_nonce)
+                next_ticket = active_source.prefetch(
+                    active_config.sample_count, next_nonce, **cond_kwargs
+                )
 
         # --- 6. Build one-hot numpy array (optional) ---
         one_hot: np.ndarray | None = None
@@ -594,6 +625,13 @@ class SamplingPipeline:
             cdf_lo=bracket_lo,
             cdf_hi=bracket_hi,
             top_entries=_as_entries(candidates),
+            # What the entropy server did to THIS token's bytes. A token
+            # served by the local fallback source was not conditioned.
+            conditioning=(
+                cond_kwargs["conditioning"].canonical()
+                if cond_kwargs and not entropy_is_fallback
+                else None
+            ),
         )
 
         # --- 8. Log ---
